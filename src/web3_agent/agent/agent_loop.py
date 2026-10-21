@@ -6,6 +6,9 @@ V1a 不生成任何 TxIntent。
 
 from __future__ import annotations
 
+from typing import Any
+
+from langsmith import traceable
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from web3_agent.agent import langsmith_tracer, secret_detector
@@ -32,6 +35,25 @@ from web3_agent.domain.memory.embedder import Embedder
 from web3_agent.persistence.conversation_context import ConversationContext
 from web3_agent.persistence.pg.repositories import memory_repo, profile_repo, summary_repo
 from web3_agent.persistence.pg.repositories.audit_repo import AuditLogger
+
+
+def _turn_inputs(params: dict[str, Any]) -> dict[str, Any]:
+    """self 与 db 不进 trace：一个是整对象，一个是连接，序列化没有意义。"""
+    return {
+        "user_message": params.get("user_message"),
+        "siwe_user_id": params.get("siwe_user_id"),
+        "wallet_address": params.get("wallet_address"),
+        "chain_id": params.get("chain_id"),
+    }
+
+
+def _turn_outputs(outcome: ChatOutcome) -> dict[str, Any]:
+    return {
+        "kind": outcome.kind,
+        "content": outcome.content,
+        "steps": outcome.steps,
+        "degraded": outcome.degraded,
+    }
 
 
 class AgentLoop:
@@ -81,24 +103,44 @@ class AgentLoop:
             await self._audit.log("prompt_injection_filtered", siwe_user_id=siwe_user_id)
 
         # 密钥命中时上面已经返回，不会走到这里 —— 所以这一段之后才开 trace。
-        turn = langsmith_tracer.run_config(
-            "chat.turn",
-            trace_id=get_trace_id(),
-            chain_id=chain_id,
-            siwe_user_id=siwe_user_id,
+        extra = langsmith_tracer.root_extra(
+            trace_id=get_trace_id(), chain_id=chain_id, siwe_user_id=siwe_user_id
         )
-        if turn:
-            set_run_id(turn["run_id"])
+        if extra:
+            set_run_id(extra["run_id"])
+        return await self._turn(
+            db,
+            siwe_user_id=siwe_user_id,
+            user_message=sanitized.text,
+            wallet_address=wallet_address,
+            chain_id=chain_id,
+            langsmith_extra=extra,
+        )
 
+    @traceable(
+        run_type="chain",
+        name="chat.turn",
+        process_inputs=_turn_inputs,
+        process_outputs=_turn_outputs,
+    )
+    async def _turn(
+        self,
+        db: AsyncSession,
+        *,
+        siwe_user_id: str,
+        wallet_address: str | None,
+        chain_id: int | None,
+        user_message: str,
+    ) -> ChatOutcome:
         # 2. Perception：短期历史 + 中期摘要 + 长期档案与背景
         history = await self._conversation.load(
             db, siwe_user_id=siwe_user_id
         )
         summary_text = await self._load_summary(db, siwe_user_id)
-        profile_text = await self._sync_profile(db, siwe_user_id, sanitized.text, chain_id)
-        memory_text = await self._load_memories(db, siwe_user_id, sanitized.text)
+        profile_text = await self._sync_profile(db, siwe_user_id, user_message, chain_id)
+        memory_text = await self._load_memories(db, siwe_user_id, user_message)
         await self._conversation.save(
-            db, siwe_user_id=siwe_user_id, role="user", content=sanitized.text
+            db, siwe_user_id=siwe_user_id, role="user", content=user_message
         )
 
         # 3. Thought：结构化意图，带熔断
@@ -106,7 +148,7 @@ class AgentLoop:
             guarded = await self._guard.run(
                 lambda: self._llm.extract_intent(
                     history,
-                    sanitized.text,
+                    user_message,
                     summary=summary_text,
                     profile=profile_text,
                     memories=memory_text,
@@ -166,13 +208,14 @@ class AgentLoop:
             state = await self._graph.ainvoke(
                 initial_state(
                     history,
-                    sanitized.text,
+                    user_message,
                     wallet_address or "",
                     summary=summary_text,
                     profile=profile_text,
                     memories=memory_text,
                 ),
-                config=turn or None,
+                config=langsmith_tracer.run_config("agent.graph", trace_id=get_trace_id())
+                or None,
             )
         except ModelUnavailable as exc:
             await self._audit.log("model_unavailable", siwe_user_id=siwe_user_id, error=str(exc))
