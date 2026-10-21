@@ -12,7 +12,9 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from web3_agent.agent import langsmith_tracer
 from web3_agent.agent.llm_adapter import LlmAdapter
+from web3_agent.common.tracing import get_trace_id, set_run_id
 from web3_agent.config.constants import QuotaMetric
 from web3_agent.config.settings import Settings
 from web3_agent.domain.memory import memory
@@ -87,8 +89,15 @@ class MemoryExtractor:
             )
 
     async def _extract(self, siwe_user_id: str, job: _Job) -> None:
+        run = langsmith_tracer.run_config(
+            "memory.extract", trace_id=get_trace_id(), until_id=job.until_id
+        )
+        if run:
+            set_run_id(run["run_id"])
         try:
-            raw = await self._llm.extract_memories(job.messages, job.existing_texts)
+            raw = await self._llm.extract_memories(
+                job.messages, job.existing_texts, config=run or None
+            )
         except Exception as exc:  # noqa: BLE001
             await self._charge()
             await self._on_failure(siwe_user_id, exc, job)

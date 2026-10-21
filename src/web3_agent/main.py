@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from web3_agent.agent.tool_registry import ToolRegistry
 from web3_agent.agent.tool_runner import ToolRunner
 from web3_agent.api.v1 import auth_router, chat_router, health_router
 from web3_agent.common.exceptions import ModelUnavailable
+from web3_agent.common.logging_setup import setup_logging
 from web3_agent.config.constants import ToolGroup
 from web3_agent.config.settings import Settings, get_settings
 from web3_agent.domain.memory.embedder import Embedder
@@ -35,8 +37,10 @@ from web3_agent.web3.tools.read.get_asset_balance import build_get_asset_balance
 from web3_agent.web3.tools.read.get_stake_info import build_get_stake_info
 from web3_agent.web3.tools.read.get_transaction_records import build_get_transaction_records
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+setup_logging(get_settings().log_level)
 logger = logging.getLogger(__name__)
+
+_HEARTBEAT_INTERVAL_SECONDS = 3600
 
 
 @dataclass
@@ -122,15 +126,26 @@ async def lifespan(app: FastAPI):
         except ModelUnavailable as exc:
             logger.error("ollama not ready: %s", exc)
 
+    heartbeat_task: asyncio.Task | None = None
     if container.tracing_enabled:
-        ok = langsmith_tracer.heartbeat()
-        logger.info("langsmith heartbeat: %s", ok)
+        logger.info("langsmith heartbeat: %s", langsmith_tracer.heartbeat())
+        heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
     try:
         yield
     finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
         await container.adapter.aclose()
         await dispose_engine()
+
+
+async def _heartbeat_loop() -> None:
+    """出口断了之后不能安静地没数据：每小时探一次，失败就报出来。"""
+    while True:
+        await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
+        if not langsmith_tracer.heartbeat():
+            logger.error("langsmith heartbeat failed: 上报链路可能已断")
 
 
 def create_app() -> FastAPI:

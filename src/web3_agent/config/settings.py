@@ -82,11 +82,11 @@ class Settings(BaseSettings):
     ollama_embed_dim: int = 1024
 
     # --- LangSmith（SaaS）---
+    # 只认这一个开关：打开就全量上报，关闭时连 run 都不建。
     langsmith_tracing: bool = False
     langsmith_api_key: str = ""
     langsmith_project: str = "web3-agent-dev"
     langsmith_endpoint: str = "https://api.smith.langchain.com"
-    langsmith_sample_rate: float = 1.0
 
     # --- 鉴权（V1a 只读匿名可访问；写链路需要）---
     jwt_secret: str = "dev-only-change-me-0123456789abcdef"

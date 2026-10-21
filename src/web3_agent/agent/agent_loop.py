@@ -8,13 +8,14 @@ from __future__ import annotations
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from web3_agent.agent import secret_detector
+from web3_agent.agent import langsmith_tracer, secret_detector
 from web3_agent.agent.graph.read_graph import build_read_graph, initial_state
 from web3_agent.agent.intent_router import route_intent
 from web3_agent.agent.json_guard import JsonGuard
 from web3_agent.agent.llm_adapter import LlmAdapter
 from web3_agent.agent.sanitize import sanitize_free_text
 from web3_agent.common.exceptions import E507_MODEL_UNAVAILABLE, AppError, ModelUnavailable
+from web3_agent.common.tracing import get_trace_id, set_run_id
 from web3_agent.common.types import ChatOutcome
 from web3_agent.config.constants import (
     MSG_CLARIFY,
@@ -79,6 +80,13 @@ class AgentLoop:
         if sanitized.hijacked:
             await self._audit.log("prompt_injection_filtered", siwe_user_id=siwe_user_id)
 
+        # 密钥命中时上面已经返回，不会走到这里 —— 所以这一段之后才开 trace。
+        turn = langsmith_tracer.run_config(
+            "chat.turn", trace_id=get_trace_id(), chain_id=chain_id
+        )
+        if turn:
+            set_run_id(turn["run_id"])
+
         # 2. Perception：短期历史 + 中期摘要 + 长期档案与背景
         history = await self._conversation.load(
             db, siwe_user_id=siwe_user_id
@@ -99,6 +107,9 @@ class AgentLoop:
                     summary=summary_text,
                     profile=profile_text,
                     memories=memory_text,
+                    config=langsmith_tracer.run_config(
+                        "intent.extract", trace_id=get_trace_id()
+                    ),
                 )
             )
         except ModelUnavailable as exc:
@@ -155,7 +166,8 @@ class AgentLoop:
                     summary=summary_text,
                     profile=profile_text,
                     memories=memory_text,
-                )
+                ),
+                config=turn or None,
             )
         except ModelUnavailable as exc:
             await self._audit.log("model_unavailable", siwe_user_id=siwe_user_id, error=str(exc))

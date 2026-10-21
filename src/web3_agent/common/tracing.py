@@ -6,6 +6,7 @@ import uuid
 from contextvars import ContextVar
 
 _trace_id: ContextVar[str] = ContextVar("trace_id", default="")
+_run_id: ContextVar[str] = ContextVar("langsmith_run_id", default="")
 
 
 def new_trace_id() -> str:
@@ -18,3 +19,12 @@ def set_trace_id(trace_id: str) -> None:
 
 def get_trace_id() -> str:
     return _trace_id.get()
+
+
+def set_run_id(run_id: str) -> None:
+    """本轮对应的 LangSmith run id。审计靠它反查当次完整轨迹。"""
+    _run_id.set(run_id)
+
+
+def get_run_id() -> str:
+    return _run_id.get()

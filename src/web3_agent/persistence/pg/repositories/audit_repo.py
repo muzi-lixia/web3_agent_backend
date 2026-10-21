@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from web3_agent.common.tracing import get_trace_id
+from web3_agent.common.tracing import get_run_id, get_trace_id
 from web3_agent.persistence.pg.base import session_scope
 from web3_agent.persistence.pg.orm_models import AuditLog
 
@@ -35,7 +35,7 @@ class AuditLogger:
                         siwe_user_id=siwe_user_id,
                         event=event,
                         payload=payload or None,
-                        langsmith_run_id=langsmith_run_id,
+                        langsmith_run_id=langsmith_run_id or get_run_id() or None,
                     )
                 )
         except Exception:  # noqa: BLE001 审计不可阻断主流程

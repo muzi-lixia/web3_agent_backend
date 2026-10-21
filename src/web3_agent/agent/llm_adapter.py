@@ -13,7 +13,7 @@ import logging
 import httpx
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
-from langchain_core.runnables import Runnable
+from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import BaseTool
 from langchain_ollama import ChatOllama
 
@@ -79,6 +79,7 @@ class LlmAdapter:
         summary: str = "",
         profile: str = "",
         memories: str = "",
+        config: RunnableConfig | None = None,
     ) -> LlmOutput:
         messages: list[BaseMessage] = [SystemMessage(content=INTENT_SYSTEM)]
         # 顺序固定为 档案 → 背景 → 摘要：前两者是长期约束，摘要是一次性事实，越靠近当前输入越具体。
@@ -92,7 +93,7 @@ class LlmAdapter:
             messages.append(_as_message(role, content))
         messages.append(_as_message("user", user_message))
         try:
-            result = await self._intent_llm.ainvoke(messages)
+            result = await self._intent_llm.ainvoke(messages, config=config or None)
         except (httpx.HTTPError, ConnectionError, TimeoutError) as exc:
             raise ModelUnavailable(f"模型调用失败：{exc}") from exc
         if not isinstance(result, LlmOutput):
@@ -100,7 +101,11 @@ class LlmAdapter:
         return result
 
     async def summarize(
-        self, previous: str, messages: list[tuple[str, str]]
+        self,
+        previous: str,
+        messages: list[tuple[str, str]],
+        *,
+        config: RunnableConfig | None = None,
     ) -> SummaryFields:
         """增量压缩：只给旧摘要 + 新增区间，不给全部历史，否则 token 随会话线性增长。"""
         prompt: list[BaseMessage] = [SystemMessage(content=SUMMARY_SYSTEM)]
@@ -109,7 +114,7 @@ class LlmAdapter:
         dialogue = "\n".join(f"{role}: {content}" for role, content in messages)
         prompt.append(HumanMessage(content=f"需要压缩的对话：\n{dialogue}"))
         try:
-            result = await self._summary_llm.ainvoke(prompt)
+            result = await self._summary_llm.ainvoke(prompt, config=config or None)
         except (httpx.HTTPError, ConnectionError, TimeoutError) as exc:
             raise ModelUnavailable(f"摘要调用失败：{exc}") from exc
         if not isinstance(result, SummaryFields):
@@ -117,7 +122,11 @@ class LlmAdapter:
         return result
 
     async def extract_memories(
-        self, messages: list[tuple[str, str]], existing: list[str]
+        self,
+        messages: list[tuple[str, str]],
+        existing: list[str],
+        *,
+        config: RunnableConfig | None = None,
     ) -> MemoryDraftList:
         """抽长期记忆。existing 只用来避免重复输出，模型不负责判断矛盾。"""
         prompt: list[BaseMessage] = [SystemMessage(content=MEMORY_SYSTEM)]
@@ -128,7 +137,7 @@ class LlmAdapter:
         dialogue = "\n".join(f"{role}: {content}" for role, content in messages)
         prompt.append(HumanMessage(content=f"需要抽取的对话：\n{dialogue}"))
         try:
-            result = await self._memory_llm.ainvoke(prompt)
+            result = await self._memory_llm.ainvoke(prompt, config=config or None)
         except (httpx.HTTPError, ConnectionError, TimeoutError) as exc:
             raise ModelUnavailable(f"记忆抽取调用失败：{exc}") from exc
         if not isinstance(result, MemoryDraftList):

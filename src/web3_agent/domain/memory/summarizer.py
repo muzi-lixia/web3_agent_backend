@@ -14,7 +14,9 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from web3_agent.agent import langsmith_tracer
 from web3_agent.agent.llm_adapter import LlmAdapter
+from web3_agent.common.tracing import get_trace_id, set_run_id
 from web3_agent.config.constants import QuotaMetric
 from web3_agent.config.settings import Settings
 from web3_agent.domain.memory import schema
@@ -101,8 +103,14 @@ class Summarizer:
             )
 
     async def _summarize(self, siwe_user_id: str, own_address: str, job: _Job) -> None:
+        # 后台任务是独立的 run，但 trace_id 跟着触发它的那轮请求走。
+        run = langsmith_tracer.run_config(
+            "summary.run", trace_id=get_trace_id(), until_id=job.until_id
+        )
+        if run:
+            set_run_id(run["run_id"])
         try:
-            raw = await self._llm.summarize(job.previous, job.messages)
+            raw = await self._llm.summarize(job.previous, job.messages, config=run or None)
         except Exception as exc:  # noqa: BLE001 模型侧任何失败都只降级、不重试
             await self._charge()
             await self._on_failure(siwe_user_id, exc, job)
