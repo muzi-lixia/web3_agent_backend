@@ -159,6 +159,19 @@ NATIVE_META: dict[int, tuple[str, int]] = {
 }
 NATIVE_FALLBACK: tuple[str, int] = ("NATIVE", 18)
 
+# 链的常用名 → chainId。只用于把「以后都用 BERA 链」这类显式偏好落成数字。
+# 不放 bare 的 "bera"：它和代币符号同名，会误判。
+CHAIN_ALIASES: dict[str, int] = {
+    "ethereum": 1,
+    "以太坊": 1,
+    "主网": 1,
+    "bsc": 56,
+    "币安智能链": 56,
+    "polygon": 137,
+    "berachain": 80094,
+    "bera链": 80094,
+}
+
 # 有价格源、可做等值金额判定的代币。不在这张表里的代币一律拒绝写操作（E404），不放行。
 # 真实 price feed 接入前，这就是"能判定 / 不能判定"的分界线；表本身是配置，不是业务规则。
 PRICE_FEED_SYMBOLS: frozenset[str] = frozenset(

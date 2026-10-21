@@ -45,13 +45,15 @@ async def chat(
     chain_id = payload.wallet.chain_id if payload.wallet else None
     if chain_id is not None and chain_id != identity.chain_id:
         raise AppError(*E509_CHAIN_IDENTITY_MISMATCH)
+    # 请求没带 wallet 时用登录身份里的链：档案要记代币属于哪条链，缺了就只能丢弃。
+    effective_chain = chain_id if chain_id is not None else identity.chain_id
 
     async with session_scope() as db:
         outcome = await container.agent.handle(
             db,
             siwe_user_id=identity.user_id,
             wallet_address=identity.address,
-            chain_id=chain_id,
+            chain_id=effective_chain,
             user_message=payload.user_message,
         )
 

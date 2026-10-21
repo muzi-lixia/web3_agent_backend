@@ -70,9 +70,17 @@ class LlmAdapter:
         return {"model": self.model_name, "digest": digest}
 
     async def extract_intent(
-        self, history: list[tuple[str, str]], user_message: str, *, summary: str = ""
+        self,
+        history: list[tuple[str, str]],
+        user_message: str,
+        *,
+        summary: str = "",
+        profile: str = "",
     ) -> LlmOutput:
         messages: list[BaseMessage] = [SystemMessage(content=INTENT_SYSTEM)]
+        # 顺序固定为 偏好 → 摘要：偏好是长期约束，摘要是一次性事实，越靠近当前输入越具体。
+        if profile:
+            messages.append(SystemMessage(content=profile))
         if summary:
             messages.append(SystemMessage(content=summary))
         for role, content in history:

@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     summary_render_chars: int = 600
     summary_fail_max: int = 3
 
+    # --- 长期记忆：结构化档案 ---
+    profile_render_chars: int = 400
+    profile_token_max_items: int = 5
+
     # --- 写链路风控（PRD 12 章：单笔等值金额上限）---
     write_max_amount_usd: float = DEFAULT_MAX_AMOUNT_USD
 

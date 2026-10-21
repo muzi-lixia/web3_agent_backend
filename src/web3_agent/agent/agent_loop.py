@@ -26,9 +26,9 @@ from web3_agent.config.constants import (
     Route,
 )
 from web3_agent.config.settings import Settings
-from web3_agent.domain.memory import schema
+from web3_agent.domain.memory import profile, schema
 from web3_agent.persistence.conversation_context import ConversationContext
-from web3_agent.persistence.pg.repositories import summary_repo
+from web3_agent.persistence.pg.repositories import profile_repo, summary_repo
 from web3_agent.persistence.pg.repositories.audit_repo import AuditLogger
 
 
@@ -76,11 +76,12 @@ class AgentLoop:
         if sanitized.hijacked:
             await self._audit.log("prompt_injection_filtered", siwe_user_id=siwe_user_id)
 
-        # 2. Perception：短期会话历史 + 中期摘要
+        # 2. Perception：短期历史 + 中期摘要 + 长期档案
         history = await self._conversation.load(
             db, siwe_user_id=siwe_user_id
         )
         summary_text = await self._load_summary(db, siwe_user_id)
+        profile_text = await self._sync_profile(db, siwe_user_id, sanitized.text, chain_id)
         await self._conversation.save(
             db, siwe_user_id=siwe_user_id, role="user", content=sanitized.text
         )
@@ -88,7 +89,9 @@ class AgentLoop:
         # 3. Thought：结构化意图，带熔断
         try:
             guarded = await self._guard.run(
-                lambda: self._llm.extract_intent(history, sanitized.text, summary=summary_text)
+                lambda: self._llm.extract_intent(
+                    history, sanitized.text, summary=summary_text, profile=profile_text
+                )
             )
         except ModelUnavailable as exc:
             await self._audit.log("model_unavailable", siwe_user_id=siwe_user_id, error=str(exc))
@@ -137,7 +140,13 @@ class AgentLoop:
         # 5. Action：只读 ReAct
         try:
             state = await self._graph.ainvoke(
-                initial_state(history, sanitized.text, wallet_address or "", summary=summary_text)
+                initial_state(
+                    history,
+                    sanitized.text,
+                    wallet_address or "",
+                    summary=summary_text,
+                    profile=profile_text,
+                )
             )
         except ModelUnavailable as exc:
             await self._audit.log("model_unavailable", siwe_user_id=siwe_user_id, error=str(exc))
@@ -165,6 +174,33 @@ class AgentLoop:
             schema.loads(row.content),
             max_chars=self._settings.summary_render_chars,
             updated_at=row.updated_at,
+        )
+
+    async def _sync_profile(
+        self, db: AsyncSession, siwe_user_id: str, message: str, chain_id: int | None
+    ) -> str:
+        """吸收本轮的显式偏好，返回注入文本。
+
+        先合并再渲染：用户说「以后都简洁点」的这一轮，回答就该是简洁的。
+        """
+        patch = profile.extract(message, chain_id=chain_id)
+        current = await profile_repo.apply_patch(
+            db, siwe_user_id=siwe_user_id, patch=patch, chain_id=chain_id
+        )
+        if not patch.is_empty:
+            await self._audit.log(
+                "profile_updated",
+                siwe_user_id=siwe_user_id,
+                answer_style=patch.answer_style,
+                language=patch.language,
+                preferred_chain_id=patch.preferred_chain_id,
+                risk_preference=patch.risk_preference,
+                tokens=list(patch.tokens),
+            )
+        return profile.render(
+            current,
+            max_chars=self._settings.profile_render_chars,
+            max_tokens=self._settings.profile_token_max_items,
         )
 
     async def _finish(
