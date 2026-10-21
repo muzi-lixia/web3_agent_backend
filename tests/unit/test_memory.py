@@ -13,9 +13,17 @@ def test_normalize_text_rewrites_first_person_subject() -> None:
     assert memory.normalize_text("  用户 偏好 简洁  ") == "用户 偏好 简洁"
 
 
-def test_normalize_text_rejects_other_subjects() -> None:
-    assert memory.normalize_text("他喜欢简洁") == ""
+def test_normalize_text_rejects_assistant_voice() -> None:
+    """助手视角的句子注入后会变成对助手自己的要求，必须挡掉。"""
     assert memory.normalize_text("助手应该更简洁") == ""
+    assert memory.normalize_text("你应该先问我") == ""
+    assert memory.normalize_text("作为助手，我不该下结论") == ""
+
+
+def test_normalize_text_keeps_action_first_sentence() -> None:
+    """constraint 常以动作开头，写不成「用户…」句式，不能因此整条丢。"""
+    assert memory.normalize_text("涉及转账的操作要先跟用户确认") == "涉及转账的操作要先跟用户确认"
+    assert memory.normalize_text("他喜欢简洁") == "他喜欢简洁"
 
 
 def test_sanitize_applies_text_normalization() -> None:
@@ -72,6 +80,20 @@ def test_sanitize_rejects_imperative_text() -> None:
     ):
         draft = {"text": text, "type": "preference", "subject": "x", "confidence": 0.9}
         assert memory.sanitize(draft) is None, text
+
+
+def test_sanitize_accepts_transfer_constraint() -> None:
+    """「转账」是链上动作词，不是祈使 —— 带它的 constraint 必须能入库。"""
+    item = memory.sanitize(
+        {
+            "text": "涉及转账的操作要先跟用户确认",
+            "type": "constraint",
+            "subject": "transfer_confirmation",
+            "confidence": 0.9,
+        }
+    )
+    assert item is not None
+    assert item.memory_type == "constraint"
 
 
 def test_sanitize_rejects_empty_text_and_bad_confidence() -> None:

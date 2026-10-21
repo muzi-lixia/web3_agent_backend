@@ -22,9 +22,13 @@ _TEXT_MAX = 200
 _SUBJECT_MAX = 64
 _SUBJECT_OK = re.compile(r"^[a-z0-9_]+$")
 
-# 模型可能写进来的祈使句 —— 记忆是注入面，陈述句之外一律不要。
+# 助手视角的句子不能入库：注入时以 System 身份出现，会被当成对助手自己的要求。
+_ASSISTANT_VOICE = re.compile(r"^助手|^你(应该|需要|必须)|作为助手|作为 AI", re.IGNORECASE)
+
+# 模型可能写进来的祈使句 —— 记忆是注入面，指令性文本一律不要。
+# 「转账」「质押」这类链上动作词本身不算祈使：constraint 必然包含它们。
 _IMPERATIVE = re.compile(
-    r"忽略|无视|系统提示|system prompt|你必须|请你|立即执行|替我|帮我执行|转账|私钥|助记词",
+    r"忽略|无视|系统提示|system prompt|你必须|请你|立即执行|替我|帮我执行|转账给|私钥|助记词",
     re.IGNORECASE,
 )
 
@@ -57,17 +61,21 @@ def normalize_subject(raw: str) -> str:
 
 
 def normalize_text(raw: str) -> str:
-    """把句首的「我」换掉。
+    """把句首的「我」换成「用户」。
 
-    提示词要求写「用户…」，但模型经常直接抄用户原话。这条文本会以 System 身份注入，
-    留着「我在做跨链套利」会让它把用户的状态当成自己的。主语不是用户就整条丢弃。
+    第一人称进向量库会让召回对不上（查询侧说的是「跨链手续费」，库里写的是
+    「我在做套利」）。模型偶尔直接抄原话，所以这里改主语。
+    不是第一人称的句子原样保留 —— 「涉及转账的操作要先确认」这类以动作开头的
+    constraint 本来就写不成「用户…」句式，硬加主语会变成病句。
     """
     text = " ".join(raw.split())
     if text.startswith("用户"):
         return text
     if text.startswith("我"):
         return "用户" + text[1:]
-    return ""
+    if _ASSISTANT_VOICE.search(text):
+        return ""
+    return text
 
 
 def accepts(item: MemoryItem) -> bool:
