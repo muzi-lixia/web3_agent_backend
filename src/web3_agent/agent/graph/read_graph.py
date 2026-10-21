@@ -84,7 +84,10 @@ def build_read_graph(
 
 
 def initial_state(
-    history: list[tuple[str, str]], user_message: str, wallet_address: str = ""
+    history: list[tuple[str, str]],
+    user_message: str,
+    wallet_address: str = "",
+    summary: str = "",
 ) -> ReadState:
     identity = (
         f"当前用户已连接的钱包地址是 {wallet_address}。用户说「我」「我的」时指这个地址，"
@@ -92,7 +95,11 @@ def initial_state(
         if wallet_address
         else "当前没有已连接的钱包地址。需要地址时先问用户，不要编造。"
     )
-    messages = [SystemMessage(content=f"{READ_SYSTEM}\n\n{identity}")]
+    system = f"{READ_SYSTEM}\n\n{identity}"
+    # 摘要紧跟身份约束：它是压缩态事实，优先级高于原文窗口，但低于身份与工具约束。
+    if summary:
+        system = f"{system}\n\n{summary}"
+    messages = [SystemMessage(content=system)]
     for role, content in history:
         messages.append(
             AIMessage(content=content) if role == "assistant" else HumanMessage(content=content)

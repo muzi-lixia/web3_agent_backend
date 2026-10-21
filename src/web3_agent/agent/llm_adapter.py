@@ -12,15 +12,16 @@ import logging
 
 import httpx
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langchain_ollama import ChatOllama
 
-from web3_agent.agent.prompts import INTENT_SYSTEM
+from web3_agent.agent.prompts import INTENT_SYSTEM, SUMMARY_SYSTEM
 from web3_agent.common.exceptions import ModelUnavailable
 from web3_agent.common.types import LlmOutput
 from web3_agent.config.settings import Settings
+from web3_agent.domain.memory.schema import SummaryFields
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ class LlmAdapter:
             keep_alive=settings.ollama_keep_alive,
         )
         self._intent_llm = self._llm.with_structured_output(LlmOutput, method="json_schema")
+        self._summary_llm = self._llm.with_structured_output(SummaryFields, method="json_schema")
 
     @property
     def model_name(self) -> str:
@@ -68,9 +70,11 @@ class LlmAdapter:
         return {"model": self.model_name, "digest": digest}
 
     async def extract_intent(
-        self, history: list[tuple[str, str]], user_message: str
+        self, history: list[tuple[str, str]], user_message: str, *, summary: str = ""
     ) -> LlmOutput:
         messages: list[BaseMessage] = [SystemMessage(content=INTENT_SYSTEM)]
+        if summary:
+            messages.append(SystemMessage(content=summary))
         for role, content in history:
             messages.append(_as_message(role, content))
         messages.append(_as_message("user", user_message))
@@ -80,6 +84,23 @@ class LlmAdapter:
             raise ModelUnavailable(f"模型调用失败：{exc}") from exc
         if not isinstance(result, LlmOutput):
             raise ModelUnavailable("结构化输出解析失败")
+        return result
+
+    async def summarize(
+        self, previous: str, messages: list[tuple[str, str]]
+    ) -> SummaryFields:
+        """增量压缩：只给旧摘要 + 新增区间，不给全部历史，否则 token 随会话线性增长。"""
+        prompt: list[BaseMessage] = [SystemMessage(content=SUMMARY_SYSTEM)]
+        if previous:
+            prompt.append(HumanMessage(content=f"已有摘要（在此基础上更新，保留仍有效的条目）：\n{previous}"))
+        dialogue = "\n".join(f"{role}: {content}" for role, content in messages)
+        prompt.append(HumanMessage(content=f"需要压缩的对话：\n{dialogue}"))
+        try:
+            result = await self._summary_llm.ainvoke(prompt)
+        except (httpx.HTTPError, ConnectionError, TimeoutError) as exc:
+            raise ModelUnavailable(f"摘要调用失败：{exc}") from exc
+        if not isinstance(result, SummaryFields):
+            raise ModelUnavailable("摘要结构化输出解析失败")
         return result
 
     async def answer(self, messages: list[BaseMessage]) -> BaseMessage:

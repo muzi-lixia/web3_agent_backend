@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, Request
 
 from web3_agent.api.deps import Identity, chat_rate_limit, require_identity
@@ -18,6 +20,15 @@ from sqlalchemy import delete, text
 router = APIRouter(prefix="/chat", tags=["chat"], dependencies=[Depends(chat_rate_limit)])
 
 _KIND_TO_TYPE = {"answer": "answer", "ask": "ask", "reject": "answer"}
+
+# 后台摘要任务。不 await：摘要慢，不能拖住回复。集合持有引用，否则任务可能被 GC 掉。
+_BACKGROUND: set[asyncio.Task] = set()
+
+
+def _spawn_summary(coro) -> None:
+    task = asyncio.create_task(coro)
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
 
 
 @router.post("", response_model=ChatResponse, response_model_by_alias=True)
@@ -54,6 +65,11 @@ async def chat(
             await container.quota.charge(
                 db, key=quota_key, metric=QuotaMetric.RPC_CALLS, amount=rpc_calls
             )
+
+    # 事务已提交，摘要任务才能看到本轮消息；它自己开会话、自己兜异常。
+    _spawn_summary(
+        container.summarizer.run(siwe_user_id=identity.user_id, own_address=identity.address)
+    )
 
     return ChatResponse(
         type=_KIND_TO_TYPE.get(outcome.kind, "answer"),

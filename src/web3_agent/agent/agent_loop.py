@@ -26,7 +26,9 @@ from web3_agent.config.constants import (
     Route,
 )
 from web3_agent.config.settings import Settings
+from web3_agent.domain.memory import schema
 from web3_agent.persistence.conversation_context import ConversationContext
+from web3_agent.persistence.pg.repositories import summary_repo
 from web3_agent.persistence.pg.repositories.audit_repo import AuditLogger
 
 
@@ -74,10 +76,11 @@ class AgentLoop:
         if sanitized.hijacked:
             await self._audit.log("prompt_injection_filtered", siwe_user_id=siwe_user_id)
 
-        # 2. Perception：短期会话历史
+        # 2. Perception：短期会话历史 + 中期摘要
         history = await self._conversation.load(
             db, siwe_user_id=siwe_user_id
         )
+        summary_text = await self._load_summary(db, siwe_user_id)
         await self._conversation.save(
             db, siwe_user_id=siwe_user_id, role="user", content=sanitized.text
         )
@@ -85,7 +88,7 @@ class AgentLoop:
         # 3. Thought：结构化意图，带熔断
         try:
             guarded = await self._guard.run(
-                lambda: self._llm.extract_intent(history, sanitized.text)
+                lambda: self._llm.extract_intent(history, sanitized.text, summary=summary_text)
             )
         except ModelUnavailable as exc:
             await self._audit.log("model_unavailable", siwe_user_id=siwe_user_id, error=str(exc))
@@ -134,7 +137,7 @@ class AgentLoop:
         # 5. Action：只读 ReAct
         try:
             state = await self._graph.ainvoke(
-                initial_state(history, sanitized.text, wallet_address or "")
+                initial_state(history, sanitized.text, wallet_address or "", summary=summary_text)
             )
         except ModelUnavailable as exc:
             await self._audit.log("model_unavailable", siwe_user_id=siwe_user_id, error=str(exc))
@@ -152,6 +155,17 @@ class AgentLoop:
             steps=steps,
         )
         return await self._finish(db, siwe_user_id, outcome)
+
+    async def _load_summary(self, db: AsyncSession, siwe_user_id: str) -> str:
+        """摘要注入文本。status=failed 时也注入上一次成功的那份 —— 它仍然有效。"""
+        row = await summary_repo.get(db, siwe_user_id)
+        if row is None or not row.content:
+            return ""
+        return schema.render(
+            schema.loads(row.content),
+            max_chars=self._settings.summary_render_chars,
+            updated_at=row.updated_at,
+        )
 
     async def _finish(
         self, db: AsyncSession, siwe_user_id: str, outcome: ChatOutcome

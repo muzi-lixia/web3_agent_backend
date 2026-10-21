@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     read_max_react_steps: int = 5
     conversation_max_messages: int = 20
 
+    # --- 摘要（中期记忆）：窗口挤出多少条才开始压、一次最多压多少 ---
+    summary_trigger_min: int = 10
+    summary_batch_cap: int = 30
+    summary_field_max_chars: int = 200
+    summary_field_max_items: int = 50
+    summary_render_chars: int = 600
+    summary_fail_max: int = 3
+
     # --- 写链路风控（PRD 12 章：单笔等值金额上限）---
     write_max_amount_usd: float = DEFAULT_MAX_AMOUNT_USD
 
