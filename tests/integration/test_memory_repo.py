@@ -174,6 +174,33 @@ def test_watermark_advances_and_failure_keeps_it() -> None:
         _run(lambda: _cleanup(uid))
 
 
+def test_purge_removes_superseded_rows_and_watermark() -> None:
+    """合规删除：历史行、active 行、水位线一起清掉，不留「用户聊过多少条」的痕迹。"""
+    uid = _uid()
+
+    async def flow() -> tuple[int, int, object]:
+        async with pg.session_scope() as db:
+            await memory_repo.insert_many(db, uid, [_item("gas", "第一句")], [_vec(1.0)])
+        async with pg.session_scope() as db:
+            await memory_repo.supersede(db, uid, ["gas"])
+            await memory_repo.insert_many(db, uid, [_item("gas", "第二句")], [_vec(1.0)])
+            await memory_repo.advance_watermark(db, uid, 7)
+        async with pg.session_scope() as db:
+            deleted = await memory_repo.purge(db, uid)
+        async with pg.session_scope() as db:
+            left = len(await _all_rows(db, uid))
+            state = await memory_repo.get_state(db, uid)
+        return deleted, left, state
+
+    try:
+        deleted, left, state = _run(flow)
+        assert deleted == 2  # superseded 的旧行也要删
+        assert left == 0
+        assert state is None
+    finally:
+        _run(lambda: _cleanup(uid))
+
+
 def test_pending_for_memory_takes_earliest_batch() -> None:
     uid = _uid()
 

@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -100,6 +100,14 @@ async def advance_watermark(db: AsyncSession, siwe_user_id: str, message_id: int
         )
     )
     await db.execute(stmt)
+
+
+async def purge(db: AsyncSession, siwe_user_id: str) -> int:
+    """彻底删除：superseded 的历史行一起删，水位线也删 —— 留着水位线等于记住
+    用户聊过多少条消息。返回删掉的记忆条数。"""
+    result = await db.execute(delete(UserMemory).where(UserMemory.siwe_user_id == siwe_user_id))
+    await db.execute(delete(UserMemoryState).where(UserMemoryState.siwe_user_id == siwe_user_id))
+    return result.rowcount or 0
 
 
 async def mark_failed(db: AsyncSession, siwe_user_id: str) -> None:

@@ -70,3 +70,12 @@ class ClearResp(BaseModel):
     cleared_messages: int = Field(alias="clearedMessages")
     cleared_summary: bool = Field(alias="clearedSummary")
     started_at: datetime = Field(alias="startedAt")
+
+
+class PurgeResp(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    deleted_messages: int = Field(alias="deletedMessages")
+    deleted_summaries: int = Field(alias="deletedSummaries")
+    deleted_profile: bool = Field(alias="deletedProfile")
+    deleted_memories: int = Field(alias="deletedMemories")
+    deleted_at: datetime = Field(alias="deletedAt")

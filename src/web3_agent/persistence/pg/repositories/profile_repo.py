@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from sqlalchemy import delete
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -82,6 +83,12 @@ async def apply_patch(
     )
     await db.execute(stmt)
     return merged
+
+
+async def purge(db: AsyncSession, siwe_user_id: str) -> bool:
+    """删掉整份档案。返回是否真的删到了行。"""
+    result = await db.execute(delete(UserProfile).where(UserProfile.siwe_user_id == siwe_user_id))
+    return (result.rowcount or 0) > 0
 
 
 def _merge_tokens(

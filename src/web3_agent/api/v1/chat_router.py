@@ -8,12 +8,19 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Request
 
 from web3_agent.api.deps import Identity, chat_rate_limit, require_identity
-from web3_agent.api.schemas.chat_schema import ChatRequest, ChatResponse, HistoryResp, HistoryItem, ClearResp
+from web3_agent.api.schemas.chat_schema import (
+    ChatRequest,
+    ChatResponse,
+    ClearResp,
+    HistoryItem,
+    HistoryResp,
+    PurgeResp,
+)
 from web3_agent.common.exceptions import E102_CHAIN_NOT_ALLOWED, AppError, E509_CHAIN_IDENTITY_MISMATCH
 from web3_agent.config.constants import QuotaMetric
 from web3_agent.persistence.pg.base import session_scope
 from web3_agent.persistence.pg.orm_models import ConversationSummary
-from web3_agent.persistence.pg.repositories import conversation_repo
+from web3_agent.persistence.pg.repositories import conversation_repo, memory_repo, profile_repo
 from web3_agent.web3.metering import take_rpc_calls
 from sqlalchemy import delete, text
 
@@ -126,5 +133,48 @@ async def clear(request: Request, identity: Identity = Depends(require_identity)
         cleared_messages=cleared,
         cleared_summary=(result.rowcount or 0) > 0,
         started_at=started,
+    )
+
+
+@router.delete("/memory", response_model=PurgeResp, response_model_by_alias=True)
+async def purge_memory(
+    request: Request, identity: Identity = Depends(require_identity)
+) -> PurgeResp:
+    """彻底删除该用户的全部对话数据：消息、摘要、档案、长期记忆、抽取水位线。
+
+    与 `/chat/clear` 的差别是连长期记忆一起删，且不可恢复 —— 合规诉求走这里，
+    清空对话走那里。审计日志不删，它要留下「什么时候删过」这条记录本身。
+    """
+    container = request.app.state.container
+    deleted_at = datetime.now(timezone.utc)
+    async with session_scope() as db:
+        # 与 clear 用同一把锁：删的过程中不能再有 /chat 往同一个用户身上写。
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:u))"), {"u": identity.user_id}
+        )
+        messages = await conversation_repo.clear_user_messages(db, identity.user_id)
+        summaries = await db.execute(
+            delete(ConversationSummary).where(
+                ConversationSummary.siwe_user_id == identity.user_id
+            )
+        )
+        profile_deleted = await profile_repo.purge(db, identity.user_id)
+        memories = await memory_repo.purge(db, identity.user_id)
+
+    deleted_summaries = summaries.rowcount or 0
+    await container.audit.log(
+        "data_purged",
+        siwe_user_id=identity.user_id,
+        messages=messages,
+        summaries=deleted_summaries,
+        profile=profile_deleted,
+        memories=memories,
+    )
+    return PurgeResp(
+        deleted_messages=messages,
+        deleted_summaries=deleted_summaries,
+        deleted_profile=profile_deleted,
+        deleted_memories=memories,
+        deleted_at=deleted_at,
     )
 
