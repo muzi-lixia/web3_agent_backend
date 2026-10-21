@@ -244,8 +244,15 @@ class AgentLoop:
     async def _finish(
         self, db: AsyncSession, siwe_user_id: str, outcome: ChatOutcome
     ) -> ChatOutcome:
+        # 工具轨迹随消息落库：历史记录要能复原「这条回答查了什么」。
+        # 没有调工具时留 NULL，不要写空数组 —— 绝大多数轮次都是这种。
+        calls = [call.model_dump() for call in outcome.tool_calls]
         await self._conversation.save(
-            db, siwe_user_id=siwe_user_id, role="assistant", content=outcome.content
+            db,
+            siwe_user_id=siwe_user_id,
+            role="assistant",
+            content=outcome.content,
+            tool_calls=calls or None,
         )
         return outcome
 

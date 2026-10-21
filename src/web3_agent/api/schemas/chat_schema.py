@@ -56,6 +56,7 @@ class HistoryItem(BaseModel):
     id: int
     role: str
     content: str
+    tool_calls: list[dict[str, Any]] | None = Field(default=None, alias="toolCalls")
     created_at: datetime = Field(alias="createdAt")
 
 

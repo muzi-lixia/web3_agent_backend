@@ -105,7 +105,13 @@ async def history(
     rows = rows[:limit]
     return HistoryResp(
         items=[
-            HistoryItem(id=r.id, role=r.role, content=r.content, created_at=r.created_at)
+            HistoryItem(
+                id=r.id,
+                role=r.role,
+                content=r.content,
+                tool_calls=r.tool_calls,
+                created_at=r.created_at,
+            )
             for r in reversed(rows)
         ],
         has_more=has_more,
