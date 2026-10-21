@@ -30,7 +30,8 @@ from web3_agent.domain.quotas import QuotaController
 from web3_agent.middlewares.error_handler_middleware import register_exception_handlers
 from web3_agent.middlewares.trace_middleware import TraceMiddleware
 from web3_agent.persistence.conversation_context import ConversationContext
-from web3_agent.persistence.pg.base import create_all, dispose_engine, init_engine
+from web3_agent.persistence.pg.base import create_all, dispose_engine, init_engine, session_scope
+from web3_agent.persistence.pg.repositories import nonce_repo
 from web3_agent.persistence.pg.repositories.audit_repo import AuditLogger
 from web3_agent.web3.chain_adapter import ChainAdapter
 from web3_agent.web3.tools.read.get_asset_balance import build_get_asset_balance
@@ -41,6 +42,7 @@ setup_logging(get_settings().log_level)
 logger = logging.getLogger(__name__)
 
 _HEARTBEAT_INTERVAL_SECONDS = 3600
+_NONCE_CLEANUP_INTERVAL_SECONDS = 3600
 
 
 @dataclass
@@ -126,16 +128,17 @@ async def lifespan(app: FastAPI):
         except ModelUnavailable as exc:
             logger.error("ollama not ready: %s", exc)
 
-    heartbeat_task: asyncio.Task | None = None
+    background: list[asyncio.Task] = []
     if container.tracing_enabled:
         logger.info("langsmith heartbeat: %s", langsmith_tracer.heartbeat())
-        heartbeat_task = asyncio.create_task(_heartbeat_loop())
+        background.append(asyncio.create_task(_heartbeat_loop()))
+    background.append(asyncio.create_task(_nonce_cleanup_loop()))
 
     try:
         yield
     finally:
-        if heartbeat_task is not None:
-            heartbeat_task.cancel()
+        for task in background:
+            task.cancel()
         await container.adapter.aclose()
         await dispose_engine()
 
@@ -146,6 +149,25 @@ async def _heartbeat_loop() -> None:
         await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
         if not langsmith_tracer.heartbeat():
             logger.error("langsmith heartbeat failed: 上报链路可能已断")
+
+
+async def _cleanup_expired_nonces() -> None:
+    """删除过期超过保留窗口的 nonce。失败只记日志，不影响服务。"""
+    try:
+        async with session_scope() as db:
+            removed = await nonce_repo.cleanup(db)
+    except Exception:  # noqa: BLE001
+        logger.exception("nonce cleanup failed")
+        return
+    if removed:
+        logger.info("nonce cleanup: removed %d expired rows", removed)
+
+
+async def _nonce_cleanup_loop() -> None:
+    """启动先清一次，之后每小时一次。"""
+    while True:
+        await _cleanup_expired_nonces()
+        await asyncio.sleep(_NONCE_CLEANUP_INTERVAL_SECONDS)
 
 
 def create_app() -> FastAPI:
