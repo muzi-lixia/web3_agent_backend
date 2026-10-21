@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import secrets
-import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Request
@@ -23,7 +22,7 @@ from web3_agent.common.evm_address import normalize_address, to_checksum_address
 from web3_agent.common.exceptions import E102_CHAIN_NOT_ALLOWED, E503_UNAUTHENTICATED, AppError
 from web3_agent.domain.auth import siwe, tokens
 from web3_agent.persistence.pg.base import session_scope
-from web3_agent.persistence.pg.repositories import conversation_repo, nonce_repo
+from web3_agent.persistence.pg.repositories import nonce_repo
 
 router = APIRouter(prefix="/auth", tags=["auth"], dependencies=[Depends(auth_rate_limit)])
 
@@ -104,19 +103,9 @@ async def verify(payload: VerifyRequest, request: Request) -> VerifyResponse:
             address=message.address,
             chain_id=message.chain_id,
         )
-        session_id = uuid.uuid4().hex
-        await conversation_repo.touch_session(
-            db,
-            session_id=session_id,
-            siwe_user_id=claims.user_id,
-            wallet_address=claims.address,
-            chain_id=claims.chain_id,
-            ttl_seconds=settings.conversation_ttl_seconds,
-        )
 
     await audit.log("siwe_login", siwe_user_id=claims.user_id, chain_id=claims.chain_id)
     return VerifyResponse(
-        session_id=session_id,
         token=token,
         siwe_address=to_checksum_address(claims.address),
         siwe_address_short=_short(claims.address),

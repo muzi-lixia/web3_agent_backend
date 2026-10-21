@@ -39,7 +39,6 @@ class Settings(BaseSettings):
     # --- Agent ---
     confidence_threshold: float = 0.75
     read_max_react_steps: int = 5
-    conversation_ttl_seconds: int = 7200
     conversation_max_messages: int = 20
 
     # --- 写链路风控（PRD 12 章：单笔等值金额上限）---

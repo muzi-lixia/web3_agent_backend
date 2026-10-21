@@ -17,6 +17,8 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
+    Index
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -24,27 +26,44 @@ from sqlalchemy.orm import Mapped, mapped_column
 from web3_agent.persistence.pg.base import Base
 
 
-class ConversationSession(Base):
-    __tablename__ = "conversation_session"
-
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    siwe_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    wallet_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    chain_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-
-
 class ConversationMessage(Base):
     __tablename__ = "conversation_message"
+    __table_args__ = (Index("ix_conv_msg_user_id_desc", "siwe_user_id", text("id DESC")),)
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    session_id: Mapped[str] = mapped_column(String(64), index=True)
+    siwe_user_id: Mapped[str] = mapped_column(String(64))
     role: Mapped[str] = mapped_column(String(16))  # user | assistant | tool | summary
     content: Mapped[str] = mapped_column(Text)
     tool_calls: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ConversationSummary(Base):
+    __tablename__ = "conversation_summary"
+    siwe_user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    content: Mapped[str] = mapped_column(Text)
+    last_summarized_message_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    version: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(16), default="ok")
+    fail_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class UserProfile(Base):
+    __tablename__ = "user_profile"
+
+    siwe_user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    answer_style: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    language: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    preferred_chain_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    frequent_tokens: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    risk_preference: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class AuditLog(Base):

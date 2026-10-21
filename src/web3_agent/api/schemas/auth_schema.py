@@ -32,7 +32,6 @@ class VerifyRequest(BaseModel):
 class VerifyResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
-    session_id: str = Field(alias="sessionId")
     token: str
     siwe_address: str = Field(alias="siweAddress")
     siwe_address_short: str = Field(alias="siweAddressShort")

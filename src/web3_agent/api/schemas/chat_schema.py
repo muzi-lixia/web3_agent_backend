@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -17,7 +18,6 @@ class WalletRef(BaseModel):
 class ChatRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
-    session_id: str = Field(alias="sessionId", min_length=1, max_length=64)
     wallet: WalletRef | None = None
     user_message: str = Field(alias="userMessage", min_length=1, max_length=4000)
 
@@ -50,3 +50,23 @@ class ErrorResponse(BaseModel):
     error_msg: str = Field(alias="errorMsg")
     retryable: bool = False
     http_status: int = Field(alias="httpStatus")
+
+class HistoryItem(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    id: int
+    role: str
+    content: str
+    created_at: datetime = Field(alias="createdAt")
+
+
+class HistoryResp(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    items: list[HistoryItem]
+    has_more: bool = Field(alias="hasMore")
+
+
+class ClearResp(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    cleared_messages: int = Field(alias="clearedMessages")
+    cleared_summary: bool = Field(alias="clearedSummary")
+    started_at: datetime = Field(alias="startedAt")

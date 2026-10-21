@@ -67,7 +67,6 @@ def build_container(settings: Settings) -> Container:
     llm = LlmAdapter(settings)
     runner = ToolRunner(registry)
     conversation = ConversationContext(
-        ttl_seconds=settings.conversation_ttl_seconds,
         max_messages=settings.conversation_max_messages,
     )
     audit = AuditLogger()

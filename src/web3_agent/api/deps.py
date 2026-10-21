@@ -1,7 +1,7 @@
 """鉴权与限流依赖。
 
-只读匿名可访问，所以默认是"可选身份"；写接口必须改用 require_identity。
-限流放在依赖里而不是中间件：/health 不该被计数，中间件无法按路由区分。
+业务接口一律 require_identity；只有限流依赖用 optional_identity ——
+未登录请求要先按 IP 计一次数再 401，直接用 require_identity 会让匿名刷接口不计费。
 """
 
 from __future__ import annotations

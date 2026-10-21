@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Request
 
-from web3_agent.api.deps import Identity, chat_rate_limit, optional_identity
-from web3_agent.api.schemas.chat_schema import ChatRequest, ChatResponse
-from web3_agent.common.exceptions import E102_CHAIN_NOT_ALLOWED, AppError
+from web3_agent.api.deps import Identity, chat_rate_limit, require_identity
+from web3_agent.api.schemas.chat_schema import ChatRequest, ChatResponse, HistoryResp, HistoryItem, ClearResp
+from web3_agent.common.exceptions import E102_CHAIN_NOT_ALLOWED, AppError, E509_CHAIN_IDENTITY_MISMATCH
 from web3_agent.config.constants import QuotaMetric
 from web3_agent.persistence.pg.base import session_scope
+from web3_agent.persistence.pg.orm_models import ConversationSummary
+from web3_agent.persistence.pg.repositories import conversation_repo
 from web3_agent.web3.metering import take_rpc_calls
+from sqlalchemy import delete, text
 
 router = APIRouter(prefix="/chat", tags=["chat"], dependencies=[Depends(chat_rate_limit)])
 
@@ -20,24 +24,23 @@ _KIND_TO_TYPE = {"answer": "answer", "ask": "ask", "reject": "answer"}
 async def chat(
     payload: ChatRequest,
     request: Request,
-    identity: Identity | None = Depends(optional_identity),
+    identity: Identity = Depends(require_identity),
 ) -> ChatResponse:
     container = request.app.state.container
 
     if payload.wallet and payload.wallet.chain_id not in container.settings.allowed_chain_ids:
-        code, msg, status = E102_CHAIN_NOT_ALLOWED
-        raise AppError(code, msg, status)
+        raise AppError(*E102_CHAIN_NOT_ALLOWED)
 
-    wallet_address = payload.wallet.address if payload.wallet else None
-    if identity is not None:
-        wallet_address = identity.address
+    chain_id = payload.wallet.chain_id if payload.wallet else None
+    if chain_id is not None and chain_id != identity.chain_id:
+        raise AppError(*E509_CHAIN_IDENTITY_MISMATCH)
 
     async with session_scope() as db:
         outcome = await container.agent.handle(
             db,
-            session_id=payload.session_id,
-            wallet_address=wallet_address,
-            chain_id=payload.wallet.chain_id if payload.wallet else None,
+            siwe_user_id=identity.user_id,
+            wallet_address=identity.address,
+            chain_id=chain_id,
             user_message=payload.user_message,
         )
 
@@ -60,3 +63,47 @@ async def chat(
             "toolCalls": [call.model_dump() for call in outcome.tool_calls],
         },
     )
+
+@router.get("/history", response_model=HistoryResp, response_model_by_alias=True)
+async def history(
+    before: int | None = None,
+    limit: int = 20,
+    identity: Identity = Depends(require_identity),
+) -> HistoryResp:
+    limit = max(1, min(limit, 50))
+    async with session_scope() as db:
+        rows = await conversation_repo.list_page(db, identity.user_id, limit, before)
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    return HistoryResp(
+        items=[
+            HistoryItem(id=r.id, role=r.role, content=r.content, created_at=r.created_at)
+            for r in reversed(rows)
+        ],
+        has_more=has_more,
+    )
+
+
+@router.post("/clear", response_model=ClearResp, response_model_by_alias=True)
+async def clear(request: Request, identity: Identity = Depends(require_identity)) -> ClearResp:
+    container = request.app.state.container
+    started = datetime.now(timezone.utc)
+    async with session_scope() as db:
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:u))"), {"u": identity.user_id}
+        )
+        cleared = await conversation_repo.clear_user_messages(db, identity.user_id)
+        result = await db.execute(
+            delete(ConversationSummary).where(
+                ConversationSummary.siwe_user_id == identity.user_id
+            )
+        )
+    await container.audit.log(
+        "conversation_cleared", siwe_user_id=identity.user_id, cleared=cleared
+    )
+    return ClearResp(
+        cleared_messages=cleared,
+        cleared_summary=(result.rowcount or 0) > 0,
+        started_at=started,
+    )
+

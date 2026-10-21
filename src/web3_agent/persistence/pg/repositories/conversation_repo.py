@@ -1,64 +1,20 @@
-"""conversation_session / conversation_message 读写。过期是惰性判定，没有后台清理任务。"""
+"""conversation_message 读写。会话不是表，归属只有 siwe_user_id 一个来源。"""
 
 from __future__ import annotations
-
-from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from web3_agent.persistence.pg.orm_models import ConversationMessage, ConversationSession
-
-
-async def touch_session(
-    db: AsyncSession,
-    *,
-    session_id: str,
-    wallet_address: str | None,
-    chain_id: int | None,
-    ttl_seconds: int,
-    siwe_user_id: str | None = None,
-) -> datetime:
-    """取会话；不存在或已过期就从空历史重新开始。返回本次的 expires_at。"""
-    now = datetime.now(timezone.utc)
-    expires_at = now + timedelta(seconds=ttl_seconds)
-
-    row = await db.get(ConversationSession, session_id)
-    if row is None:
-        db.add(
-            ConversationSession(
-                id=session_id,
-                siwe_user_id=siwe_user_id,
-                wallet_address=wallet_address,
-                chain_id=chain_id,
-                expires_at=expires_at,
-            )
-        )
-        await db.flush()
-        return expires_at
-
-    if row.expires_at <= now:
-        await db.execute(
-            delete(ConversationMessage).where(ConversationMessage.session_id == session_id)
-        )
-        row.created_at = now
-
-    row.siwe_user_id = siwe_user_id or row.siwe_user_id
-    row.wallet_address = wallet_address or row.wallet_address
-    row.chain_id = chain_id or row.chain_id
-    row.last_seen_at = now
-    row.expires_at = expires_at
-    await db.flush()
-    return expires_at
+from web3_agent.persistence.pg.orm_models import ConversationMessage
 
 
 async def load_history(
-    db: AsyncSession, session_id: str, limit: int
+    db: AsyncSession, siwe_user_id: str, limit: int
 ) -> list[tuple[str, str]]:
-    """按时间正序返回最近 limit 条 (role, content)。"""
+    """按 id 正序返回最近 limit 条 (role, content)。"""
     stmt = (
         select(ConversationMessage.role, ConversationMessage.content)
-        .where(ConversationMessage.session_id == session_id)
+        .where(ConversationMessage.siwe_user_id == siwe_user_id)
         .order_by(ConversationMessage.id.desc())
         .limit(limit)
     )
@@ -66,17 +22,35 @@ async def load_history(
     return [(r.role, r.content) for r in reversed(rows)]
 
 
+async def list_page(
+    db: AsyncSession, siwe_user_id: str, limit: int, before_id: int | None = None
+) -> list[ConversationMessage]:
+    """多取一条用来判 hasMore。"""
+    stmt = select(ConversationMessage).where(ConversationMessage.siwe_user_id == siwe_user_id)
+    if before_id is not None:
+        stmt = stmt.where(ConversationMessage.id < before_id)
+    stmt = stmt.order_by(ConversationMessage.id.desc()).limit(limit + 1)
+    return list((await db.execute(stmt)).scalars().all())
+
+
 async def append_message(
     db: AsyncSession,
     *,
-    session_id: str,
+    siwe_user_id: str,
     role: str,
     content: str,
     tool_calls: list | None = None,
-) -> None:
-    db.add(
-        ConversationMessage(
-            session_id=session_id, role=role, content=content, tool_calls=tool_calls
-        )
+) -> int:
+    row = ConversationMessage(
+        siwe_user_id=siwe_user_id, role=role, content=content, tool_calls=tool_calls
     )
+    db.add(row)
     await db.flush()
+    return row.id
+
+
+async def clear_user_messages(db: AsyncSession, siwe_user_id: str) -> int:
+    result = await db.execute(
+        delete(ConversationMessage).where(ConversationMessage.siwe_user_id == siwe_user_id)
+    )
+    return result.rowcount or 0

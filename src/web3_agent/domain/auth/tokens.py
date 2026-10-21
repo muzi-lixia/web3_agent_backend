@@ -25,9 +25,9 @@ class SiweClaims:
     expires_at: datetime
 
 
-def user_id_for(address: str, chain_id: int) -> str:
-    """用户主键由地址与链推导，不另开用户表也能稳定归属。"""
-    return f"eip155:{chain_id}:{address.lower()}"
+def user_id_for(address: str) -> str:
+    """用户主键由地址推导，不另开用户表也能稳定归属。"""
+    return f"eip155:{address.lower()}"
 
 
 def issue(
@@ -45,7 +45,7 @@ def issue(
     if normalized is None:
         raise AppError(*E503_UNAUTHENTICATED)
     claims = SiweClaims(
-        user_id=user_id_for(normalized, chain_id),
+        user_id=user_id_for(normalized),
         address=normalized,
         chain_id=chain_id,
         expires_at=expires_at,

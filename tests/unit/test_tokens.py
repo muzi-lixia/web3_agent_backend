@@ -31,12 +31,12 @@ def test_issue_and_decode_roundtrip() -> None:
 
     assert decoded.address == ADDRESS
     assert decoded.chain_id == 80094
-    assert decoded.user_id == claims.user_id == f"eip155:80094:{ADDRESS}"
+    assert decoded.user_id == claims.user_id == f"eip155:{ADDRESS}"
 
 
 def test_user_id_is_stable_across_checksum_case() -> None:
     mixed = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"
-    assert tokens.user_id_for(mixed, 1) == tokens.user_id_for(mixed.lower(), 1)
+    assert tokens.user_id_for(mixed) == tokens.user_id_for(mixed.lower())
 
 
 def test_decode_rejects_wrong_secret() -> None:

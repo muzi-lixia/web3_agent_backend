@@ -63,6 +63,7 @@ ERROR_TABLE: dict[str, tuple[str, int]] = {
     "E507": ("模型服务暂时不可用", 503),
     # PRD 表未列：PRD 8.7 要求 fromAddress 必须等于绑定的 siweAddress，但没给错误码。
     "E508": ("钱包地址与登录身份不一致", 403),
+    "E509": ("链与登录身份不一致", 403),
 }
 
 
@@ -86,3 +87,4 @@ E302_RPC_ERROR = error_tuple("E302")
 E501_QUOTA_EXHAUSTED = error_tuple("E501")
 E503_UNAUTHENTICATED = error_tuple("E503")
 E507_MODEL_UNAVAILABLE = error_tuple("E507")
+E509_CHAIN_IDENTITY_MISMATCH = error_tuple("E509")

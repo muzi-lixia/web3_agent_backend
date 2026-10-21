@@ -54,7 +54,7 @@ class AgentLoop:
         self,
         db: AsyncSession,
         *,
-        session_id: str,
+        siwe_user_id: str,
         wallet_address: str | None,
         chain_id: int | None,
         user_message: str,
@@ -66,20 +66,20 @@ class AgentLoop:
                 "secret_leak_blocked",
                 kind=hit.kind,
                 excerpt=hit.excerpt,
-                session_id=session_id,
+                siwe_user_id=siwe_user_id,
             )
             return ChatOutcome(kind="reject", content=MSG_SECRET_REFUSED)
 
         sanitized = sanitize_free_text(user_message)
         if sanitized.hijacked:
-            await self._audit.log("prompt_injection_filtered", session_id=session_id)
+            await self._audit.log("prompt_injection_filtered", siwe_user_id=siwe_user_id)
 
         # 2. Perception：短期会话历史
         history = await self._conversation.load(
-            db, session_id=session_id, wallet_address=wallet_address, chain_id=chain_id
+            db, siwe_user_id=siwe_user_id
         )
         await self._conversation.save(
-            db, session_id=session_id, role="user", content=sanitized.text
+            db, siwe_user_id=siwe_user_id, role="user", content=sanitized.text
         )
 
         # 3. Thought：结构化意图，带熔断
@@ -88,15 +88,15 @@ class AgentLoop:
                 lambda: self._llm.extract_intent(history, sanitized.text)
             )
         except ModelUnavailable as exc:
-            await self._audit.log("model_unavailable", session_id=session_id, error=str(exc))
+            await self._audit.log("model_unavailable", siwe_user_id=siwe_user_id, error=str(exc))
             code, msg, status = E507_MODEL_UNAVAILABLE
             raise AppError(code, msg, status, retryable=True) from exc
         if guarded.degraded or guarded.output is None:
             await self._audit.log(
-                "llm_json_degraded", session_id=session_id, attempts=guarded.attempts
+                "llm_json_degraded", siwe_user_id=siwe_user_id, attempts=guarded.attempts
             )
             return await self._finish(
-                db, session_id, ChatOutcome(kind="answer", content=MSG_JSON_DEGRADED, degraded=True)
+                db, siwe_user_id, ChatOutcome(kind="answer", content=MSG_JSON_DEGRADED, degraded=True)
             )
 
         # 4. IntentRouter：唯一路由决策点
@@ -105,7 +105,7 @@ class AgentLoop:
         )
         await self._audit.log(
             "intent_routed",
-            session_id=session_id,
+            siwe_user_id=siwe_user_id,
             intent=guarded.output.intent.value,
             confidence=guarded.output.confidence,
             route=decision.route.value,
@@ -115,7 +115,7 @@ class AgentLoop:
         if decision.route is Route.CLARIFY:
             return await self._finish(
                 db,
-                session_id,
+                siwe_user_id,
                 ChatOutcome(
                     kind="ask",
                     content=MSG_CLARIFY,
@@ -124,11 +124,11 @@ class AgentLoop:
             )
         if decision.route is Route.REJECT:
             return await self._finish(
-                db, session_id, ChatOutcome(kind="reject", content=MSG_OUT_OF_SCOPE)
+                db, siwe_user_id, ChatOutcome(kind="reject", content=MSG_OUT_OF_SCOPE)
             )
         if decision.route is Route.WRITE:
             return await self._finish(
-                db, session_id, ChatOutcome(kind="answer", content=MSG_WRITE_NOT_ENABLED)
+                db, siwe_user_id, ChatOutcome(kind="answer", content=MSG_WRITE_NOT_ENABLED)
             )
 
         # 5. Action：只读 ReAct
@@ -137,7 +137,7 @@ class AgentLoop:
                 initial_state(history, sanitized.text, wallet_address or "")
             )
         except ModelUnavailable as exc:
-            await self._audit.log("model_unavailable", session_id=session_id, error=str(exc))
+            await self._audit.log("model_unavailable", siwe_user_id=siwe_user_id, error=str(exc))
             code, msg, status = E507_MODEL_UNAVAILABLE
             raise AppError(code, msg, status, retryable=True) from exc
         answer = state["messages"][-1].content
@@ -151,13 +151,13 @@ class AgentLoop:
             tool_calls=[_record(item) for item in state.get("tool_calls", [])],
             steps=steps,
         )
-        return await self._finish(db, session_id, outcome)
+        return await self._finish(db, siwe_user_id, outcome)
 
     async def _finish(
-        self, db: AsyncSession, session_id: str, outcome: ChatOutcome
+        self, db: AsyncSession, siwe_user_id: str, outcome: ChatOutcome
     ) -> ChatOutcome:
         await self._conversation.save(
-            db, session_id=session_id, role="assistant", content=outcome.content
+            db, siwe_user_id=siwe_user_id, role="assistant", content=outcome.content
         )
         return outcome
 
