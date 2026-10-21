@@ -16,6 +16,8 @@ import jwt
 from web3_agent.common.evm_address import normalize_address
 from web3_agent.common.exceptions import E503_UNAUTHENTICATED, AppError
 
+_USER_NAMESPACE = uuid.UUID("f9989dd8-f823-4680-86c4-26f3eeb6729c")
+
 
 @dataclass(frozen=True)
 class SiweClaims:
@@ -26,8 +28,12 @@ class SiweClaims:
 
 
 def user_id_for(address: str) -> str:
-    """用户主键由地址推导，不另开用户表也能稳定归属。"""
-    return f"eip155:{address.lower()}"
+    """用户主键由地址确定性推导成 UUID。
+
+    不含地址本身，且同一钱包永远得到同一个 id —— 不另开用户表也能稳定归属。
+    命名空间一旦有真实用户就不能改：改了所有人的 id 全变，历史数据全部失联。
+    """
+    return str(uuid.uuid5(_USER_NAMESPACE, address.lower()))
 
 
 def issue(

@@ -105,7 +105,10 @@ class Summarizer:
     async def _summarize(self, siwe_user_id: str, own_address: str, job: _Job) -> None:
         # 后台任务是独立的 run，但 trace_id 跟着触发它的那轮请求走。
         run = langsmith_tracer.run_config(
-            "summary.run", trace_id=get_trace_id(), until_id=job.until_id
+            "summary.run",
+            trace_id=get_trace_id(),
+            until_id=job.until_id,
+            siwe_user_id=siwe_user_id,
         )
         if run:
             set_run_id(run["run_id"])

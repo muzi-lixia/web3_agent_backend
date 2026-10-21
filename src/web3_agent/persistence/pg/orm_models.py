@@ -132,6 +132,7 @@ class AuditLog(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     trace_id: Mapped[str] = mapped_column(String(64), index=True)
     siwe_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    siwe_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
     event: Mapped[str] = mapped_column(String(64), index=True)
     payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     langsmith_run_id: Mapped[str | None] = mapped_column(String(128), nullable=True)

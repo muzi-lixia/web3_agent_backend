@@ -104,7 +104,12 @@ async def verify(payload: VerifyRequest, request: Request) -> VerifyResponse:
             chain_id=message.chain_id,
         )
 
-    await audit.log("siwe_login", siwe_user_id=claims.user_id, chain_id=claims.chain_id)
+    await audit.log(
+        "siwe_login",
+        siwe_user_id=claims.user_id,
+        siwe_address=claims.address,
+        chain_id=claims.chain_id,
+    )
     return VerifyResponse(
         token=token,
         siwe_address=to_checksum_address(claims.address),

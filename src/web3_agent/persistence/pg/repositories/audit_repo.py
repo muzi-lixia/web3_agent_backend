@@ -21,6 +21,7 @@ class AuditLogger:
         event: str,
         *,
         siwe_user_id: str | None = None,
+        siwe_address: str | None = None,
         langsmith_run_id: str | None = None,
         **payload: Any,
     ) -> None:
@@ -33,6 +34,7 @@ class AuditLogger:
                     AuditLog(
                         trace_id=get_trace_id(),
                         siwe_user_id=siwe_user_id,
+                        siwe_address=siwe_address,
                         event=event,
                         payload=payload or None,
                         langsmith_run_id=langsmith_run_id or get_run_id() or None,

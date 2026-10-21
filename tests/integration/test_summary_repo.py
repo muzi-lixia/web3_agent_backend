@@ -31,7 +31,7 @@ pytestmark = pytest.mark.skipif(not _pg_ready(), reason="本机 PostgreSQL 不�
 
 
 def _uid() -> str:
-    return f"eip155:0x{uuid.uuid4().hex[:40]}"
+    return str(uuid.uuid4())
 
 
 async def _seed(uid: str, count: int) -> list[int]:

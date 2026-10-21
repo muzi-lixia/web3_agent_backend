@@ -90,7 +90,10 @@ class MemoryExtractor:
 
     async def _extract(self, siwe_user_id: str, job: _Job) -> None:
         run = langsmith_tracer.run_config(
-            "memory.extract", trace_id=get_trace_id(), until_id=job.until_id
+            "memory.extract",
+            trace_id=get_trace_id(),
+            until_id=job.until_id,
+            siwe_user_id=siwe_user_id,
         )
         if run:
             set_run_id(run["run_id"])

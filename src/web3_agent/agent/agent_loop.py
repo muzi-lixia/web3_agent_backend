@@ -82,7 +82,10 @@ class AgentLoop:
 
         # 密钥命中时上面已经返回，不会走到这里 —— 所以这一段之后才开 trace。
         turn = langsmith_tracer.run_config(
-            "chat.turn", trace_id=get_trace_id(), chain_id=chain_id
+            "chat.turn",
+            trace_id=get_trace_id(),
+            chain_id=chain_id,
+            siwe_user_id=siwe_user_id,
         )
         if turn:
             set_run_id(turn["run_id"])
@@ -108,7 +111,9 @@ class AgentLoop:
                     profile=profile_text,
                     memories=memory_text,
                     config=langsmith_tracer.run_config(
-                        "intent.extract", trace_id=get_trace_id()
+                        "intent.extract",
+                        trace_id=get_trace_id(),
+                        siwe_user_id=siwe_user_id,
                     ),
                 )
             )
