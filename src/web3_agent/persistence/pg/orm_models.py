@@ -219,7 +219,9 @@ class QuotaCounter(Base):
     __tablename__ = "quota_counter"
 
     subject: Mapped[str] = mapped_column(String(128), primary_key=True)
-    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    window_start: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), primary_key=True, index=True
+    )
     count: Mapped[int] = mapped_column(BigInteger, default=0)
 
 

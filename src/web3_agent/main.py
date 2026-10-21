@@ -31,7 +31,7 @@ from web3_agent.middlewares.error_handler_middleware import register_exception_h
 from web3_agent.middlewares.trace_middleware import TraceMiddleware
 from web3_agent.persistence.conversation_context import ConversationContext
 from web3_agent.persistence.pg.base import create_all, dispose_engine, init_engine, session_scope
-from web3_agent.persistence.pg.repositories import nonce_repo
+from web3_agent.persistence.pg.repositories import nonce_repo, quota_repo
 from web3_agent.persistence.pg.repositories.audit_repo import AuditLogger
 from web3_agent.web3.chain_adapter import ChainAdapter
 from web3_agent.web3.tools.read.get_asset_balance import build_get_asset_balance
@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 _HEARTBEAT_INTERVAL_SECONDS = 3600
 _NONCE_CLEANUP_INTERVAL_SECONDS = 3600
+_QUOTA_CLEANUP_INTERVAL_SECONDS = 3600
 
 
 @dataclass
@@ -133,6 +134,7 @@ async def lifespan(app: FastAPI):
         logger.info("langsmith heartbeat: %s", langsmith_tracer.heartbeat())
         background.append(asyncio.create_task(_heartbeat_loop()))
     background.append(asyncio.create_task(_nonce_cleanup_loop()))
+    background.append(asyncio.create_task(_quota_cleanup_loop()))
 
     try:
         yield
@@ -168,6 +170,25 @@ async def _nonce_cleanup_loop() -> None:
     while True:
         await _cleanup_expired_nonces()
         await asyncio.sleep(_NONCE_CLEANUP_INTERVAL_SECONDS)
+
+
+async def _cleanup_old_quota() -> None:
+    """回收过窗口的限流与配额计数。失败只记日志，不影响服务。"""
+    try:
+        async with session_scope() as db:
+            removed = await quota_repo.cleanup(db)
+    except Exception:  # noqa: BLE001
+        logger.exception("quota cleanup failed")
+        return
+    if removed:
+        logger.info("quota cleanup: removed %d old buckets", removed)
+
+
+async def _quota_cleanup_loop() -> None:
+    """启动先清一次，之后每小时一次。"""
+    while True:
+        await _cleanup_old_quota()
+        await asyncio.sleep(_QUOTA_CLEANUP_INTERVAL_SECONDS)
 
 
 def create_app() -> FastAPI:
