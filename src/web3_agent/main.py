@@ -21,6 +21,8 @@ from web3_agent.api.v1 import auth_router, chat_router, health_router
 from web3_agent.common.exceptions import ModelUnavailable
 from web3_agent.config.constants import ToolGroup
 from web3_agent.config.settings import Settings, get_settings
+from web3_agent.domain.memory.embedder import Embedder
+from web3_agent.domain.memory.extractor import MemoryExtractor
 from web3_agent.domain.memory.summarizer import Summarizer
 from web3_agent.domain.quotas import QuotaController
 from web3_agent.middlewares.error_handler_middleware import register_exception_handlers
@@ -46,6 +48,7 @@ class Container:
     audit: AuditLogger
     quota: QuotaController
     summarizer: Summarizer
+    memory: MemoryExtractor
     tracing_enabled: bool
 
 
@@ -73,6 +76,7 @@ def build_container(settings: Settings) -> Container:
     )
     audit = AuditLogger()
     quota = QuotaController(settings)
+    embedder = Embedder(settings)
 
     agent = AgentLoop(
         settings=settings,
@@ -82,8 +86,12 @@ def build_container(settings: Settings) -> Container:
         audit=audit,
         model_with_tools=llm.bind_tools(registry.llm_tools()),
         runner=runner,
+        embedder=embedder,
     )
     summarizer = Summarizer(settings=settings, llm=llm, audit=audit, quota=quota)
+    memory = MemoryExtractor(
+        settings=settings, llm=llm, embedder=embedder, audit=audit, quota=quota
+    )
     return Container(
         settings=settings,
         adapter=adapter,
@@ -92,6 +100,7 @@ def build_container(settings: Settings) -> Container:
         audit=audit,
         quota=quota,
         summarizer=summarizer,
+        memory=memory,
         tracing_enabled=tracing_enabled,
     )
 

@@ -26,9 +26,10 @@ from web3_agent.config.constants import (
     Route,
 )
 from web3_agent.config.settings import Settings
-from web3_agent.domain.memory import profile, schema
+from web3_agent.domain.memory import memory, profile, schema
+from web3_agent.domain.memory.embedder import Embedder
 from web3_agent.persistence.conversation_context import ConversationContext
-from web3_agent.persistence.pg.repositories import profile_repo, summary_repo
+from web3_agent.persistence.pg.repositories import memory_repo, profile_repo, summary_repo
 from web3_agent.persistence.pg.repositories.audit_repo import AuditLogger
 
 
@@ -42,12 +43,14 @@ class AgentLoop:
         audit: AuditLogger,
         model_with_tools,
         runner,
+        embedder: Embedder,
     ) -> None:
         self._settings = settings
         self._llm = llm
         self._guard = guard
         self._conversation = conversation
         self._audit = audit
+        self._embedder = embedder
         self._graph = build_read_graph(
             model_with_tools, runner=runner, max_steps=settings.read_max_react_steps
         )
@@ -76,12 +79,13 @@ class AgentLoop:
         if sanitized.hijacked:
             await self._audit.log("prompt_injection_filtered", siwe_user_id=siwe_user_id)
 
-        # 2. Perception：短期历史 + 中期摘要 + 长期档案
+        # 2. Perception：短期历史 + 中期摘要 + 长期档案与背景
         history = await self._conversation.load(
             db, siwe_user_id=siwe_user_id
         )
         summary_text = await self._load_summary(db, siwe_user_id)
         profile_text = await self._sync_profile(db, siwe_user_id, sanitized.text, chain_id)
+        memory_text = await self._load_memories(db, siwe_user_id, sanitized.text)
         await self._conversation.save(
             db, siwe_user_id=siwe_user_id, role="user", content=sanitized.text
         )
@@ -90,7 +94,11 @@ class AgentLoop:
         try:
             guarded = await self._guard.run(
                 lambda: self._llm.extract_intent(
-                    history, sanitized.text, summary=summary_text, profile=profile_text
+                    history,
+                    sanitized.text,
+                    summary=summary_text,
+                    profile=profile_text,
+                    memories=memory_text,
                 )
             )
         except ModelUnavailable as exc:
@@ -146,6 +154,7 @@ class AgentLoop:
                     wallet_address or "",
                     summary=summary_text,
                     profile=profile_text,
+                    memories=memory_text,
                 )
             )
         except ModelUnavailable as exc:
@@ -203,6 +212,35 @@ class AgentLoop:
             max_tokens=self._settings.profile_token_max_items,
         )
 
+    async def _load_memories(self, db: AsyncSession, siwe_user_id: str, query: str) -> str:
+        """长期背景：constraint 全量注入，preference / profile 走向量召回。
+
+        向量化是新增的失败点，坏了只降级到 constraint —— 记忆是增强项，
+        不能因为它把整轮对话拖垮。
+        """
+        rows = await memory_repo.active_items(db, siwe_user_id)
+        picked = [_as_item(r) for r in rows if r.memory_type == "constraint"]
+        picked = picked[: self._settings.memory_constraint_max]
+
+        if query.strip():
+            try:
+                vector = await self._embedder.embed(query)
+                recalled = await memory_repo.recall(
+                    db,
+                    siwe_user_id,
+                    embedding=vector,
+                    limit=self._settings.memory_recall_limit,
+                    max_distance=self._settings.memory_recall_max_distance,
+                )
+            except ModelUnavailable as exc:
+                await self._audit.log(
+                    "memory_recall_degraded", siwe_user_id=siwe_user_id, error=str(exc)[:200]
+                )
+                recalled = []
+            picked.extend(_as_item(r) for r in recalled)
+
+        return memory.render(picked, max_chars=self._settings.memory_render_chars)
+
     async def _finish(
         self, db: AsyncSession, siwe_user_id: str, outcome: ChatOutcome
     ) -> ChatOutcome:
@@ -216,3 +254,12 @@ def _record(item: dict):
     from web3_agent.common.types import ToolCallRecord
 
     return ToolCallRecord(**item)
+
+
+def _as_item(row) -> memory.MemoryItem:
+    return memory.MemoryItem(
+        text=row.text,
+        memory_type=row.memory_type,
+        subject=row.subject,
+        confidence=row.confidence,
+    )

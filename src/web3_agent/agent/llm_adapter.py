@@ -17,10 +17,11 @@ from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langchain_ollama import ChatOllama
 
-from web3_agent.agent.prompts import INTENT_SYSTEM, SUMMARY_SYSTEM
+from web3_agent.agent.prompts import INTENT_SYSTEM, MEMORY_SYSTEM, SUMMARY_SYSTEM
 from web3_agent.common.exceptions import ModelUnavailable
 from web3_agent.common.types import LlmOutput
 from web3_agent.config.settings import Settings
+from web3_agent.domain.memory.memory import MemoryDraftList
 from web3_agent.domain.memory.schema import SummaryFields
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ class LlmAdapter:
         )
         self._intent_llm = self._llm.with_structured_output(LlmOutput, method="json_schema")
         self._summary_llm = self._llm.with_structured_output(SummaryFields, method="json_schema")
+        self._memory_llm = self._llm.with_structured_output(MemoryDraftList, method="json_schema")
 
     @property
     def model_name(self) -> str:
@@ -76,11 +78,14 @@ class LlmAdapter:
         *,
         summary: str = "",
         profile: str = "",
+        memories: str = "",
     ) -> LlmOutput:
         messages: list[BaseMessage] = [SystemMessage(content=INTENT_SYSTEM)]
-        # 顺序固定为 偏好 → 摘要：偏好是长期约束，摘要是一次性事实，越靠近当前输入越具体。
+        # 顺序固定为 档案 → 背景 → 摘要：前两者是长期约束，摘要是一次性事实，越靠近当前输入越具体。
         if profile:
             messages.append(SystemMessage(content=profile))
+        if memories:
+            messages.append(SystemMessage(content=memories))
         if summary:
             messages.append(SystemMessage(content=summary))
         for role, content in history:
@@ -109,6 +114,25 @@ class LlmAdapter:
             raise ModelUnavailable(f"摘要调用失败：{exc}") from exc
         if not isinstance(result, SummaryFields):
             raise ModelUnavailable("摘要结构化输出解析失败")
+        return result
+
+    async def extract_memories(
+        self, messages: list[tuple[str, str]], existing: list[str]
+    ) -> MemoryDraftList:
+        """抽长期记忆。existing 只用来避免重复输出，模型不负责判断矛盾。"""
+        prompt: list[BaseMessage] = [SystemMessage(content=MEMORY_SYSTEM)]
+        if existing:
+            prompt.append(
+                HumanMessage(content="已有记忆（已覆盖的不要重复输出）：\n" + "\n".join(f"- {t}" for t in existing))
+            )
+        dialogue = "\n".join(f"{role}: {content}" for role, content in messages)
+        prompt.append(HumanMessage(content=f"需要抽取的对话：\n{dialogue}"))
+        try:
+            result = await self._memory_llm.ainvoke(prompt)
+        except (httpx.HTTPError, ConnectionError, TimeoutError) as exc:
+            raise ModelUnavailable(f"记忆抽取调用失败：{exc}") from exc
+        if not isinstance(result, MemoryDraftList):
+            raise ModelUnavailable("记忆抽取结构化输出解析失败")
         return result
 
     async def answer(self, messages: list[BaseMessage]) -> BaseMessage:

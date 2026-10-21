@@ -112,3 +112,30 @@ async def load_range(
         .order_by(ConversationMessage.id.asc())
     )
     return [(r.role, r.content) for r in (await db.execute(stmt)).all()]
+
+
+async def pending_for_memory(
+    db: AsyncSession, siwe_user_id: str, *, since_id: int, cap: int
+) -> tuple[int, list[tuple[int, str, str]]]:
+    """返回（水位线之后的消息总数，本批要处理的 (id, role, content)）。
+
+    取最早的一批而不是最新的一批：积压时按顺序吃完，水位线才能单调推进。
+    """
+    pending = (
+        ConversationMessage.siwe_user_id == siwe_user_id,
+        ConversationMessage.id > since_id,
+    )
+    total = (
+        await db.execute(select(func.count()).select_from(ConversationMessage).where(*pending))
+    ).scalar_one()
+    if total == 0:
+        return 0, []
+    rows = (
+        await db.execute(
+            select(ConversationMessage.id, ConversationMessage.role, ConversationMessage.content)
+            .where(*pending)
+            .order_by(ConversationMessage.id.asc())
+            .limit(cap)
+        )
+    ).all()
+    return total, [(r.id, r.role, r.content) for r in rows]

@@ -53,6 +53,17 @@ class Settings(BaseSettings):
     profile_render_chars: int = 400
     profile_token_max_items: int = 5
 
+    # --- 长期记忆：自由文本（V2，向量）---
+    memory_trigger_messages: int = 10  # ≈5 轮
+    memory_batch_cap: int = 20
+    memory_fail_max: int = 3
+    memory_recall_limit: int = 3
+    # 余弦距离上限（= 1 - 相似度）。不是照抄 0.85 那个相似度：bge-m3 对同域短句
+    # 的相似度普遍偏高，两个阈值不在同一量纲上。这个值在本机语料上标定过。
+    memory_recall_max_distance: float = 0.42
+    memory_constraint_max: int = 5
+    memory_render_chars: int = 400
+
     # --- 写链路风控（PRD 12 章：单笔等值金额上限）---
     write_max_amount_usd: float = DEFAULT_MAX_AMOUNT_USD
 
@@ -65,6 +76,10 @@ class Settings(BaseSettings):
     ollama_temperature: float = 0.0
     ollama_timeout_seconds: float = 120.0
     model_check_on_startup: bool = True
+
+    # --- 向量化（bge-m3；维度写死在建表里）---
+    ollama_embed_model: str = "bge-m3"
+    ollama_embed_dim: int = 1024
 
     # --- LangSmith（SaaS）---
     langsmith_tracing: bool = False

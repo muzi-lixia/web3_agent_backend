@@ -12,6 +12,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Float,
     Integer,
     String,
     Text,
@@ -20,10 +21,13 @@ from sqlalchemy import (
     text,
     Index
 )
+from pgvector.sqlalchemy import Vector
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from web3_agent.persistence.pg.base import Base
+
+EMBEDDING_DIM = 1024  # bge-m3
 
 
 class ConversationMessage(Base):
@@ -61,6 +65,62 @@ class UserProfile(Base):
     frequent_tokens: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     risk_preference: Mapped[str | None] = mapped_column(String(16), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class UserMemory(Base):
+    """长期记忆第二段：自由文本背景（V2）。
+
+    与 user_profile 的分工：档案只放枚举/链号/代币符号，装不下的背景放这里。
+    同一 subject 只允许一条 active —— 用部分唯一索引保证，不靠相似度去重。
+    旧行改成 superseded 保留，可回溯用户什么时候改的主意。
+    """
+
+    __tablename__ = "user_memory"
+    __table_args__ = (
+        Index(
+            "uq_user_memory_active",
+            "siwe_user_id",
+            "subject",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+        ),
+        Index(
+            "ix_user_memory_embedding",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    siwe_user_id: Mapped[str] = mapped_column(String(64))
+    text: Mapped[str] = mapped_column(Text)
+    memory_type: Mapped[str] = mapped_column(String(16))  # preference | constraint | profile
+    subject: Mapped[str] = mapped_column(String(64))
+    embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM))
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    status: Mapped[str] = mapped_column(String(16), default="active")
+    superseded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class UserMemoryState(Base):
+    """抽取水位线。没有它就无法判断「最近这批消息抽过没有」，会重复抽同一段。
+
+    只记位置上不记轮数：轮次要靠 message 计数推，消息一删计数就错位。
+    """
+
+    __tablename__ = "user_memory_state"
+
+    siwe_user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    last_extracted_message_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    fail_count: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )

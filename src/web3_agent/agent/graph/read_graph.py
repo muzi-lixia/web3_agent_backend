@@ -89,6 +89,7 @@ def initial_state(
     wallet_address: str = "",
     summary: str = "",
     profile: str = "",
+    memories: str = "",
 ) -> ReadState:
     identity = (
         f"当前用户已连接的钱包地址是 {wallet_address}。用户说「我」「我的」时指这个地址，"
@@ -97,9 +98,12 @@ def initial_state(
         else "当前没有已连接的钱包地址。需要地址时先问用户，不要编造。"
     )
     system = f"{READ_SYSTEM}\n\n{identity}"
-    # 偏好 → 摘要。偏好是最稳定的约束，摘要是一次压缩事实，都排在原文窗口之前。
+    # 档案 → 背景 → 摘要。前两者是最稳定的长期约束，摘要是一次压缩事实，
+    # 都排在原文窗口之前。
     if profile:
         system = f"{system}\n\n{profile}"
+    if memories:
+        system = f"{system}\n\n{memories}"
     if summary:
         system = f"{system}\n\n{summary}"
     messages = [SystemMessage(content=system)]

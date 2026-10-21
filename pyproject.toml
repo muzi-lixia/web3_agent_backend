@@ -17,6 +17,7 @@ dependencies = [
     "langchain-ollama",
     "langgraph",
     "langsmith",
+    "pgvector>=0.5.1",
 ]
 
 [dependency-groups]

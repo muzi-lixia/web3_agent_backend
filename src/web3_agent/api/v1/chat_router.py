@@ -21,11 +21,12 @@ router = APIRouter(prefix="/chat", tags=["chat"], dependencies=[Depends(chat_rat
 
 _KIND_TO_TYPE = {"answer": "answer", "ask": "ask", "reject": "answer"}
 
-# 后台摘要任务。不 await：摘要慢，不能拖住回复。集合持有引用，否则任务可能被 GC 掉。
+# 后台任务（摘要、长期记忆抽取）。不 await：都慢，不能拖住回复。
+# 集合持有引用，否则任务可能被 GC 掉。
 _BACKGROUND: set[asyncio.Task] = set()
 
 
-def _spawn_summary(coro) -> None:
+def _spawn_background(coro) -> None:
     task = asyncio.create_task(coro)
     _BACKGROUND.add(task)
     task.add_done_callback(_BACKGROUND.discard)
@@ -68,10 +69,12 @@ async def chat(
                 db, key=quota_key, metric=QuotaMetric.RPC_CALLS, amount=rpc_calls
             )
 
-    # 事务已提交，摘要任务才能看到本轮消息；它自己开会话、自己兜异常。
-    _spawn_summary(
+    # 事务已提交，后台任务才能看到本轮消息；它们各自开会话、各自兜异常。
+    # 摘要只压挤出窗口的部分，记忆抽取处理水位线之后的全部 —— 两条独立水位线，不互相卡。
+    _spawn_background(
         container.summarizer.run(siwe_user_id=identity.user_id, own_address=identity.address)
     )
+    _spawn_background(container.memory.run(siwe_user_id=identity.user_id))
 
     return ChatResponse(
         type=_KIND_TO_TYPE.get(outcome.kind, "answer"),
