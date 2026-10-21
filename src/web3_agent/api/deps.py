@@ -1,42 +1,34 @@
-"""鉴权依赖：解析 Authorization: Bearer 的 SIWE JWT。
+"""鉴权与限流依赖。
 
-V1a 只读匿名可访问，所以这里是"可选身份"；拿到就带 siwe_address 做归属校验，
-拿不到也不拒绝。写接口必须改用 require_identity。
+只读匿名可访问，所以默认是"可选身份"；写接口必须改用 require_identity。
+限流放在依赖里而不是中间件：/health 不该被计数，中间件无法按路由区分。
 """
 
 from __future__ import annotations
 
-from fastapi import Header
+from fastapi import Depends, Header, Request
 
-from web3_agent.common.exceptions import AppError
+from web3_agent.common.exceptions import E503_UNAUTHENTICATED, AppError
 from web3_agent.config.settings import get_settings
-
-try:
-    import jwt
-except ImportError:  # pragma: no cover 依赖未装时明确失败，不静默放行
-    jwt = None
+from web3_agent.domain.auth.tokens import SiweClaims, decode
+from web3_agent.persistence.pg.base import session_scope
 
 
 class Identity:
-    def __init__(self, siwe_user_id: str, siwe_address: str) -> None:
-        self.siwe_user_id = siwe_user_id
-        self.siwe_address = siwe_address
+    def __init__(self, claims: SiweClaims) -> None:
+        self.user_id = claims.user_id
+        self.address = claims.address
+        self.chain_id = claims.chain_id
 
 
-def _decode(token: str) -> Identity:
-    if jwt is None:
-        raise AppError("E401", "鉴权组件未就绪", 401)
+def _parse(authorization: str | None) -> Identity:
+    if not authorization:
+        raise AppError(*E503_UNAUTHENTICATED)
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise AppError(*E503_UNAUTHENTICATED)
     settings = get_settings()
-    try:
-        payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
-    except Exception as exc:  # noqa: BLE001 一切解码失败都按未授权处理
-        raise AppError("E401", "登录状态无效，请重新连接钱包", 401) from exc
-
-    address = payload.get("siwe_address") or payload.get("sub")
-    user_id = payload.get("siwe_user_id") or ""
-    if not address:
-        raise AppError("E401", "登录状态无效，请重新连接钱包", 401)
-    return Identity(siwe_user_id=user_id, siwe_address=address)
+    return Identity(decode(secret=settings.jwt_secret, algorithm=settings.jwt_algorithm, token=token))
 
 
 async def optional_identity(
@@ -44,18 +36,36 @@ async def optional_identity(
 ) -> Identity | None:
     if not authorization:
         return None
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not token:
-        raise AppError("E401", "登录状态无效，请重新连接钱包", 401)
-    return _decode(token)
+    return _parse(authorization)
 
 
 async def require_identity(
     authorization: str | None = Header(default=None),
 ) -> Identity:
-    if not authorization:
-        raise AppError("E401", "该操作需要连接钱包", 401)
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not token:
-        raise AppError("E401", "登录状态无效，请重新连接钱包", 401)
-    return _decode(token)
+    return _parse(authorization)
+
+
+def client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+async def _enforce(request: Request, identity: Identity | None, *, auth_endpoint: bool) -> None:
+    container = request.app.state.container
+    key = container.quota.key_for(
+        user_id=identity.user_id if identity else None, client_ip=client_ip(request)
+    )
+    async with session_scope() as db:
+        await container.quota.check_request(
+            db, key=key, logged_in=identity is not None, auth_endpoint=auth_endpoint
+        )
+    request.state.quota_key = key
+
+
+async def chat_rate_limit(
+    request: Request, identity: Identity | None = Depends(optional_identity)
+) -> None:
+    await _enforce(request, identity, auth_endpoint=False)
+
+
+async def auth_rate_limit(request: Request) -> None:
+    await _enforce(request, None, auth_endpoint=True)

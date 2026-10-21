@@ -12,6 +12,7 @@ dependencies = [
     "asyncpg",
     "httpx",
     "pyjwt",
+    "eth-account",
     "langchain-core",
     "langchain-ollama",
     "langgraph",

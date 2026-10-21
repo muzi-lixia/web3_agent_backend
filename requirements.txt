@@ -7,6 +7,8 @@ sqlalchemy[asyncio]==2.1.5
 asyncpg==0.32.0
 httpx==0.28.1
 pyjwt==2.15.1
+# SIWE 验签与 EIP-55 校验和（同时带入 eth-abi，写链路的 ABI 编解码会用它）
+eth-account==0.14.0
 
 # LLM 编排与观测
 langchain-core==1.6.12

@@ -5,6 +5,7 @@ from __future__ import annotations
 import httpx
 
 from web3_agent.common.exceptions import RpcUnavailable
+from web3_agent.web3.metering import record_rpc_call
 
 
 class RpcClient:
@@ -15,6 +16,7 @@ class RpcClient:
 
     async def call(self, method: str, params: list) -> object:
         self._id += 1
+        record_rpc_call()
         payload = {"jsonrpc": "2.0", "id": self._id, "method": method, "params": params}
         try:
             resp = await self._client.post(self._url, json=payload)

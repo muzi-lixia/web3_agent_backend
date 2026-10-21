@@ -1,7 +1,6 @@
-"""keccak-256 与 EIP-55 校验和。向量全部取自 EIP-55 原文与 keccak 官方测试值。"""
+"""EIP-55 校验和。向量全部取自 EIP-55 原文。"""
 
 from web3_agent.common.evm_address import normalize_address, to_checksum_address
-from web3_agent.common.keccak import keccak_256
 
 EIP55_VALID = (
     "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
@@ -14,15 +13,6 @@ EIP55_INVALID_CASE = (
     "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeD",  # 末位大小写被改动
     "0x5AAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",  # 第三位大小写被改动
 )
-
-
-def test_keccak_known_vectors() -> None:
-    assert keccak_256(b"").hex() == (
-        "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
-    )
-    assert keccak_256(b"abc").hex() == (
-        "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45"
-    )
 
 
 def test_eip55_checksum_matches_spec() -> None:

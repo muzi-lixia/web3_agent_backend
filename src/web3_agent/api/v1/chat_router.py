@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Request
 
-from web3_agent.api.deps import Identity, optional_identity
+from web3_agent.api.deps import Identity, chat_rate_limit, optional_identity
 from web3_agent.api.schemas.chat_schema import ChatRequest, ChatResponse
 from web3_agent.common.exceptions import E102_CHAIN_NOT_ALLOWED, AppError
+from web3_agent.config.constants import QuotaMetric
 from web3_agent.persistence.pg.base import session_scope
+from web3_agent.web3.metering import take_rpc_calls
 
-router = APIRouter(prefix="/chat", tags=["chat"])
+router = APIRouter(prefix="/chat", tags=["chat"], dependencies=[Depends(chat_rate_limit)])
 
 _KIND_TO_TYPE = {"answer": "answer", "ask": "ask", "reject": "answer"}
 
@@ -28,7 +30,7 @@ async def chat(
 
     wallet_address = payload.wallet.address if payload.wallet else None
     if identity is not None:
-        wallet_address = identity.siwe_address
+        wallet_address = identity.address
 
     async with session_scope() as db:
         outcome = await container.agent.handle(
@@ -38,6 +40,17 @@ async def chat(
             chain_id=payload.wallet.chain_id if payload.wallet else None,
             user_message=payload.user_message,
         )
+
+    rpc_calls = take_rpc_calls()
+    quota_key = getattr(request.state, "quota_key", None)
+    if quota_key:
+        async with session_scope() as db:
+            await container.quota.charge(
+                db, key=quota_key, metric=QuotaMetric.STEPS, amount=outcome.steps
+            )
+            await container.quota.charge(
+                db, key=quota_key, metric=QuotaMetric.RPC_CALLS, amount=rpc_calls
+            )
 
     return ChatResponse(
         type=_KIND_TO_TYPE.get(outcome.kind, "answer"),

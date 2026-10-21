@@ -17,6 +17,7 @@ async def touch_session(
     wallet_address: str | None,
     chain_id: int | None,
     ttl_seconds: int,
+    siwe_user_id: str | None = None,
 ) -> datetime:
     """取会话；不存在或已过期就从空历史重新开始。返回本次的 expires_at。"""
     now = datetime.now(timezone.utc)
@@ -27,6 +28,7 @@ async def touch_session(
         db.add(
             ConversationSession(
                 id=session_id,
+                siwe_user_id=siwe_user_id,
                 wallet_address=wallet_address,
                 chain_id=chain_id,
                 expires_at=expires_at,
@@ -41,6 +43,7 @@ async def touch_session(
         )
         row.created_at = now
 
+    row.siwe_user_id = siwe_user_id or row.siwe_user_id
     row.wallet_address = wallet_address or row.wallet_address
     row.chain_id = chain_id or row.chain_id
     row.last_seen_at = now

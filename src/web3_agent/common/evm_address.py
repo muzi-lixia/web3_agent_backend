@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-from web3_agent.common.keccak import keccak_256
+from eth_utils import keccak
 
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _ZERO_ADDRESS = "0x" + "0" * 40
@@ -22,7 +22,7 @@ def is_evm_address(value: str) -> bool:
 def to_checksum_address(value: str) -> str:
     """按 EIP-55 生成带校验和的写法。"""
     body = value.lower().removeprefix("0x")
-    digest = keccak_256(body.encode("ascii")).hex()
+    digest = keccak(body.encode("ascii")).hex()
     return "0x" + "".join(c.upper() if int(digest[i], 16) >= 8 else c for i, c in enumerate(body))
 
 

@@ -63,8 +63,21 @@ class Settings(BaseSettings):
     langsmith_sample_rate: float = 1.0
 
     # --- 鉴权（V1a 只读匿名可访问；写链路需要）---
-    jwt_secret: str = "dev-only-change-me"
+    jwt_secret: str = "dev-only-change-me-0123456789abcdef"
     jwt_algorithm: str = "HS256"
+    jwt_ttl_seconds: int = 7200
+    # SIWE 消息里的 domain / uri 必须与本站一致，防钓鱼页面拿本站 nonce 签出跨站消息
+    siwe_domain: str = "localhost"
+    siwe_uri: str = "http://localhost:5173"
+    siwe_nonce_ttl_seconds: int = 300
+
+    # --- 限流与配额（PRD 12 章：1 分钟分桶，计数落 PG）---
+    quota_anon_rpm: int = 10
+    quota_user_rpm: int = 30
+    # /auth/nonce 单独放宽：登录前一秒一次会让前端重连时卡住
+    quota_auth_rpm: int = 20
+    quota_rpc_per_minute: int = 200
+    quota_steps_per_minute: int = 200
 
 
 @lru_cache

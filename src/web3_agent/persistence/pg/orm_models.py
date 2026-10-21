@@ -141,3 +141,21 @@ class QuotaCounter(Base):
     subject: Mapped[str] = mapped_column(String(128), primary_key=True)
     window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
     count: Mapped[int] = mapped_column(BigInteger, default=0)
+
+
+class SiweNonce(Base):
+    """SIWE 一次性 nonce。
+
+    consumed_at 承担"单次消费"语义：核销靠 UPDATE ... WHERE consumed_at IS NULL，
+    并发下只有一个请求能拿到那条记录，不需要额外加锁。
+    address 非空表示 nonce 已绑定地址，验签时 recovered 必须与之一致。
+    """
+
+    __tablename__ = "siwe_nonce"
+
+    nonce: Mapped[str] = mapped_column(String(64), primary_key=True)
+    address: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    chain_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

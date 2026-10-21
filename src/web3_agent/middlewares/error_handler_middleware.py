@@ -8,7 +8,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from web3_agent.common.exceptions import AppError
+from web3_agent.common.exceptions import AppError, error_tuple
 from web3_agent.common.tracing import get_trace_id
 
 logger = logging.getLogger(__name__)
@@ -35,7 +35,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(RequestValidationError)
     async def _validation(_: Request, exc: RequestValidationError) -> JSONResponse:
         logger.info("validation error: %s", exc.errors())
-        return _error("E101", "请求参数不合法", 400)
+        return _error(*error_tuple("E101"))
 
     @app.exception_handler(Exception)
     async def _unhandled(_: Request, exc: Exception) -> JSONResponse:

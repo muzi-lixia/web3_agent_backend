@@ -17,10 +17,11 @@ from web3_agent.agent.json_guard import JsonGuard
 from web3_agent.agent.llm_adapter import LlmAdapter
 from web3_agent.agent.tool_registry import ToolRegistry
 from web3_agent.agent.tool_runner import ToolRunner
-from web3_agent.api.v1 import chat_router, health_router
+from web3_agent.api.v1 import auth_router, chat_router, health_router
 from web3_agent.common.exceptions import ModelUnavailable
 from web3_agent.config.constants import ToolGroup
 from web3_agent.config.settings import Settings, get_settings
+from web3_agent.domain.quotas import QuotaController
 from web3_agent.middlewares.error_handler_middleware import register_exception_handlers
 from web3_agent.middlewares.trace_middleware import TraceMiddleware
 from web3_agent.persistence.conversation_context import ConversationContext
@@ -41,6 +42,8 @@ class Container:
     adapter: ChainAdapter
     llm: LlmAdapter
     agent: AgentLoop
+    audit: AuditLogger
+    quota: QuotaController
     tracing_enabled: bool
 
 
@@ -79,7 +82,13 @@ def build_container(settings: Settings) -> Container:
         runner=runner,
     )
     return Container(
-        settings=settings, adapter=adapter, llm=llm, agent=agent, tracing_enabled=tracing_enabled
+        settings=settings,
+        adapter=adapter,
+        llm=llm,
+        agent=agent,
+        audit=audit,
+        quota=QuotaController(settings),
+        tracing_enabled=tracing_enabled,
     )
 
 
@@ -116,6 +125,7 @@ def create_app() -> FastAPI:
     app.add_middleware(TraceMiddleware)
     register_exception_handlers(app)
     app.include_router(health_router.router)
+    app.include_router(auth_router.router, prefix="/api/v1")
     app.include_router(chat_router.router, prefix="/api/v1")
     return app
 
