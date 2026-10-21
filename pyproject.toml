@@ -1,0 +1,33 @@
+[project]
+name = "web3-agent-backend"
+version = "0.1.0"
+description = "Web3 链上智能 Agent 助手 — 后端"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic>=2",
+    "pydantic-settings",
+    "sqlalchemy[asyncio]>=2",
+    "asyncpg",
+    "httpx",
+    "pyjwt",
+    "langchain-core",
+    "langchain-ollama",
+    "langgraph",
+    "langsmith",
+]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/web3_agent"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

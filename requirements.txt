@@ -1,0 +1,18 @@
+# 运行时
+fastapi==0.156.4
+uvicorn[standard]==0.54.0
+pydantic==2.14.1
+pydantic-settings==2.16.1
+sqlalchemy[asyncio]==2.1.5
+asyncpg==0.32.0
+httpx==0.28.1
+pyjwt==2.15.1
+
+# LLM 编排与观测
+langchain-core==1.6.12
+langchain-ollama==1.1.0
+langgraph==1.2.16
+langsmith==0.14.11
+
+# 开发与测试
+pytest==9.1.1
