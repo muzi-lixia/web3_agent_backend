@@ -282,7 +282,10 @@ class AgentLoop:
         picked = [_as_item(r) for r in rows if r.memory_type == "constraint"]
         picked = picked[: self._settings.memory_constraint_max]
 
-        if query.strip():
+        # constraint 已经全量注入，向量召回只为软记忆服务 —— 一条软记忆都没有时
+        # 没必要向量化：那一次 embed 要 2s 以上，还会顺带把 embedding 模型拉进显存。
+        soft = [r for r in rows if r.memory_type != "constraint"]
+        if query.strip() and soft:
             try:
                 vector = await self._embedder.embed(query)
                 recalled = await memory_repo.recall(

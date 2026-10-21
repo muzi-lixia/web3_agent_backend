@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 from langchain_core.tools import StructuredTool
 
@@ -18,8 +18,21 @@ DESCRIPTION = (
 )
 
 
+# 展示精度。raw 字段保留原始整数，这里只决定「给人看的那一串」：
+# 满精度串会被模型逐位抄进回答，对用户没有信息量。
+_PRECISION = Decimal("0.000001")
+
+
 def _human(raw: int, decimals: int) -> str:
-    return str(Decimal(raw).scaleb(-decimals).normalize())
+    value = Decimal(raw).scaleb(-decimals)
+    if value == 0:
+        return "0"
+    # ROUND_DOWN：宁可少说，也不能把 0.0000009 显示成 0.000001。
+    shown = value.quantize(_PRECISION, rounding=ROUND_DOWN)
+    if shown == 0:
+        return f"<{_PRECISION}"
+    # normalize 对整数值会得到 1E+2（100），必须用 format(..., "f") 落回普通写法。
+    return format(shown.normalize(), "f")
 
 
 async def _query_chain(adapter: ChainAdapter, chain_id: int, address: str, top_n: int) -> dict:
