@@ -1,0 +1,577 @@
+{
+  "_legend": {
+    "用途": "工具调用正确性评估集。每条 = 一句话 + 期望的意图/路由/工具集合/必需槽位。",
+    "intent": "字符串表示必须命中；数组表示任一命中即可（复合问题模型只能选一个 intent）。",
+    "route": "read / write / clarify / reject，取自 IntentRouter 的四条分支。",
+    "tools": "期望调用的工具集合，顺序无关，判等不看重复；同一工具被调用多次记为「冗余调用」。",
+    "slots": "必需槽位，逐项比对：地址小写比较、代币符号大写比较、数量按数值比较。未列出的槽位不判分。",
+    "history": "多轮用例的前置对话，格式 [[role, content]]，role 只能是 user / assistant。",
+    "known_gap": "当前代码尚不具备该行为（写链路未接入等）。跑分时单独计数，不计入可用准确率。",
+    "threshold": "route=clarify 有两条来源：confidence < 0.75，或写意图缺必填槽位。两者都判 clarify 为正确。"
+  },
+  "version": 1,
+  "updated": "2026-10-22",
+  "cases": [
+    {
+      "id": "qa-01",
+      "tags": ["read", "asset"],
+      "message": "我的资产",
+      "intent": "query_asset",
+      "route": "read",
+      "tools": ["get_asset_balance"],
+      "slots": {}
+    },
+    {
+      "id": "qa-02",
+      "tags": ["read", "asset"],
+      "message": "我这有多少 BERA",
+      "intent": "query_asset",
+      "route": "read",
+      "tools": ["get_asset_balance"],
+      "slots": {}
+    },
+    {
+      "id": "qa-03",
+      "tags": ["read", "asset"],
+      "message": "查一下我的 USDC.e 余额",
+      "intent": "query_asset",
+      "route": "read",
+      "tools": ["get_asset_balance"],
+      "slots": {}
+    },
+    {
+      "id": "qa-04",
+      "tags": ["read", "asset"],
+      "message": "我钱包里都有什么代币",
+      "intent": "query_asset",
+      "route": "read",
+      "tools": ["get_asset_balance"],
+      "slots": {},
+      "note": "资产盘点类问法，不需要模型枚举代币名"
+    },
+    {
+      "id": "qa-05",
+      "tags": ["read", "asset", "other-address"],
+      "message": "帮我看看 0x63a9f8df422e1983d42565234557d46d18dbece9 的资产",
+      "intent": "query_asset",
+      "route": "read",
+      "tools": ["get_asset_balance"],
+      "slots": {},
+      "note": "查他人地址是产品能力，地址必须保留在工具入参里"
+    },
+    {
+      "id": "qa-06",
+      "tags": ["read", "asset"],
+      "message": "WBERA 和 WETH 各有多少",
+      "intent": "query_asset",
+      "route": "read",
+      "tools": ["get_asset_balance"],
+      "slots": {},
+      "note": "两个代币应一次调用解决；调两次记为一次冗余"
+    },
+    {
+      "id": "qa-07",
+      "tags": ["read", "asset", "tx", "compound"],
+      "message": "我资产现在什么情况，顺便看看最近交易",
+      "intent": ["query_asset", "query_tx"],
+      "route": "read",
+      "tools": ["get_asset_balance", "get_transaction_records"],
+      "slots": {},
+      "note": "复合问题：两个工具都要调，只调一个算缺失"
+    },
+    {
+      "id": "qa-08",
+      "tags": ["read", "asset"],
+      "message": "HONEY 还剩多少",
+      "intent": "query_asset",
+      "route": "read",
+      "tools": ["get_asset_balance"],
+      "slots": {}
+    },
+    {
+      "id": "qt-01",
+      "tags": ["read", "tx"],
+      "message": "最近 5 笔交易",
+      "intent": "query_tx",
+      "route": "read",
+      "tools": ["get_transaction_records"],
+      "slots": { "limit": 5 }
+    },
+    {
+      "id": "qt-02",
+      "tags": ["read", "tx"],
+      "message": "查一下我的交易历史",
+      "intent": "query_tx",
+      "route": "read",
+      "tools": ["get_transaction_records"],
+      "slots": {},
+      "note": "未提数量时不应硬造 limit，用工具默认值"
+    },
+    {
+      "id": "qt-03",
+      "tags": ["read", "tx"],
+      "message": "我上周转出去的钱到哪了",
+      "intent": "query_tx",
+      "route": "read",
+      "tools": ["get_transaction_records"],
+      "slots": {}
+    },
+    {
+      "id": "qt-04",
+      "tags": ["read", "tx"],
+      "message": "我收过 USDC.e 吗",
+      "intent": "query_tx",
+      "route": "read",
+      "tools": ["get_transaction_records"],
+      "slots": {}
+    },
+    {
+      "id": "qt-05",
+      "tags": ["read", "tx"],
+      "message": "最近的转入转出都列出来",
+      "intent": "query_tx",
+      "route": "read",
+      "tools": ["get_transaction_records"],
+      "slots": {}
+    },
+    {
+      "id": "qt-06",
+      "tags": ["read", "tx"],
+      "message": "查下我这周花了多少",
+      "intent": "query_tx",
+      "route": "read",
+      "tools": ["get_transaction_records"],
+      "slots": {},
+      "note": "「花了多少」是交易记录聚合，不是余额查询"
+    },
+    {
+      "id": "qs-01",
+      "tags": ["read", "stake"],
+      "message": "我在质押池里有多少",
+      "intent": "query_stake",
+      "route": "read",
+      "tools": ["get_stake_info"],
+      "slots": {},
+      "note": "未指定池子时不得编造合约地址"
+    },
+    {
+      "id": "qs-02",
+      "tags": ["read", "stake"],
+      "message": "查一下 A 池的质押仓位",
+      "intent": "query_stake",
+      "route": "read",
+      "tools": ["get_stake_info"],
+      "slots": {},
+      "note": "别名原文照传，不在模型侧做地址解析"
+    },
+    {
+      "id": "qs-03",
+      "tags": ["read", "stake"],
+      "message": "我的质押收益有多少",
+      "intent": "query_stake",
+      "route": "read",
+      "tools": ["get_stake_info"],
+      "slots": {}
+    },
+    {
+      "id": "qs-04",
+      "tags": ["read", "stake", "other-address"],
+      "message": "帮我看看 0x63a9f8df422e1983d42565234557d46d18dbece9 在 stakeContract 的仓位",
+      "intent": "query_stake",
+      "route": "read",
+      "tools": ["get_stake_info"],
+      "slots": { "stakeContractAliasOrAddress": "stakeContract" }
+    },
+    {
+      "id": "qs-05",
+      "tags": ["read", "stake"],
+      "message": "我质押的 USDC 赚了多少",
+      "intent": "query_stake",
+      "route": "read",
+      "tools": ["get_stake_info"],
+      "slots": {},
+      "note": "易混：提到代币但这是仓位查询，不是资产查询"
+    },
+    {
+      "id": "tf-01",
+      "tags": ["write", "transfer"],
+      "message": "把 0.1 BERA 转给 0x63a9f8df422e1983d42565234557d46d18dbece9",
+      "intent": "transfer",
+      "route": "write",
+      "tools": [],
+      "slots": {
+        "toAddress": "0x63a9f8df422e1983d42565234557d46d18dbece9",
+        "tokenSymbol": "BERA",
+        "humanAmount": "0.1"
+      },
+      "known_gap": "写链路未接入，当前返回固定文案"
+    },
+    {
+      "id": "tf-02",
+      "tags": ["write", "transfer"],
+      "message": "转 10 USDC.e 给 0x63a9f8df422e1983d42565234557d46d18dbece9",
+      "intent": "transfer",
+      "route": "write",
+      "tools": [],
+      "slots": {
+        "toAddress": "0x63a9f8df422e1983d42565234557d46d18dbece9",
+        "tokenSymbol": "USDC.e",
+        "humanAmount": "10"
+      },
+      "known_gap": "写链路未接入"
+    },
+    {
+      "id": "tf-03",
+      "tags": ["write", "transfer"],
+      "message": "给 0x63a9f8df422e1983d42565234557d46d18dbece9 转 5 个 BERA",
+      "intent": "transfer",
+      "route": "write",
+      "tools": [],
+      "slots": {
+        "toAddress": "0x63a9f8df422e1983d42565234557d46d18dbece9",
+        "tokenSymbol": "BERA",
+        "humanAmount": "5"
+      },
+      "known_gap": "写链路未接入"
+    },
+    {
+      "id": "tf-04",
+      "tags": ["write", "transfer", "number-word"],
+      "message": "把一千个 BERA 转给 0x63a9f8df422e1983d42565234557d46d18dbece9",
+      "intent": "transfer",
+      "route": "write",
+      "tools": [],
+      "slots": {
+        "toAddress": "0x63a9f8df422e1983d42565234557d46d18dbece9",
+        "tokenSymbol": "BERA",
+        "humanAmount": "1000"
+      },
+      "known_gap": "写链路未接入",
+      "note": "中文数字需转成数值字符串"
+    },
+    {
+      "id": "tf-05",
+      "tags": ["write", "transfer", "missing-slot"],
+      "message": "转点 BERA 给 0x63a9f8df422e1983d42565234557d46d18dbece9",
+      "intent": "transfer",
+      "route": "clarify",
+      "tools": [],
+      "slots": { "toAddress": "0x63a9f8df422e1983d42565234557d46d18dbece9" },
+      "known_gap": "缺 humanAmount 需追问"
+    },
+    {
+      "id": "tf-06",
+      "tags": ["write", "transfer", "missing-slot"],
+      "message": "转账给 0x63a9f8df422e1983d42565234557d46d18dbece9",
+      "intent": "transfer",
+      "route": "clarify",
+      "tools": [],
+      "slots": { "toAddress": "0x63a9f8df422e1983d42565234557d46d18dbece9" },
+      "known_gap": "缺代币与数量需追问"
+    },
+    {
+      "id": "tf-07",
+      "tags": ["write", "transfer", "missing-slot"],
+      "message": "把我一半的 BERA 转给 0x63a9f8df422e1983d42565234557d46d18dbece9",
+      "intent": "transfer",
+      "route": "clarify",
+      "tools": [],
+      "slots": { "toAddress": "0x63a9f8df422e1983d42565234557d46d18dbece9" },
+      "known_gap": "比例无法换算成数量，必须追问"
+    },
+    {
+      "id": "ap-01",
+      "tags": ["write", "approve"],
+      "message": "授权 100 USDC.e 给 0x1111111111111111111111111111111111111111",
+      "intent": "approve",
+      "route": "write",
+      "tools": [],
+      "slots": {
+        "spenderContractAddress": "0x1111111111111111111111111111111111111111",
+        "tokenSymbol": "USDC.e",
+        "humanAmount": "100"
+      },
+      "known_gap": "写链路未接入"
+    },
+    {
+      "id": "ap-02",
+      "tags": ["write", "approve"],
+      "message": "给 0x1111111111111111111111111111111111111111 授权 50 个 HONEY",
+      "intent": "approve",
+      "route": "write",
+      "tools": [],
+      "slots": {
+        "spenderContractAddress": "0x1111111111111111111111111111111111111111",
+        "tokenSymbol": "HONEY",
+        "humanAmount": "50"
+      },
+      "known_gap": "写链路未接入"
+    },
+    {
+      "id": "ap-03",
+      "tags": ["write", "approve", "missing-slot"],
+      "message": "授权 USDC.e 给 0x1111111111111111111111111111111111111111",
+      "intent": "approve",
+      "route": "clarify",
+      "tools": [],
+      "slots": { "spenderContractAddress": "0x1111111111111111111111111111111111111111" },
+      "known_gap": "V1 只支持 exact 额度，缺数量必须追问，不得默认无限"
+    },
+    {
+      "id": "ap-04",
+      "tags": ["write", "approve", "refuse"],
+      "message": "给质押池无限授权",
+      "intent": "approve",
+      "route": "clarify",
+      "tools": [],
+      "slots": {},
+      "known_gap": "无限授权属 P2，V1 拒绝构造；且质押池不是地址",
+      "note": "既是缺槽位，也是必须拒绝的能力"
+    },
+    {
+      "id": "st-01",
+      "tags": ["write", "stake"],
+      "message": "质押 10 USDC 到 A 质押池",
+      "intent": "stake",
+      "route": "write",
+      "tools": [],
+      "slots": {
+        "stakeContractAliasOrAddress": "A",
+        "tokenSymbol": "USDC",
+        "humanAmount": "10"
+      },
+      "known_gap": "写链路未接入"
+    },
+    {
+      "id": "st-02",
+      "tags": ["write", "stake", "missing-slot"],
+      "message": "把 100 HONEY 质押进去",
+      "intent": "stake",
+      "route": "clarify",
+      "tools": [],
+      "slots": { "humanAmount": "100" },
+      "known_gap": "缺质押合约，需追问"
+    },
+    {
+      "id": "st-03",
+      "tags": ["write", "stake"],
+      "message": "质押 10 USDC 到 0x2222222222222222222222222222222222222222",
+      "intent": "stake",
+      "route": "write",
+      "tools": [],
+      "slots": {
+        "stakeContractAliasOrAddress": "0x2222222222222222222222222222222222222222",
+        "tokenSymbol": "USDC",
+        "humanAmount": "10"
+      },
+      "known_gap": "写链路未接入"
+    },
+    {
+      "id": "st-04",
+      "tags": ["write", "stake", "missing-slot"],
+      "message": "我要质押",
+      "intent": "stake",
+      "route": "clarify",
+      "tools": [],
+      "slots": {},
+      "known_gap": "三要素全缺，不得编造"
+    },
+    {
+      "id": "st-05",
+      "tags": ["write", "stake"],
+      "message": "质押 0.5 BERA 到 stakeContract",
+      "intent": "stake",
+      "route": "write",
+      "tools": [],
+      "slots": {
+        "stakeContractAliasOrAddress": "stakeContract",
+        "tokenSymbol": "BERA",
+        "humanAmount": "0.5"
+      },
+      "known_gap": "写链路未接入"
+    },
+    {
+      "id": "rv-01",
+      "tags": ["write", "revoke"],
+      "message": "取消我给 0x1111111111111111111111111111111111111111 的 USDC.e 授权",
+      "intent": "revoke_approve",
+      "route": "write",
+      "tools": [],
+      "slots": {
+        "spenderContractAddress": "0x1111111111111111111111111111111111111111",
+        "tokenSymbol": "USDC.e"
+      },
+      "known_gap": "写链路未接入；PRD 17 章把 revoke 列为 P2，此处按架构保留判定"
+    },
+    {
+      "id": "rv-02",
+      "tags": ["write", "revoke", "missing-slot"],
+      "message": "把授权都撤了",
+      "intent": "revoke_approve",
+      "route": "clarify",
+      "tools": [],
+      "slots": {},
+      "known_gap": "缺 spender，且 V1 不做批量，必须追问"
+    },
+    {
+      "id": "rv-03",
+      "tags": ["write", "revoke", "missing-slot"],
+      "message": "取消授权",
+      "intent": "revoke_approve",
+      "route": "clarify",
+      "tools": [],
+      "slots": {},
+      "known_gap": "缺 spender 与代币"
+    },
+    {
+      "id": "ch-01",
+      "tags": ["chitchat"],
+      "message": "你好",
+      "intent": "chitchat",
+      "route": "read",
+      "tools": [],
+      "slots": {},
+      "note": "闲聊也走 read 分支，但必须一个工具都不调"
+    },
+    {
+      "id": "ch-02",
+      "tags": ["chitchat"],
+      "message": "你是谁",
+      "intent": "chitchat",
+      "route": "read",
+      "tools": [],
+      "slots": {}
+    },
+    {
+      "id": "ch-03",
+      "tags": ["chitchat"],
+      "message": "谢谢",
+      "intent": "chitchat",
+      "route": "read",
+      "tools": [],
+      "slots": {}
+    },
+    {
+      "id": "ch-04",
+      "tags": ["chitchat"],
+      "message": "你能做什么",
+      "intent": "chitchat",
+      "route": "read",
+      "tools": [],
+      "slots": {},
+      "note": "能力介绍不得声称支持转账/质押"
+    },
+    {
+      "id": "os-01",
+      "tags": ["out-of-scope"],
+      "message": "BTC 现在多少钱",
+      "intent": "out_of_scope",
+      "route": "reject",
+      "tools": [],
+      "slots": {},
+      "note": "无价格数据源，不允许编造行情"
+    },
+    {
+      "id": "os-02",
+      "tags": ["out-of-scope"],
+      "message": "跨链手续费一般要多少",
+      "intent": "out_of_scope",
+      "route": "reject",
+      "tools": [],
+      "slots": {},
+      "note": "系统只有余额/交易/质押三个数据源，没有 gas 与桥接费"
+    },
+    {
+      "id": "os-03",
+      "tags": ["out-of-scope", "swap"],
+      "message": "帮我 swap 100 USDC 成 BERA",
+      "intent": "out_of_scope",
+      "route": "reject",
+      "tools": [],
+      "slots": {},
+      "note": "枚举里没有 swap，不得降级判成 transfer"
+    },
+    {
+      "id": "os-04",
+      "tags": ["out-of-scope", "audit"],
+      "message": "帮我审计一下这个合约 0x3333333333333333333333333333333333333333",
+      "intent": "out_of_scope",
+      "route": "reject",
+      "tools": [],
+      "slots": {}
+    },
+    {
+      "id": "os-05",
+      "tags": ["out-of-scope"],
+      "message": "今天天气怎么样",
+      "intent": "out_of_scope",
+      "route": "reject",
+      "tools": [],
+      "slots": {}
+    },
+    {
+      "id": "os-06",
+      "tags": ["out-of-scope"],
+      "message": "帮我写个 Python 脚本",
+      "intent": "out_of_scope",
+      "route": "reject",
+      "tools": [],
+      "slots": {}
+    },
+    {
+      "id": "ctx-01",
+      "tags": ["context", "read", "asset"],
+      "history": [
+        ["user", "我这有多少 BERA"],
+        ["assistant", "你当前地址的 BERA 余额是 6748.58。"]
+      ],
+      "message": "那 USDC.e 呢",
+      "intent": "query_asset",
+      "route": "read",
+      "tools": ["get_asset_balance"],
+      "slots": {},
+      "note": "指代上一轮的钱包，不得要求用户重复地址"
+    },
+    {
+      "id": "ctx-02",
+      "tags": ["context", "read", "tx"],
+      "history": [
+        ["user", "帮我看看 0x63a9f8df422e1983d42565234557d46d18dbece9 的资产"],
+        ["assistant", "该地址持有 BERA、HONEY 等代币。"]
+      ],
+      "message": "再看看这个地址的交易",
+      "intent": "query_tx",
+      "route": "read",
+      "tools": ["get_transaction_records"],
+      "slots": {},
+      "note": "「这个地址」要沿用上一轮的 0x63a9…"
+    },
+    {
+      "id": "ctx-03",
+      "tags": ["context", "read", "tx"],
+      "history": [
+        ["user", "查一下我的交易历史"],
+        ["assistant", "最近 10 笔交易如下：……"]
+      ],
+      "message": "只看最近一笔",
+      "intent": "query_tx",
+      "route": "read",
+      "tools": ["get_transaction_records"],
+      "slots": { "limit": 1 }
+    },
+    {
+      "id": "ctx-04",
+      "tags": ["context", "chitchat"],
+      "history": [
+        ["user", "我这有多少 BERA"],
+        ["assistant", "你当前地址的 BERA 余额是 6748.58。"]
+      ],
+      "message": "你怎么知道我的地址的",
+      "intent": "chitchat",
+      "route": "read",
+      "tools": [],
+      "slots": {},
+      "note": "元问题：不该触发任何工具调用"
+    }
+  ]
+}

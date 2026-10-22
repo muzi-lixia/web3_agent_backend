@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from langchain_core.messages import HumanMessage
 from langsmith import traceable
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,14 +20,16 @@ from web3_agent.agent.llm_adapter import LlmAdapter
 from web3_agent.agent.sanitize import sanitize_free_text
 from web3_agent.common.exceptions import E507_MODEL_UNAVAILABLE, AppError, ModelUnavailable
 from web3_agent.common.tracing import get_trace_id, set_run_id
-from web3_agent.common.types import ChatOutcome
+from web3_agent.common.types import ChatOutcome, ToolCallRecord
 from web3_agent.config.constants import (
     MSG_CLARIFY,
     MSG_JSON_DEGRADED,
+    MSG_NO_DATA,
     MSG_OUT_OF_SCOPE,
     MSG_SECRET_REFUSED,
     MSG_STEP_LIMIT,
     MSG_WRITE_NOT_ENABLED,
+    Intent,
     Route,
 )
 from web3_agent.config.settings import Settings
@@ -54,6 +57,23 @@ def _turn_outputs(outcome: ChatOutcome) -> dict[str, Any]:
         "steps": outcome.steps,
         "degraded": outcome.degraded,
     }
+
+
+# 这三个意图的答案必须是链上数据，不是模型自己写出来的话。
+# chitchat 也走 read 路由，但它不需要数据，所以不在其中。
+_DATA_INTENTS = frozenset({Intent.QUERY_ASSET, Intent.QUERY_TX, Intent.QUERY_STAKE})
+
+
+def _lacks_evidence(intent: Intent, records: list[ToolCallRecord]) -> bool:
+    """需要数据的意图，一条成功的工具调用都没有 —— 这时模型在无据作答。"""
+    return intent in _DATA_INTENTS and not any(r.ok for r in records)
+
+
+# 重跑图时替换掉模型那句空转回答：它没有数据，留着只会被抄一遍。
+_RETRY_HINT = (
+    "你刚才没有调用任何工具就给出了结果。请立即调用合适的工具获取真实数据后再回答；"
+    "拿不到数据就直说拿不到，不要编造任何哈希、金额、时间或状态。"
+)
 
 
 class AgentLoop:
@@ -204,6 +224,9 @@ class AgentLoop:
             )
 
         # 5. Action：只读 ReAct
+        graph_config = (
+            langsmith_tracer.run_config("agent.graph", trace_id=get_trace_id()) or None
+        )
         try:
             state = await self._graph.ainvoke(
                 initial_state(
@@ -213,24 +236,58 @@ class AgentLoop:
                     summary=summary_text,
                     profile=profile_text,
                     memories=memory_text,
+                    intent=guarded.output.intent,
                 ),
-                config=langsmith_tracer.run_config("agent.graph", trace_id=get_trace_id())
-                or None,
+                config=graph_config,
             )
+            records = [_record(item) for item in state.get("tool_calls", [])]
+            retried = False
+            # 只在「一条工具都没调」时重跑：调了但全失败说明是数据源问题，再问一遍也是白问。
+            if not records and _lacks_evidence(guarded.output.intent, records):
+                # 模型绕过工具直接作答：摘掉那句空转回答，明确要求先取数再答，重跑一次。
+                retried = True
+                retry_messages = [*state["messages"][:-1], HumanMessage(content=_RETRY_HINT)]
+                state = await self._graph.ainvoke(
+                    {**state, "messages": retry_messages},
+                    config=graph_config,
+                )
+                records = [_record(item) for item in state.get("tool_calls", [])]
         except ModelUnavailable as exc:
             await self._audit.log("model_unavailable", siwe_user_id=siwe_user_id, error=str(exc))
             code, msg, status = E507_MODEL_UNAVAILABLE
             raise AppError(code, msg, status, retryable=True) from exc
+
         answer = state["messages"][-1].content
         steps = state.get("steps", 0)
         if steps >= self._settings.read_max_react_steps:
             answer = f"{answer}\n\n{MSG_STEP_LIMIT}"
 
+        no_data = _lacks_evidence(guarded.output.intent, records)
+        if retried and not no_data:
+            await self._audit.log(
+                "tool_call_retried",
+                siwe_user_id=siwe_user_id,
+                intent=guarded.output.intent.value,
+                steps=steps,
+            )
+        if no_data:
+            # 整段替换而不是追加：模型写的是带哈希和金额的一整段，追加等于把假数据留在里面。
+            answer = MSG_NO_DATA
+            await self._audit.log(
+                "answer_without_evidence",
+                siwe_user_id=siwe_user_id,
+                intent=guarded.output.intent.value,
+                steps=steps,
+                tool_calls=len(records),
+                retried=retried,
+            )
+
         outcome = ChatOutcome(
             kind="answer",
             content=answer if isinstance(answer, str) else str(answer),
-            tool_calls=[_record(item) for item in state.get("tool_calls", [])],
+            tool_calls=records,
             steps=steps,
+            degraded=no_data,
         )
         return await self._finish(db, siwe_user_id, outcome)
 

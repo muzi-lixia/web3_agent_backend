@@ -149,6 +149,7 @@ MSG_WRITE_NOT_ENABLED = "写操作链路（转账 / 授权 / 质押）尚未接�
 MSG_CLARIFY = "我需要再确认一点信息才能继续，能补充一下吗？"
 MSG_OUT_OF_SCOPE = "这个问题超出我的能力范围，我只能处理链上资产、交易记录与质押相关的问题。"
 MSG_STEP_LIMIT = "查询步骤已达到上限，先给你目前拿到的结果。可以把问题拆小一点再问。"
+MSG_NO_DATA = "暂时查不到这条链上的数据，稍后再试一次。"
 
 # 原生币元数据：(symbol, decimals)。未命中的链标 NATIVE，不要错标成 ETH。
 NATIVE_META: dict[int, tuple[str, int]] = {

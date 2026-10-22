@@ -14,7 +14,7 @@ from web3_agent.agent.graph.state import ReadState
 from web3_agent.agent.prompts import READ_SYSTEM
 from web3_agent.agent.sanitize import wrap_chain_data
 from web3_agent.agent.tool_runner import ToolRunner
-from web3_agent.config.constants import CallSource
+from web3_agent.config.constants import CallSource, Intent
 from web3_agent.web3.chain_adapter import is_evm_address
 
 # 这些工具的地址参数来自会话身份，不允许模型自己编。
@@ -22,6 +22,14 @@ _ADDRESS_ARG = {
     "get_asset_balance": "address",
     "get_transaction_records": "address",
     "get_stake_info": "userAddress",
+}
+
+# 意图 → 必须调用的工具。意图识别已经做过一次判断，这个结果要传进图里，
+# 否则图里的模型会拿着同一句话从零再判断一遍要不要调工具。
+_INTENT_TOOLS = {
+    Intent.QUERY_ASSET: ("get_asset_balance", "资产余额"),
+    Intent.QUERY_TX: ("get_transaction_records", "交易记录"),
+    Intent.QUERY_STAKE: ("get_stake_info", "质押仓位"),
 }
 
 
@@ -90,6 +98,7 @@ def initial_state(
     summary: str = "",
     profile: str = "",
     memories: str = "",
+    intent: Intent | None = None,
 ) -> ReadState:
     identity = (
         f"当前用户已连接的钱包地址是 {wallet_address}。用户说「我」「我的」时指这个地址，"
@@ -106,6 +115,13 @@ def initial_state(
         system = f"{system}\n\n{memories}"
     if summary:
         system = f"{system}\n\n{summary}"
+    # 意图放在最后：它是本轮的执行约束，离当前输入越近越管用。
+    if intent is not None and intent in _INTENT_TOOLS:
+        tool, label = _INTENT_TOOLS[intent]
+        system = (
+            f"{system}\n\n本轮意图已识别为 {intent.value}（{label}查询）。"
+            f"必须先调用 {tool} 取得数据再回答，不得凭上下文或记忆作答。"
+        )
     messages = [SystemMessage(content=system)]
     for role, content in history:
         messages.append(
