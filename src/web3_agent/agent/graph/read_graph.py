@@ -201,3 +201,16 @@ def initial_state(
         ),
         "direct_answer": "",
     }
+
+if __name__ == "__main__":
+    graph = build_read_graph(
+        model_with_tools=None,
+        runner=None,
+        max_steps=5,
+    )
+
+    # 打印 Mermaid 图代码
+    print(graph.get_graph().draw_mermaid())
+
+    # 如需生成图片，取消下面这行注释；默认需要联网
+    graph.get_graph().draw_mermaid_png(output_file_path="../../../../../read_graph.png")
