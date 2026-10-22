@@ -18,6 +18,8 @@ from web3_agent.agent.intent_router import route_intent
 from web3_agent.agent.json_guard import JsonGuard
 from web3_agent.agent.llm_adapter import LlmAdapter
 from web3_agent.agent.prompts import CHAT_SYSTEM
+from web3_agent.rag.answer import grounded_answer
+from web3_agent.rag.retriever import NO_DOCUMENTS, UNAVAILABLE
 from web3_agent.agent.sanitize import sanitize_free_text
 from web3_agent.common.exceptions import E507_MODEL_UNAVAILABLE, AppError, ModelUnavailable
 from web3_agent.common.tracing import get_trace_id, set_run_id
@@ -67,7 +69,10 @@ _DATA_INTENTS = frozenset({Intent.QUERY_ASSET, Intent.QUERY_TX, Intent.QUERY_STA
 
 def _lacks_evidence(intent: Intent, records: list[ToolCallRecord]) -> bool:
     """需要数据的意图，一条成功的工具调用都没有 —— 这时模型在无据作答。"""
-    return intent in _DATA_INTENTS and not any(r.ok for r in records)
+    if intent is Intent.QUERY_KNOWLEDGE:
+        return not any(r.ok and r.name == "rag_general_knowledge" for r in records)
+    # 文档检索成功不能当作查到了实时链上数据。
+    return intent in _DATA_INTENTS and not any(r.ok and r.name != "rag_general_knowledge" for r in records)
 
 
 # 重跑图时替换掉模型那句空转回答：它没有数据，留着只会被抄一遍。
@@ -96,7 +101,10 @@ class AgentLoop:
         self._audit = audit
         self._embedder = embedder
         self._graph = build_read_graph(
-            model_with_tools, runner=runner, max_steps=settings.read_max_react_steps
+            model_with_tools,
+            runner=runner,
+            max_steps=settings.read_max_react_steps,
+            rag_answer_model=llm.answer_model
         )
 
     async def handle(
@@ -107,6 +115,7 @@ class AgentLoop:
         wallet_address: str | None,
         chain_id: int | None,
         user_message: str,
+        knowledge_base_id: str = "default",
     ) -> ChatOutcome:
         # 1. 密钥检测必须早于任何模型调用：命中就不外发、不落库。
         hit = secret_detector.detect(user_message)
@@ -119,7 +128,7 @@ class AgentLoop:
             )
             return ChatOutcome(kind="reject", content=MSG_SECRET_REFUSED)
 
-        sanitized = sanitize_free_text(user_message)
+        sanitized = sanitize_free_text(user_message, max_len=4000)
         if sanitized.hijacked:
             await self._audit.log("prompt_injection_filtered", siwe_user_id=siwe_user_id)
 
@@ -133,6 +142,7 @@ class AgentLoop:
             db,
             siwe_user_id=siwe_user_id,
             user_message=sanitized.text,
+            knowledge_base_id=knowledge_base_id,
             wallet_address=wallet_address,
             chain_id=chain_id,
             langsmith_extra=extra,
@@ -152,6 +162,7 @@ class AgentLoop:
         wallet_address: str | None,
         chain_id: int | None,
         user_message: str,
+        knowledge_base_id: str = "default",
     ) -> ChatOutcome:
         # 2. Perception：短期历史 + 中期摘要 + 长期档案与背景
         history = await self._conversation.load(
@@ -210,15 +221,11 @@ class AgentLoop:
         )
 
         if decision.route is Route.CLARIFY:
-            return await self._finish(
-                db,
-                siwe_user_id,
-                ChatOutcome(
-                    kind="ask",
-                    content=MSG_CLARIFY,
-                    degraded=False,
-                ),
-            )
+            kind, content = "ask", MSG_CLARIFY
+            if guarded.output.intent is Intent.QUERY_KNOWLEDGE:
+                if not self._settings.rag_enabled:
+                    kind, content = "answer", UNAVAILABLE
+            return await self._finish(db, siwe_user_id, ChatOutcome(kind=kind, content=content))
         if decision.route is Route.REJECT:
             return await self._finish(
                 db, siwe_user_id, ChatOutcome(kind="reject", content=MSG_OUT_OF_SCOPE)
@@ -228,6 +235,8 @@ class AgentLoop:
                 db, siwe_user_id, ChatOutcome(kind="answer", content=MSG_WRITE_NOT_ENABLED)
             )
 
+        if guarded.output.intent is Intent.QUERY_KNOWLEDGE and not self._settings.rag_enabled:
+            return await self._finish(db, siwe_user_id, ChatOutcome(kind="answer", content=UNAVAILABLE, degraded=True))
         # 闲聊不进工具图：不带工具就不可能在闲聊里查一遍链，也省掉一次工具往返。
         if guarded.output.intent is Intent.CHITCHAT:
             return await self._finish(
@@ -258,13 +267,20 @@ class AgentLoop:
                     memories=memory_text,
                     intent=guarded.output.intent,
                     slots=guarded.output.slots,
+                    chain_id=chain_id,
+                    rag_enabled=self._settings.rag_enabled,
+                    kb_id=knowledge_base_id,
                 ),
                 config=graph_config,
             )
             records = [_record(item) for item in state.get("tool_calls", [])]
             retried = False
             # 只在「一条工具都没调」时重跑：调了但全失败说明是数据源问题，再问一遍也是白问。
-            if not records and _lacks_evidence(guarded.output.intent, records):
+            if (
+                guarded.output.intent is not Intent.QUERY_KNOWLEDGE
+                and not records
+                and _lacks_evidence(guarded.output.intent, records)
+            ):
                 # 模型绕过工具直接作答：摘掉那句空转回答，明确要求先取数再答，重跑一次。
                 retried = True
                 retry_messages = [*state["messages"][:-1], HumanMessage(content=_RETRY_HINT)]
@@ -310,12 +326,30 @@ class AgentLoop:
                 retried=retried,
             )
 
+        citations = []
+        kind = "answer"
+        if guarded.output.intent is Intent.QUERY_KNOWLEDGE:
+            citations = state.get("rag_citations", [])
+            if no_data or not citations:
+                status = state.get("rag_status", "")
+                if not status:
+                    answer = "本次未完成知识库检索，暂时无法确认，请稍后重试。"
+                elif status == "empty":
+                    answer = NO_DOCUMENTS
+                else:
+                    answer = UNAVAILABLE
+                no_data = True
+                citations = []
+            else:
+                answer, excerpted = grounded_answer(str(answer), citations)
+                no_data = excerpted
         outcome = ChatOutcome(
-            kind="answer",
+            kind=kind,
             content=answer if isinstance(answer, str) else str(answer),
             tool_calls=records,
             steps=steps,
             degraded=no_data,
+            citations=citations,
         )
         return await self._finish(db, siwe_user_id, outcome)
 

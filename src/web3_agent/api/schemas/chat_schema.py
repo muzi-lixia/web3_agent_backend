@@ -20,6 +20,7 @@ class ChatRequest(BaseModel):
 
     wallet: WalletRef | None = None
     user_message: str = Field(alias="userMessage", min_length=1, max_length=4000)
+    knowledge_base_id: str = Field(default="default",alias="knowledgeBaseId",pattern=r"^[A-Za-z0-9_.:-]{1,64}$")
 
 
 class IntentPreview(BaseModel):

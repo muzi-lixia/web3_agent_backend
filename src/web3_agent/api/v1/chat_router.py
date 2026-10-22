@@ -63,6 +63,7 @@ async def chat(
             wallet_address=identity.address,
             chain_id=effective_chain,
             user_message=payload.user_message,
+            knowledge_base_id=payload.knowledge_base_id,
         )
 
     rpc_calls = take_rpc_calls()
@@ -100,6 +101,7 @@ async def chat(
         data={
             "steps": outcome.steps,
             "toolCalls": [call.model_dump() for call in outcome.tool_calls],
+            **({"citations": outcome.citations} if outcome.citations else {}),
         },
     )
 

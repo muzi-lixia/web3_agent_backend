@@ -150,6 +150,10 @@ class LlmAdapter:
         return await self._llm.ainvoke(messages, config=config or None)
 
     @property
+    def answer_model(self) -> Runnable:
+        return self._llm
+
+    @property
     def chat_model(self) -> BaseChatModel:
         return self._llm
 

@@ -12,6 +12,7 @@ class Intent(str, Enum):
     QUERY_ASSET = "query_asset"
     QUERY_TX = "query_tx"
     QUERY_STAKE = "query_stake"
+    QUERY_KNOWLEDGE = "query_knowledge"
     TRANSFER = "transfer"
     APPROVE = "approve"
     STAKE = "stake"
@@ -38,7 +39,7 @@ class CallSource(str, Enum):
 
 
 READ_INTENTS: frozenset[Intent] = frozenset(
-    {Intent.QUERY_ASSET, Intent.QUERY_TX, Intent.QUERY_STAKE}
+    {Intent.QUERY_ASSET, Intent.QUERY_TX, Intent.QUERY_STAKE, Intent.QUERY_KNOWLEDGE}
 )
 WRITE_INTENTS: frozenset[Intent] = frozenset(
     {Intent.TRANSFER, Intent.APPROVE, Intent.STAKE, Intent.REVOKE_APPROVE}

@@ -27,6 +27,13 @@ class _Llm:
         self.reply = reply
         self.seen: list[Any] = []
 
+    @property
+    def answer_model(self):
+        return self
+
+    async def ainvoke(self, messages):
+        return await self.answer(messages)
+
     async def extract_intent(self, history, user_message, **kwargs) -> LlmOutput:
         return LlmOutput(intent=self.intent, confidence=0.95, slots={})
 
@@ -78,6 +85,10 @@ class _Graph:
             "messages": [AIMessage(content=self.answer)],
             "steps": 1,
             "tool_calls": [r.model_dump() for r in self.records],
+            "rag_status": "empty" if any(
+                r.name == "rag_general_knowledge" and r.error == "E602"
+                for r in self.records
+            ) else "",
         }
 
 

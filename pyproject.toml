@@ -18,6 +18,8 @@ dependencies = [
     "langgraph",
     "langsmith",
     "pgvector>=0.5.1",
+    "python-multipart>=0.0.32",
+    "pypdf>=6.21.2",
 ]
 
 [dependency-groups]

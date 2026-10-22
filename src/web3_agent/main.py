@@ -18,7 +18,7 @@ from web3_agent.agent.json_guard import JsonGuard
 from web3_agent.agent.llm_adapter import LlmAdapter
 from web3_agent.agent.tool_registry import ToolRegistry
 from web3_agent.agent.tool_runner import ToolRunner
-from web3_agent.api.v1 import auth_router, chat_router, health_router
+from web3_agent.api.v1 import auth_router, chat_router, health_router, rag_router
 from web3_agent.common.exceptions import ModelUnavailable
 from web3_agent.common.logging_setup import setup_logging
 from web3_agent.config.constants import ToolGroup
@@ -34,6 +34,13 @@ from web3_agent.persistence.pg.base import create_all, dispose_engine, init_engi
 from web3_agent.persistence.pg.repositories import nonce_repo, quota_repo
 from web3_agent.persistence.pg.repositories.audit_repo import AuditLogger
 from web3_agent.web3.chain_adapter import ChainAdapter
+from web3_agent.rag.retriever import KnowledgeRetriever
+from web3_agent.rag.vector_store import PgKnowledgeStore
+from web3_agent.rag.tool import build_rag_general_knowledge
+from web3_agent.rag.jobs import JobRepository
+from web3_agent.rag.models import embedding_profile
+from web3_agent.rag.knowledge_bases import KnowledgeBaseRepository
+from web3_agent.rag.worker import IngestionWorker
 from web3_agent.web3.tools.read.get_asset_balance import build_get_asset_balance
 from web3_agent.web3.tools.read.get_stake_info import build_get_stake_info
 from web3_agent.web3.tools.read.get_transaction_records import build_get_transaction_records
@@ -57,6 +64,11 @@ class Container:
     summarizer: Summarizer
     memory: MemoryExtractor
     tracing_enabled: bool
+    knowledge_bases: KnowledgeBaseRepository
+    rag_jobs: JobRepository
+    rag_store: PgKnowledgeStore
+    rag_retriever: KnowledgeRetriever
+    rag_worker: IngestionWorker
 
 
 def build_container(settings: Settings) -> Container:
@@ -76,6 +88,18 @@ def build_container(settings: Settings) -> Container:
         mutating=False,
     )
 
+    embedder = Embedder(settings)
+    profile = embedding_profile(settings)
+    knowledge_bases = KnowledgeBaseRepository(profile)
+    rag_jobs, rag_store = JobRepository(profile), PgKnowledgeStore(profile)
+    rag_retriever = KnowledgeRetriever(settings, embedder, rag_store)
+    rag_worker = IngestionWorker(settings, embedder, rag_store, rag_jobs)
+    if settings.rag_enabled:
+        registry.register(
+            build_rag_general_knowledge(rag_retriever),
+            ToolGroup.LLM_VISIBLE, mutating=False,
+        )
+
     llm = LlmAdapter(settings)
     runner = ToolRunner(registry)
     conversation = ConversationContext(
@@ -84,7 +108,6 @@ def build_container(settings: Settings) -> Container:
     )
     audit = AuditLogger()
     quota = QuotaController(settings)
-    embedder = Embedder(settings)
 
     agent = AgentLoop(
         settings=settings,
@@ -110,6 +133,7 @@ def build_container(settings: Settings) -> Container:
         summarizer=summarizer,
         memory=memory,
         tracing_enabled=tracing_enabled,
+        knowledge_bases=knowledge_bases, rag_jobs=rag_jobs, rag_store=rag_store, rag_retriever=rag_retriever, rag_worker=rag_worker,
     )
 
 
@@ -122,6 +146,10 @@ async def lifespan(app: FastAPI):
     init_engine(settings)
     if settings.auto_create_tables:
         await create_all()
+
+    if settings.rag_enabled or settings.rag_upload_enabled:
+        await container.knowledge_bases.check_schema()
+        await container.knowledge_bases.ensure_default()
 
     if settings.model_check_on_startup:
         try:
@@ -136,12 +164,15 @@ async def lifespan(app: FastAPI):
         background.append(asyncio.create_task(_heartbeat_loop()))
     background.append(asyncio.create_task(_nonce_cleanup_loop()))
     background.append(asyncio.create_task(_quota_cleanup_loop()))
+    if settings.rag_upload_enabled:
+        background.append(asyncio.create_task(container.rag_worker.run(), name="rag-ingestion"))
 
     try:
         yield
     finally:
         for task in background:
             task.cancel()
+        await asyncio.gather(*background, return_exceptions=True)
         await container.adapter.aclose()
         await dispose_engine()
 
@@ -199,6 +230,8 @@ def create_app() -> FastAPI:
     app.include_router(health_router.router)
     app.include_router(auth_router.router, prefix="/api/v1")
     app.include_router(chat_router.router, prefix="/api/v1")
+    app.include_router(rag_router.router, prefix="/api/v1")
+    app.include_router(rag_router.public_router, prefix="/api/v1")
     return app
 
 

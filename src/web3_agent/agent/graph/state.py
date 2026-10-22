@@ -19,3 +19,9 @@ class ReadState(TypedDict):
     # 直出工具的调用参数。地址与条数在意图阶段就定了，不必再问模型。
     direct_args: dict
     direct_answer: str
+    rag_kb_id: str
+    rag_query: str
+    rag_citations: list[dict]
+    rag_status: str
+    rag_required: bool
+    rag_args: dict

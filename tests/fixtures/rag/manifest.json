@@ -1,0 +1,13 @@
+[
+  {
+    "path": "pool100.md",
+    "title": "合成测试池100规则（非真实协议）",
+    "source_url": "https://example.com/test-only/pool100",
+    "chain_id": 1,
+    "protocol_id": "100",
+    "doc_category": "stake",
+    "version": "fixture-v1",
+    "reviewed": false,
+    "valid_from": "2026-01-01T00:00:00Z"
+  }
+]

@@ -67,6 +67,39 @@ class Settings(BaseSettings):
     memory_constraint_max: int = 5
     memory_render_chars: int = 400
 
+    # --- 通用文档 RAG（与用户记忆独立）---
+    rag_embedding_version: str = Field(default="v1", min_length=1, max_length=64)
+    rag_enabled: bool = False
+    rag_upload_enabled: bool = False
+    rag_admin_addresses: list[str] = Field(default_factory=list)
+    rag_upload_max_bytes: int = Field(default=5_000_000, ge=1024, le=20_000_000)
+    rag_max_text_chars: int = Field(default=1_000_000, ge=1000, le=5_000_000)
+    rag_max_chunks: int = Field(default=2000, ge=1, le=10000)
+    rag_worker_poll_seconds: float = Field(default=2, ge=.1, le=60)
+    rag_job_timeout_seconds: float = Field(default=600, ge=10, le=3600)
+    rag_job_max_attempts: int = Field(default=3, ge=1, le=10)
+    rag_top_k: int = Field(default=3, ge=1, le=5)
+    rag_max_distance: float = Field(default=0.42, ge=0, le=2)
+    rag_chunk_tokens: int = Field(default=400, ge=400, le=600)
+    rag_chunk_overlap: float = Field(default=0.1, ge=0, lt=0.5)
+    rag_max_context_chars: int = Field(default=2400, ge=600, le=8000)
+    rag_timeout_seconds: float = Field(default=20, gt=0, le=120)
+
+    # Hybrid retrieval: all optional stages stay inside the RAG tool.
+    rag_hybrid_enabled: bool = False
+    rag_candidate_k: int = Field(default=20, ge=5, le=100)
+    rag_fusion_k: int = Field(default=15, ge=3, le=100)
+    rag_keyword_max_chunks: int = Field(default=10000, ge=100, le=100000)
+    rag_rerank_enabled: bool = False
+    rag_rerank_url: str = ""
+    rag_rerank_model_version: str = "v1"
+    rag_rerank_timeout_seconds: float = Field(default=5, gt=0, le=30)
+    rag_rerank_min_score: float | None = None
+    rag_rewrite_enabled: bool = False
+    rag_rewrite_timeout_seconds: float = Field(default=3, gt=0, le=15)
+    rag_cache_ttl_seconds: float = Field(default=600, ge=0, le=3600)
+    rag_cache_max_entries: int = Field(default=128, ge=1, le=10000)
+
     # --- 写链路风控（PRD 12 章：单笔等值金额上限）---
     write_max_amount_usd: float = DEFAULT_MAX_AMOUNT_USD
 

@@ -48,6 +48,7 @@ class ChatOutcome(BaseModel):
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
     steps: int = 0
     degraded: bool = False
+    citations: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class TokenMeta(BaseModel):

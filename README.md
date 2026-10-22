@@ -105,3 +105,13 @@ curl -s localhost:8000/api/v1/auth/verify -H 'content-type: application/json' \
 - 真实质押合约地址 + ABI（当前 `STAKE_CONTRACTS` 为空）
 - IntentRouter 语义互斥表（`(intent × token × 目标)` 判定矩阵）
 - 前端不在本仓库：PRD 16 章的"用户故事全通过"需要改判为接口级验收
+
+## 通用 Web3 文档 RAG（可选 P0）
+
+新增 `rag_general_knowledge` 只读工具，与现有链上工具并列，查询协议、钱包、Gas、NFT、DEX、质押等静态知识。
+链、协议、分类均可选过滤，通用术语可全局检索。默认 `RAG_ENABLED=false`；启用需准备知识库表并发布已审核文档。
+复用 PG/pgvector 与 bge-m3，知识库与用户记忆独立。部署、元数据、导入脚本、引用与兜底说明见 [通用 RAG 文档](docs/rag.md)。
+
+前端上传、任务轮询、自动解析/切块/向量化/入库、失败重试与检索验证见 [上传接口方案](docs/rag-upload-api.md)。
+
+知识库、文档、切片和任务的四表结构、前端知识库选择与待执行数据库升级见 [知识库分层调整](docs/rag-knowledge-bases.md)。

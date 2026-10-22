@@ -1,0 +1,377 @@
+"""P0 RAG：入库、作用域、证据引用、写路径隔离与原工具兼容。"""
+import asyncio
+import json
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from langchain_core.messages import AIMessage
+from sqlalchemy.dialects import postgresql
+from sqlalchemy import select
+from web3_agent.agent.graph.read_graph import build_read_graph, initial_state
+from web3_agent.agent.intent_router import route_intent
+from web3_agent.agent.agent_loop import _lacks_evidence
+from web3_agent.common.types import LlmOutput, ToolCallRecord
+from web3_agent.config.constants import Intent, Route, CallSource
+from web3_agent.config.settings import Settings
+from web3_agent.rag.models import Citation, DocumentSpec
+from web3_agent.rag.chunker import split_document
+from web3_agent.rag.config import normalize_filters
+from web3_agent.rag.tool import build_rag_general_knowledge
+from web3_agent.rag.retriever import KnowledgeRetriever, NO_DOCUMENTS, UNAVAILABLE
+from web3_agent.rag.answer import grounded_answer
+from web3_agent.rag.ingestion_job import prepare, ingest
+from web3_agent.rag.vector_store import active_scope
+from web3_agent.persistence.pg.orm_models import RagDocument
+
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "rag"
+
+
+def settings(**kwargs):
+    return Settings(_env_file=None, rag_enabled=True, allowed_chain_ids=[1,56], **kwargs)
+
+
+
+def citation(**kwargs):
+    values=dict(id="S1",chunk_id="a"*64,title="测试规则",section="退出",source_url="https://example.com/rules",
+        doc_category="stake",version="v1",chain_id=1,protocol_id="100",updated_at="2026-01-01T00:00:00Z",content="解锁期为7天。\n仅在锁定期内提前退出，罚金为2%。",distance=.1)
+    values.update(kwargs)
+    return Citation(**values)
+
+
+def test_optional_filters_allow_global_and_independent_scope():
+    assert normalize_filters() == dict(chain_id=None, protocol_id=None, doc_category=None,kb_id="default")
+    assert normalize_filters("56", "dex_x", "swap") == dict(chain_id=56, protocol_id="dex_x", doc_category="swap",kb_id="default")
+
+
+def test_chunking_retains_headings_overlap_and_long_content():
+    text="# A\n"+"词语 "*1000+"\n# B\n最后一段"
+    chunks=split_document(text,chunk_tokens=300)
+    assert len(chunks)>1 and chunks[-1].section=="B"
+    assert chunks[-1].content=="最后一段"
+    assert all(chunk.content for chunk in chunks)
+    assert split_document(" ")==[]
+    with pytest.raises(ValueError):
+        split_document(text,overlap_ratio=.9)
+
+
+def test_manifest_validation_and_dry_run_do_not_embed():
+    spec=DocumentSpec.model_validate(json.loads((FIXTURES/"manifest.json").read_text())[0])
+    chunks,checksum=prepare(spec,FIXTURES,settings())
+    assert len(checksum)==64 and chunks and not spec.reviewed
+    with pytest.raises(ValueError):
+        DocumentSpec.model_validate({**spec.model_dump(),"protocol_id":""})
+    with pytest.raises(ValueError,match="时区"):
+        DocumentSpec.model_validate({**spec.model_dump(),"valid_from":datetime(2026,1,1)})
+    assert prepare(spec.model_copy(update={"chain_id":None,"protocol_id":None}),FIXTURES,settings())[0]
+
+
+def test_publish_requires_review_before_model_or_database():
+    spec=DocumentSpec.model_validate(json.loads((FIXTURES/"manifest.json").read_text())[0])
+    embedder=SimpleNamespace(embed_many=AsyncMock())
+    store=SimpleNamespace(publish=AsyncMock())
+    with pytest.raises(ValueError,match="reviewed"):
+        asyncio.run(ingest(spec,FIXTURES,settings(),embedder,store))
+    embedder.embed_many.assert_not_awaited()
+    store.publish.assert_not_awaited()
+
+
+def test_ingestion_embeds_before_atomic_publication():
+    spec=DocumentSpec.model_validate(json.loads((FIXTURES/"manifest.json").read_text())[0]).model_copy(update={"reviewed":True})
+    async def embed(texts):
+        return [[1.0]+[0.0]*1023 for _ in texts]
+    store=SimpleNamespace(validate_kb=AsyncMock(),publish=AsyncMock(return_value={"chunks":3}))
+    result=asyncio.run(ingest(spec,FIXTURES,settings(),SimpleNamespace(embed_many=embed),store))
+    assert result=={"chunks":3}
+    assert len(store.publish.call_args.args[1])==len(store.publish.call_args.args[2])
+
+
+def test_pg_query_filters_scope_version_and_expiry_before_limit():
+    query=select(RagDocument).where(*active_scope(1,"100",datetime.now(timezone.utc)))
+    compiled=query.compile(dialect=postgresql.dialect())
+    assert "chain_id" in str(compiled) and "protocol_id" in str(compiled)
+    assert "status" in str(compiled) and "valid_until" in str(compiled) and "valid_from" in str(compiled)
+    assert 1 in compiled.params.values() and "100" in compiled.params.values()
+
+
+@pytest.mark.parametrize("filters", [{"chain_id":0},{"chain_id":True},{"protocol_id":"bad / tag"},{"doc_category":""}])
+def test_invalid_scope_never_queries_or_embeds(filters):
+    embedder=SimpleNamespace(embed=AsyncMock())
+    store=SimpleNamespace(has_documents=AsyncMock(),search=AsyncMock())
+    result=asyncio.run(KnowledgeRetriever(settings(),embedder,store).search("规则",**filters))
+    assert result["status"]=="invalid"
+    embedder.embed.assert_not_awaited()
+    store.search.assert_not_awaited()
+
+
+@pytest.mark.parametrize("filters", [{},{"chain_id":56},{"protocol_id":"dex_x"},{"doc_category":"wallet"},
+    {"chain_id":56,"protocol_id":"dex_x","doc_category":"swap"}])
+def test_each_filter_combination_is_passed_without_implicit_wallet_chain(filters):
+    store=SimpleNamespace(has_documents=AsyncMock(return_value=True),search=AsyncMock(return_value=[citation()]))
+    embedder=SimpleNamespace(embed=AsyncMock(return_value=[0.0]*1024))
+    result=asyncio.run(KnowledgeRetriever(settings(),embedder,store).search("什么是Gas",**filters))
+    assert result["status"]=="success"
+    expected=normalize_filters(**filters)
+    assert store.has_documents.call_args.kwargs==expected
+    assert all(store.search.call_args.kwargs[k]==v for k,v in expected.items())
+
+
+def test_empty_corpus_skips_embedding_and_has_explicit_status():
+    embedder=SimpleNamespace(embed=AsyncMock())
+    store=SimpleNamespace(has_documents=AsyncMock(return_value=False),search=AsyncMock())
+    result=asyncio.run(KnowledgeRetriever(settings(),embedder,store).search("解锁",chain_id=1,protocol_id="100"))
+    assert result["status"]=="empty" and result["hits"]==[]
+    embedder.embed.assert_not_awaited()
+
+
+def test_retrieval_enforces_scope_limit_distance_and_returns_sources():
+    store=SimpleNamespace(has_documents=AsyncMock(return_value=True),search=AsyncMock(return_value=[citation()]))
+    embedder=SimpleNamespace(embed=AsyncMock(return_value=[0.0]*1024))
+    result=asyncio.run(KnowledgeRetriever(settings(),embedder,store).search("多久解锁",chain_id=1,protocol_id="dex_x",doc_category="swap",top_k=999))
+    assert result["hits"][0]["source_url"]=="https://example.com/rules"
+    kwargs=store.search.call_args.kwargs
+    assert kwargs["chain_id"]==1 and kwargs["protocol_id"]=="dex_x" and kwargs["doc_category"]=="swap" and kwargs["limit"]==3
+    assert kwargs["max_distance"]==.42
+
+
+def test_store_failure_degrades_without_rules_or_sensitive_exception():
+    store=SimpleNamespace(has_documents=AsyncMock(side_effect=RuntimeError("secret DB URL")))
+    result=asyncio.run(KnowledgeRetriever(settings(),None,store).search("解锁",chain_id=1,protocol_id="100"))
+    assert result["message"]==UNAVAILABLE and "secret" not in json.dumps(result)
+
+
+def test_tool_exposes_optional_filters_and_allows_global_terms():
+    retriever=SimpleNamespace(search=AsyncMock(return_value={"hits":[]}))
+    tool=build_rag_general_knowledge(retriever)
+    assert {"chain_id","protocol_id","doc_category"} <= tool.args.keys()
+    asyncio.run(tool.ainvoke({"query_str":"什么是Gas"}))
+    assert retriever.search.call_args.kwargs["chain_id"] is None
+    asyncio.run(tool.ainvoke({"query_str":"滑点规则","chain_id":56,"protocol_id":"dex_x","doc_category":"swap"}))
+    assert retriever.search.call_args.kwargs["chain_id"] == 56
+
+
+def test_sensitive_claims_require_complete_source_sentence_and_valid_citation():
+    hits=[citation().model_dump()]
+    answer,degraded=grounded_answer("解锁期为7天。[S1]",hits)
+    assert not degraded and "https://example.com/rules" in answer
+    for invented in ["解锁期为1天。[S1]","罚金为2%。[S1]","解锁期为7天。[S9]","不收罚金。"]:
+        answer,degraded=grounded_answer(invented,hits)
+        assert degraded and "未通过证据校验" in answer
+        assert "仅在锁定期内" not in answer
+
+
+def test_percentage_cannot_match_different_unit():
+    hits=[citation(content="罚金为2 USDC。").model_dump()]
+    assert grounded_answer("罚金为2%。[S1]",hits)[1]
+
+
+def test_english_sentence_and_chinese_numeral_match_the_same_fact():
+    hits=[citation(content="Unlock period is 7 days. Early exit within the lockup window incurs a penalty of 2%.").model_dump()]
+    # 英文按句号切开后，只引其中一句也是原文，不能判成编造。
+    assert not grounded_answer("Unlock period is 7 days.[S1]",hits)[1]
+    assert not grounded_answer("Early exit within the lockup window incurs a penalty of 2%.[S1]",hits)[1]
+    # 中文数词与原文的阿拉伯数字是同一事实；改错仍然要拦住。
+    zh=[citation().model_dump()]
+    assert not grounded_answer("解锁期为七天。[S1]",zh)[1]
+    assert grounded_answer("解锁期为三十天。[S1]",zh)[1]
+
+
+def test_document_success_is_not_live_chain_evidence():
+    records=[ToolCallRecord(name="rag_general_knowledge",ok=True)]
+    assert _lacks_evidence(Intent.QUERY_STAKE,records)
+    assert not _lacks_evidence(Intent.QUERY_KNOWLEDGE,records)
+
+
+def test_knowledge_routes_read_and_stake_commands_still_route_write():
+    knowledge=LlmOutput(intent=Intent.QUERY_KNOWLEDGE,confidence=.99,slots={"protocol_id":"100"})
+    assert route_intent(knowledge,confidence_threshold=.75).route is Route.READ
+    command=LlmOutput(intent=Intent.STAKE,confidence=.99,slots={"stakeContractAliasOrAddress":"100","tokenSymbol":"ETH","humanAmount":"0.1"})
+    assert route_intent(command,confidence_threshold=.75).route is Route.WRITE
+
+
+def test_graph_uses_original_query_and_passes_explicit_slots_as_filters():
+    seen=[]
+    class Model:
+        count=0
+        async def ainvoke(self,messages):
+            self.count+=1
+            return AIMessage(content="解锁期为7天。[S1]")
+    class Runner:
+        async def run(self,name,args,source):
+            seen.append(args)
+            return json.dumps({"status":"success","hits":[citation().model_dump()]},ensure_ascii=False),ToolCallRecord(name=name,args=args,ok=True)
+    state=initial_state([],"池100多久解锁",intent=Intent.QUERY_KNOWLEDGE,slots={"protocol_id":"100"},chain_id=1)
+    model=Model()
+    result=asyncio.run(build_read_graph(None,Runner(),5,rag_answer_model=model).ainvoke(state))
+    assert seen==[{"query_str":"池100多久解锁","kb_id":"default"}]
+    assert model.count==1
+    assert result["rag_citations"][0]["protocol_id"]=="100"
+    assert result["rag_status"]=="success"
+
+
+def test_general_knowledge_does_not_require_protocol_or_pool():
+    output=LlmOutput(intent=Intent.QUERY_KNOWLEDGE,confidence=.99,slots={})
+    assert route_intent(output,confidence_threshold=.75).route is Route.READ
+
+
+def test_agent_write_command_never_enters_rag_graph(monkeypatch):
+    from tests.unit.test_agent_loop_evidence import _loop, _without_db, _Graph
+    graph=_Graph("should not run")
+    loop=_without_db(_loop(graph,Intent.STAKE),monkeypatch)
+    loop._settings=settings()
+    loop._llm.extract_intent=AsyncMock(return_value=LlmOutput(intent=Intent.STAKE,confidence=.99,slots={
+        "stakeContractAliasOrAddress":"100","tokenSymbol":"ETH","humanAmount":"0.1"}))
+    outcome=asyncio.run(loop.handle(None,siwe_user_id="u",wallet_address="0x"+"1"*40,chain_id=1,user_message="帮我质押0.1ETH到池100"))
+    from web3_agent.config.constants import MSG_WRITE_NOT_ENABLED
+    assert graph.calls==0 and outcome.content==MSG_WRITE_NOT_ENABLED and outcome.citations==[]
+
+
+def test_agent_never_keeps_fabricated_rules_when_retrieval_failed(monkeypatch):
+    from tests.unit.test_agent_loop_evidence import _loop, _without_db, _Graph
+    graph=_Graph("提前赎回不收罚金，解锁期1天",[ToolCallRecord(name="rag_general_knowledge",ok=False,error="E602")])
+    loop=_without_db(_loop(graph,Intent.QUERY_KNOWLEDGE),monkeypatch)
+    loop._settings=settings()
+    loop._llm.extract_intent=AsyncMock(return_value=LlmOutput(intent=Intent.QUERY_KNOWLEDGE,confidence=.99,slots={"protocol_id":"100"}))
+    outcome=asyncio.run(loop.handle(None,siwe_user_id="u",wallet_address="0x"+"1"*40,chain_id=1,user_message="池100有罚金吗"))
+    assert outcome.content==NO_DOCUMENTS and outcome.degraded and outcome.citations==[]
+
+
+def test_agent_rejects_unsupported_sensitive_answer_without_dumping_evidence(monkeypatch):
+    from tests.unit.test_agent_loop_evidence import _loop, _without_db
+    class Graph:
+        async def ainvoke(self,state,config=None):
+            return {"messages":[AIMessage(content="罚金为0%。[S1]")],"steps":2,
+                "tool_calls":[ToolCallRecord(name="rag_general_knowledge",ok=True).model_dump()],
+                "rag_status":"success","rag_citations":[citation().model_dump()]}
+    loop=_without_db(_loop(Graph(),Intent.QUERY_KNOWLEDGE),monkeypatch)
+    loop._settings=settings()
+    loop._llm.extract_intent=AsyncMock(return_value=LlmOutput(intent=Intent.QUERY_KNOWLEDGE,confidence=.99,slots={"protocol_id":"100"}))
+    outcome=asyncio.run(loop.handle(None,siwe_user_id="u",wallet_address="0x"+"1"*40,chain_id=1,user_message="池100有罚金吗"))
+    assert "罚金为0%" not in outcome.content
+    assert "未通过证据校验" in outcome.content and outcome.citations[0]["protocol_id"]=="100"
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_rag_toggle_preserves_three_original_tools(monkeypatch, enabled):
+    from web3_agent import main
+    from web3_agent.agent.tool_registry import ToolRegistry
+    registered=[]
+    class Registry(ToolRegistry):
+        def register(self, tool, group, mutating):
+            registered.append(tool.name)
+            return super().register(tool, group, mutating)
+    monkeypatch.setattr(main,"ToolRegistry",Registry)
+    container=main.build_container(Settings(_env_file=None,rag_enabled=enabled,model_check_on_startup=False))
+    assert registered[:3]==["get_asset_balance","get_transaction_records","get_stake_info"]
+    assert registered[3:]==(["rag_general_knowledge"] if enabled else [])
+    asyncio.run(container.adapter.aclose())
+
+
+def test_missing_pool_is_a_router_clarification():
+    output=LlmOutput(intent=Intent.QUERY_KNOWLEDGE,confidence=.99,slots={})
+    decision=route_intent(output,confidence_threshold=.75)
+    assert decision.route is Route.READ and not decision.missing_slots
+
+
+def test_question_tail_protocol_id_reaches_intent_model(monkeypatch):
+    from tests.unit.test_agent_loop_evidence import _loop, _without_db, _Graph
+    loop=_without_db(_loop(_Graph("unused"),Intent.QUERY_KNOWLEDGE),monkeypatch)
+    loop._settings=settings()
+    extract=AsyncMock(return_value=LlmOutput(intent=Intent.QUERY_KNOWLEDGE,confidence=.99,slots={}))
+    loop._llm.extract_intent=extract
+    text="请参考协议官方规则解释提前退出的各种限制条件，尤其是罚金和冷却期，池子ID是100"
+    asyncio.run(loop.handle(None,siwe_user_id="u",wallet_address="0x"+"1"*40,chain_id=1,user_message=text))
+    assert extract.call_args.args[1]==text
+
+
+def test_empty_retrieval_ends_graph_without_model_inventing_rules():
+    class Model:
+        count=0
+        async def ainvoke(self,messages):
+            self.count+=1
+            if self.count>1:
+                raise AssertionError("空检索后不应再请求模型补全")
+            return AIMessage(content="",tool_calls=[{"name":"rag_general_knowledge","args":{},"id":"x"}])
+    model=Model()
+    runner=SimpleNamespace(run=AsyncMock(return_value=(json.dumps({"error":"E602","status":"empty","hits":[]}),ToolCallRecord(name="rag_general_knowledge",ok=False,error="E602"))))
+    state=initial_state([],"池100多久解锁",intent=Intent.QUERY_KNOWLEDGE,slots={"protocol_id":"100"},chain_id=1)
+    result=asyncio.run(build_read_graph(model,runner,5).ainvoke(state))
+    assert model.count==0 and result["rag_status"]=="empty" and result["rag_citations"]==[]
+
+
+def test_sql_global_scope_does_not_implicitly_filter_chain_or_protocol():
+    from web3_agent.persistence.pg.orm_models import RagDocument
+    global_query=str(select(RagDocument.id).where(*active_scope()).compile(dialect=postgresql.dialect()))
+    assert "chain_id =" not in global_query and "protocol_id =" not in global_query
+    scoped=select(RagDocument.id).where(*active_scope(56,"dex_x",doc_category="swap")).compile(dialect=postgresql.dialect())
+    assert {56,"dex_x","swap"} <= set(scoped.params.values())
+    assert "valid_until" in str(scoped)
+
+
+def test_general_document_metadata_has_no_pool_requirement():
+    values=dict(path="gas.md",title="Gas",source_url="https://example.com/gas",doc_category="term",
+                version="v1",valid_from="2026-01-01T00:00:00Z")
+    doc=DocumentSpec(**values)
+    assert doc.chain_id is None and doc.protocol_id is None
+    with pytest.raises(ValueError):
+        DocumentSpec(**{**values,"doc_category":"bad category"})
+
+
+def test_local_document_without_url_retains_citation_title_and_version():
+    spec=DocumentSpec(path="local.md",title="内部知识",doc_category="faq",version="v1",valid_from="2026-01-01T00:00:00Z")
+    assert spec.source_url == ""
+    hits=[citation(source_url="").model_dump()]
+    answer,degraded=grounded_answer("解锁期为7天。[S1]",hits)
+    assert not degraded and "测试规则" in answer and "版本 v1" in answer
+    assert "http" not in answer and "None" not in answer
+
+
+def test_chunk_provenance_is_exact_in_normalized_text_and_overlap():
+    text="# 第一章\n"+"知识内容 "*700+"\n## 第二章\n钱包说明"
+    chunks=split_document(text,chunk_tokens=400)
+    assert all(text[c.char_start:c.char_end]==c.content for c in chunks)
+    assert all(0<c.token_count<=400 for c in chunks)
+    assert chunks[1].char_start<chunks[0].char_end
+    assert chunks[-1].section=="第二章"
+
+
+def test_query_always_has_a_library_and_profiles_filter_sql():
+    from web3_agent.rag.models import EmbeddingProfile
+    assert normalize_filters(kb_id="wallet-guides")["kb_id"]=="wallet-guides"
+    with pytest.raises(ValueError): normalize_filters(kb_id="")
+    compiled=select(RagDocument.id).where(*active_scope(kb_id="wallet-guides",profile=EmbeddingProfile())).compile(dialect=postgresql.dialect())
+    assert "wallet-guides" in compiled.params.values() and "bge-m3" in compiled.params.values()
+    assert "embedding_dimension" in str(compiled) and "embedding_version" in str(compiled)
+
+
+def test_graph_cannot_switch_library_in_model_tool_arguments():
+    seen=[]
+    class Model:
+        count=0
+        async def ainvoke(self,messages):
+            self.count+=1
+            return AIMessage(content="",tool_calls=[{"name":"rag_general_knowledge","args":{"kb_id":"another-library"},"id":"kb"}]) if self.count==1 else AIMessage(content="解锁期为7天。[S1]")
+    async def run(name,args,source):
+        seen.append(args)
+        return json.dumps({"status":"success","hits":[citation(kb_id="chosen-library").model_dump()]}),ToolCallRecord(name=name,args=args,ok=True)
+    state=initial_state([],"规则",intent=Intent.QUERY_KNOWLEDGE,kb_id="chosen-library")
+    model=Model()
+    asyncio.run(build_read_graph(None,SimpleNamespace(run=run),5,rag_answer_model=model).ainvoke(state))
+    assert seen[0]["kb_id"]=="chosen-library"
+    assert len(seen)==1 and model.count==1
+
+
+@pytest.mark.parametrize("state,model,expected",[(None,"bge-m3","E611"),("disabled","bge-m3","E611"),("active","other-model","E612"),("active","bge-m3",None)])
+def test_real_knowledge_base_repository_guards_status_and_model(state,model,expected):
+    from web3_agent.rag.knowledge_bases import KnowledgeBaseRepository
+    from web3_agent.common.exceptions import AppError
+    row=None if state is None else SimpleNamespace(status=state,embedding_provider="ollama",embedding_model=model,embedding_dimension=1024,embedding_version="v1")
+    db=SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda:row)))
+    if expected:
+        with pytest.raises(AppError) as exc:
+            asyncio.run(KnowledgeBaseRepository().require_active("default",db))
+        assert exc.value.code==expected
+    else:
+        assert asyncio.run(KnowledgeBaseRepository().require_active("default",db)) is row

@@ -10,6 +10,8 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
+    LargeBinary,
+    ForeignKey,
     Boolean,
     DateTime,
     Float,
@@ -241,3 +243,83 @@ class SiweNonce(Base):
     issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class RagKnowledgeBase(Base):
+    __tablename__ = "rag_knowledge_base"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    embedding_provider: Mapped[str] = mapped_column(String(32))
+    embedding_model: Mapped[str] = mapped_column(String(128))
+    embedding_dimension: Mapped[int] = mapped_column(Integer)
+    embedding_version: Mapped[str] = mapped_column(String(64))
+    created_by: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RagDocument(Base):
+    __tablename__ = "rag_document"
+    kb_id: Mapped[str] = mapped_column(ForeignKey("rag_knowledge_base.id", ondelete="RESTRICT"), index=True)
+    embedding_provider: Mapped[str] = mapped_column(String(32))
+    embedding_model: Mapped[str] = mapped_column(String(128))
+    embedding_dimension: Mapped[int] = mapped_column(Integer)
+    embedding_version: Mapped[str] = mapped_column(String(64))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    chain_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    protocol_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    title: Mapped[str] = mapped_column(String(200))
+    source_url: Mapped[str] = mapped_column(Text)
+    doc_category: Mapped[str] = mapped_column(String(64), index=True)
+    version: Mapped[str] = mapped_column(String(64))
+    checksum: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), default="active")
+    valid_from: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RagChunk(Base):
+    __tablename__ = "rag_chunk"
+    __table_args__ = (UniqueConstraint("document_id", "ordinal", name="uq_rag_chunk_order"),)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("rag_document.id", ondelete="CASCADE"), index=True)
+    ordinal: Mapped[int] = mapped_column(Integer)
+    section: Mapped[str] = mapped_column(Text)
+    content: Mapped[str] = mapped_column(Text)
+    embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM))
+    token_count: Mapped[int] = mapped_column(Integer)
+    token_count_method: Mapped[str] = mapped_column(String(32))
+    char_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    char_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    page_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    extra_metadata: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
+
+
+class RagIngestionJob(Base):
+    """Durable upload queue; bytes and metadata survive process restarts."""
+    __tablename__ = "rag_ingestion_job"
+    kb_id: Mapped[str] = mapped_column(ForeignKey("rag_knowledge_base.id", ondelete="RESTRICT"), index=True)
+    __table_args__ = (UniqueConstraint("created_by", "idempotency_key", name="uq_rag_upload_request"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    created_by: Mapped[str] = mapped_column(String(128), index=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    filename: Mapped[str] = mapped_column(String(255))
+    payload: Mapped[bytes] = mapped_column(LargeBinary, deferred=True)
+    document_metadata: Mapped[dict] = mapped_column(JSONB)
+    status: Mapped[str] = mapped_column(String(16), default="queued", index=True)
+    stage: Mapped[str] = mapped_column(String(16), default="queued")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    claim_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    total_chunks: Mapped[int] = mapped_column(Integer, default=0)
+    embedded_chunks: Mapped[int] = mapped_column(Integer, default=0)
+    document_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
