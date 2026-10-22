@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     confidence_threshold: float = 0.75
     read_max_react_steps: int = 5
     conversation_max_messages: int = 20
+    # 条数管不住体积：一条 50 笔交易的直出文本就有 7000 字符，
+    # 两三轮下来会把 num_ctx 挤满，而 Ollama 超限是静默截断。
+    conversation_max_chars: int = 6000
 
     # --- 摘要（中期记忆）：窗口挤出多少条才开始压、一次最多压多少 ---
     summary_trigger_min: int = 10

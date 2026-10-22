@@ -11,6 +11,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage
 
+from web3_agent.agent import agent_loop as agent_loop_module
 from web3_agent.agent.agent_loop import AgentLoop
 from web3_agent.agent.json_guard import JsonGuard
 from web3_agent.common.types import LlmOutput, ToolCallRecord
@@ -21,11 +22,17 @@ FABRICATED = "您的交易记录如下：\n1. 交易哈希: 0x1234567890abcdef�
 
 
 class _Llm:
-    def __init__(self, intent: Intent) -> None:
+    def __init__(self, intent: Intent, reply: str = "你好，我能帮你查链上资产与交易。") -> None:
         self.intent = intent
+        self.reply = reply
+        self.seen: list[Any] = []
 
     async def extract_intent(self, history, user_message, **kwargs) -> LlmOutput:
         return LlmOutput(intent=self.intent, confidence=0.95, slots={})
+
+    async def answer(self, messages, *, config=None):
+        self.seen.append(messages)
+        return AIMessage(content=self.reply)
 
 
 class _Audit:
@@ -44,6 +51,14 @@ class _Conversation:
         pass
 
 
+class _HistoryConversation(_Conversation):
+    def __init__(self, history: list[tuple[str, str]]) -> None:
+        self._history = history
+
+    async def load(self, db, *, siwe_user_id: str) -> list[tuple[str, str]]:
+        return self._history
+
+
 class _Embedder:
     async def embed(self, text: str) -> list[float]:
         return [0.0]
@@ -55,8 +70,10 @@ class _Graph:
     def __init__(self, answer: str, records: list[ToolCallRecord] | None = None) -> None:
         self.answer = answer
         self.records = records or []
+        self.calls = 0
 
     async def ainvoke(self, state, config=None):
+        self.calls += 1
         return {
             "messages": [AIMessage(content=self.answer)],
             "steps": 1,
@@ -83,15 +100,18 @@ async def _empty(*args: Any, **kwargs: Any) -> str:
     return ""
 
 
-def _without_db(loop: AgentLoop) -> AgentLoop:
+def _without_db(loop: AgentLoop, monkeypatch) -> AgentLoop:
+    async def _no_rows(*args: Any, **kwargs: Any) -> list:
+        return []
+
     loop._load_summary = _empty
     loop._sync_profile = _empty
-    loop._load_memories = _empty
+    monkeypatch.setattr(agent_loop_module.memory_repo, "active_items", _no_rows)
     return loop
 
 
-def test_fabricated_answer_without_any_tool_call_is_replaced() -> None:
-    loop = _without_db(_loop(_Graph(FABRICATED), Intent.QUERY_TX))
+def test_fabricated_answer_without_any_tool_call_is_replaced(monkeypatch) -> None:
+    loop = _without_db(_loop(_Graph(FABRICATED), Intent.QUERY_TX), monkeypatch)
 
     outcome = asyncio.run(
         loop.handle(
@@ -108,9 +128,9 @@ def test_fabricated_answer_without_any_tool_call_is_replaced() -> None:
     assert "answer_without_evidence" in [event for event, _ in loop._audit.events]
 
 
-def test_answer_is_kept_when_a_tool_call_succeeded() -> None:
+def test_answer_is_kept_when_a_tool_call_succeeded(monkeypatch) -> None:
     records = [ToolCallRecord(name="get_transaction_records", ok=True)]
-    loop = _without_db(_loop(_Graph(FABRICATED, records), Intent.QUERY_TX))
+    loop = _without_db(_loop(_Graph(FABRICATED, records), Intent.QUERY_TX), monkeypatch)
 
     outcome = asyncio.run(
         loop.handle(
@@ -127,9 +147,9 @@ def test_answer_is_kept_when_a_tool_call_succeeded() -> None:
     assert "answer_without_evidence" not in [event for event, _ in loop._audit.events]
 
 
-def test_all_tool_calls_failed_is_treated_as_no_evidence() -> None:
+def test_all_tool_calls_failed_is_treated_as_no_evidence(monkeypatch) -> None:
     records = [ToolCallRecord(name="get_transaction_records", ok=False, error="E303")]
-    loop = _without_db(_loop(_Graph(FABRICATED, records), Intent.QUERY_TX))
+    loop = _without_db(_loop(_Graph(FABRICATED, records), Intent.QUERY_TX), monkeypatch)
 
     outcome = asyncio.run(
         loop.handle(
@@ -145,8 +165,12 @@ def test_all_tool_calls_failed_is_treated_as_no_evidence() -> None:
     assert outcome.degraded is True
 
 
-def test_chitchat_without_tools_is_not_touched() -> None:
-    loop = _without_db(_loop(_Graph("你好，我能帮你查链上资产与交易。"), Intent.CHITCHAT))
+def test_chitchat_answers_from_history_without_the_graph(monkeypatch) -> None:
+    graph = _Graph("不该出现的工具回答")
+    loop = _without_db(_loop(graph, Intent.CHITCHAT), monkeypatch)
+    loop._conversation = _HistoryConversation(
+        [("user", "查一下我的交易记录"), ("assistant", "最近 3 笔交易……")]
+    )
 
     outcome = asyncio.run(
         loop.handle(
@@ -154,12 +178,13 @@ def test_chitchat_without_tools_is_not_touched() -> None:
             siwe_user_id="u-1",
             wallet_address="0x63a9f8df422e1983d42565234557d46d18dbece9",
             chain_id=80094,
-            user_message="你好",
+            user_message="我上一个问题是什么？",
         )
     )
 
+    assert graph.calls == 0
     assert outcome.content.startswith("你好")
-    assert outcome.degraded is False
+    assert outcome.tool_calls == []
 
 
 class _RetryGraph:
@@ -180,9 +205,9 @@ class _RetryGraph:
         }
 
 
-def test_missing_tool_call_triggers_one_retry() -> None:
+def test_missing_tool_call_triggers_one_retry(monkeypatch) -> None:
     graph = _RetryGraph()
-    loop = _without_db(_loop(graph, Intent.QUERY_TX))
+    loop = _without_db(_loop(graph, Intent.QUERY_TX), monkeypatch)
 
     outcome = asyncio.run(
         loop.handle(
@@ -198,3 +223,29 @@ def test_missing_tool_call_triggers_one_retry() -> None:
     assert outcome.content == "查到了两笔交易"
     assert outcome.degraded is False
     assert "tool_call_retried" in [event for event, _ in loop._audit.events]
+
+
+PROFILE_TEXT = "- 回答风格：简洁"
+
+
+async def _profile(*args: Any, **kwargs: Any) -> str:
+    return PROFILE_TEXT
+
+
+def test_chitchat_carries_the_profile(monkeypatch) -> None:
+    """闲聊轮也要遵守用户设过的回答偏好，不能因为不查数据就丢掉档案。"""
+    loop = _without_db(_loop(_Graph("不该出现的工具回答"), Intent.CHITCHAT), monkeypatch)
+    loop._sync_profile = _profile
+
+    asyncio.run(
+        loop.handle(
+            None,
+            siwe_user_id="u-1",
+            wallet_address="0x63a9f8df422e1983d42565234557d46d18dbece9",
+            chain_id=80094,
+            user_message="你好",
+        )
+    )
+
+    systems = [m.content for m in loop._llm.seen[0] if m.type == "system"]
+    assert PROFILE_TEXT in systems

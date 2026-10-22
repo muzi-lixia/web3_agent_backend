@@ -8,8 +8,9 @@ from web3_agent.persistence.pg.repositories import conversation_repo
 
 
 class ConversationContext:
-    def __init__(self, max_messages: int) -> None:
+    def __init__(self, max_messages: int, max_chars: int) -> None:
         self._max = max_messages
+        self._max_chars = max_chars
 
     async def load(
         self,
@@ -17,7 +18,9 @@ class ConversationContext:
         *,
         siwe_user_id: str
     ) -> list[tuple[str, str]]:
-        return await conversation_repo.load_history(db, siwe_user_id, self._max)
+        return await conversation_repo.load_history(
+            db, siwe_user_id, self._max, self._max_chars
+        )
 
     async def save(
         self,

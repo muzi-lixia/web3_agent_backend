@@ -56,17 +56,18 @@ class MemoryExtractor:
             return False
         return fail_count < self._settings.memory_fail_max
 
-    async def run(self, *, siwe_user_id: str) -> None:
+    async def run(self, *, siwe_user_id: str, job: _Job | None = None) -> None:
         take_rpc_calls()
         try:
-            job = await self._collect(siwe_user_id)
+            job = job or await self.collect(siwe_user_id)
             if job is None:
                 return
             await self._extract(siwe_user_id, job)
         except Exception:  # noqa: BLE001 后台任务不能把异常丢给事件循环
             logger.exception("memory extract crashed: user=%s", siwe_user_id)
 
-    async def _collect(self, siwe_user_id: str) -> _Job | None:
+    async def collect(self, siwe_user_id: str) -> _Job | None:
+        """探水位线并取出待抽取区间。返回 None 表示这轮没活干。"""
         async with session_scope() as db:
             state = await memory_repo.get_state(db, siwe_user_id)
             since = state.last_extracted_message_id if state else 0

@@ -38,11 +38,15 @@ class ToolRunner:
             )
             return json.dumps({"error": "E302", "message": str(exc)}, ensure_ascii=False), record
 
+        payload = result if isinstance(result, (dict, list)) else {"result": result}
+        # 只读工具用 {"error": "E303"} 表示查不到（数据源未配置 / 地址不合法 / 无 RPC）。
+        # 这种返回没抛异常，但确实没有数据 —— 记成 ok 会让证据校验以为「查到过」。
+        failed = isinstance(payload, dict) and bool(payload.get("error"))
         record = ToolCallRecord(
             name=name,
             args=args,
-            ok=True,
+            ok=not failed,
+            error=str(payload["error"]) if failed else None,
             latency_ms=int((time.monotonic() - started) * 1000),
         )
-        payload = result if isinstance(result, (dict, list)) else {"result": result}
         return json.dumps(payload, ensure_ascii=False, default=str), record

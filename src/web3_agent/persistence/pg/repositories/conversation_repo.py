@@ -9,9 +9,9 @@ from web3_agent.persistence.pg.orm_models import ConversationMessage
 
 
 async def load_history(
-    db: AsyncSession, siwe_user_id: str, limit: int
+    db: AsyncSession, siwe_user_id: str, limit: int, max_chars: int
 ) -> list[tuple[str, str]]:
-    """按 id 正序返回最近 limit 条 (role, content)。"""
+    """按 id 正序返回最近 limit 条 (role, content)，再按字符预算从旧到新裁掉。"""
     stmt = (
         select(ConversationMessage.role, ConversationMessage.content)
         .where(ConversationMessage.siwe_user_id == siwe_user_id)
@@ -19,7 +19,27 @@ async def load_history(
         .limit(limit)
     )
     rows = (await db.execute(stmt)).all()
-    return [(r.role, r.content) for r in reversed(rows)]
+    return _fit_budget([(r.role, r.content) for r in reversed(rows)], max_chars)
+
+
+def _fit_budget(
+    messages: list[tuple[str, str]], max_chars: int
+) -> list[tuple[str, str]]:
+    """从最新一条往回装，装不下就丢掉更早的，保留一段连续的结尾。
+
+    最新一条永远保留：用户下一句多半就在问它，截断它等于把上下文切成两半。
+    """
+    if max_chars <= 0:
+        return messages
+    kept: list[tuple[str, str]] = []
+    used = 0
+    for role, content in reversed(messages):
+        size = len(content or "")
+        if kept and used + size > max_chars:
+            break
+        kept.append((role, content))
+        used += size
+    return list(reversed(kept))
 
 
 async def list_page(

@@ -80,6 +80,7 @@ def build_container(settings: Settings) -> Container:
     runner = ToolRunner(registry)
     conversation = ConversationContext(
         max_messages=settings.conversation_max_messages,
+        max_chars=settings.conversation_max_chars,
     )
     audit = AuditLogger()
     quota = QuotaController(settings)

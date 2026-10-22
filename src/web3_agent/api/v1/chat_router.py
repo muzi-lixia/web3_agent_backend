@@ -78,10 +78,21 @@ async def chat(
 
     # 事务已提交，后台任务才能看到本轮消息；它们各自开会话、各自兜异常。
     # 摘要只压挤出窗口的部分，记忆抽取处理水位线之后的全部 —— 两条独立水位线，不互相卡。
-    _spawn_background(
-        container.summarizer.run(siwe_user_id=identity.user_id, own_address=identity.address)
-    )
-    _spawn_background(container.memory.run(siwe_user_id=identity.user_id))
+    # 先探一次水位线再决定开不开任务：两个任务各自开一次会话查一次库，
+    # 而五轮里只有一轮真的积压够了，其余轮次到这里就结束。
+    async with session_scope() as db:
+        summary_job = await container.summarizer.collect(identity.user_id)
+        memory_job = await container.memory.collect(identity.user_id)
+    if summary_job is not None:
+        _spawn_background(
+            container.summarizer.run(
+                siwe_user_id=identity.user_id,
+                own_address=identity.address,
+                job=summary_job,
+            )
+        )
+    if memory_job is not None:
+        _spawn_background(container.memory.run(siwe_user_id=identity.user_id, job=memory_job))
 
     return ChatResponse(
         type=_KIND_TO_TYPE.get(outcome.kind, "answer"),

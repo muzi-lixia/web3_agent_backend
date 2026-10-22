@@ -49,6 +49,7 @@ def _normalize(item: dict, chain_id: int, source: str) -> dict:
         "from": item.get("from"),
         "to": item.get("to"),
         "value": item.get("value"),
+        "decimals": int(item.get("tokenDecimal") or 18),
         "tokenSymbol": item.get("tokenSymbol"),
         "contractAddress": item.get("contractAddress"),
         "source": source,

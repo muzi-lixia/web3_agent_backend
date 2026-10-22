@@ -144,8 +144,10 @@ class LlmAdapter:
             raise ModelUnavailable("记忆抽取结构化输出解析失败")
         return result
 
-    async def answer(self, messages: list[BaseMessage]) -> BaseMessage:
-        return await self._llm.ainvoke(messages)
+    async def answer(
+        self, messages: list[BaseMessage], *, config: RunnableConfig | None = None
+    ) -> BaseMessage:
+        return await self._llm.ainvoke(messages, config=config or None)
 
     @property
     def chat_model(self) -> BaseChatModel:

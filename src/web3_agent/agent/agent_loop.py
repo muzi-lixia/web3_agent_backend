@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langsmith import traceable
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,6 +17,7 @@ from web3_agent.agent.graph.read_graph import build_read_graph, initial_state
 from web3_agent.agent.intent_router import route_intent
 from web3_agent.agent.json_guard import JsonGuard
 from web3_agent.agent.llm_adapter import LlmAdapter
+from web3_agent.agent.prompts import CHAT_SYSTEM
 from web3_agent.agent.sanitize import sanitize_free_text
 from web3_agent.common.exceptions import E507_MODEL_UNAVAILABLE, AppError, ModelUnavailable
 from web3_agent.common.tracing import get_trace_id, set_run_id
@@ -158,7 +159,11 @@ class AgentLoop:
         )
         summary_text = await self._load_summary(db, siwe_user_id)
         profile_text = await self._sync_profile(db, siwe_user_id, user_message, chain_id)
-        memory_text = await self._load_memories(db, siwe_user_id, user_message)
+        # constraint 直接注入；软记忆要向量召回（一次 embed 2s 以上），
+        # 留到意图确认之后 —— 闲聊轮用不上它。
+        memory_rows = await memory_repo.active_items(db, siwe_user_id)
+        memory_items = _constraints_of(memory_rows, self._settings.memory_constraint_max)
+        memory_text = self._render_memories(memory_items)
         await self._conversation.save(
             db, siwe_user_id=siwe_user_id, role="user", content=user_message
         )
@@ -223,6 +228,21 @@ class AgentLoop:
                 db, siwe_user_id, ChatOutcome(kind="answer", content=MSG_WRITE_NOT_ENABLED)
             )
 
+        # 闲聊不进工具图：不带工具就不可能在闲聊里查一遍链，也省掉一次工具往返。
+        if guarded.output.intent is Intent.CHITCHAT:
+            return await self._finish(
+                db,
+                siwe_user_id,
+                await self._chitchat(history, user_message, siwe_user_id, profile_text),
+            )
+
+        # 要查数据的轮次才值得为软记忆做一次向量召回。
+        memory_items = [
+            *memory_items,
+            *await self._recall(db, siwe_user_id, user_message, memory_rows),
+        ]
+        memory_text = self._render_memories(memory_items)
+
         # 5. Action：只读 ReAct
         graph_config = (
             langsmith_tracer.run_config("agent.graph", trace_id=get_trace_id()) or None
@@ -237,6 +257,7 @@ class AgentLoop:
                     profile=profile_text,
                     memories=memory_text,
                     intent=guarded.output.intent,
+                    slots=guarded.output.slots,
                 ),
                 config=graph_config,
             )
@@ -257,12 +278,19 @@ class AgentLoop:
             code, msg, status = E507_MODEL_UNAVAILABLE
             raise AppError(code, msg, status, retryable=True) from exc
 
-        answer = state["messages"][-1].content
+        answer = state.get("direct_answer") or state["messages"][-1].content
         steps = state.get("steps", 0)
         if steps >= self._settings.read_max_react_steps:
             answer = f"{answer}\n\n{MSG_STEP_LIMIT}"
 
         no_data = _lacks_evidence(guarded.output.intent, records)
+        if state.get("direct_answer"):
+            await self._audit.log(
+                "answer_direct",
+                siwe_user_id=siwe_user_id,
+                intent=guarded.output.intent.value,
+                tool_calls=len(records),
+            )
         if retried and not no_data:
             await self._audit.log(
                 "tool_call_retried",
@@ -290,6 +318,37 @@ class AgentLoop:
             degraded=no_data,
         )
         return await self._finish(db, siwe_user_id, outcome)
+
+    async def _chitchat(
+        self,
+        history: list[tuple[str, str]],
+        user_message: str,
+        siwe_user_id: str,
+        profile_text: str = "",
+    ) -> ChatOutcome:
+        """不带工具的一次性回答。历史原样给，用户问的就是历史本身。"""
+        messages = [SystemMessage(content=CHAT_SYSTEM)]
+        if profile_text:
+            messages.append(SystemMessage(content=profile_text))
+        for role, content in history:
+            messages.append(
+                AIMessage(content=content) if role == "assistant" else HumanMessage(content=content)
+            )
+        messages.append(HumanMessage(content=user_message))
+        try:
+            reply = await self._llm.answer(
+                messages,
+                config=langsmith_tracer.run_config(
+                    "chat.chitchat",
+                    trace_id=get_trace_id(),
+                    siwe_user_id=siwe_user_id,
+                ),
+            )
+        except ModelUnavailable as exc:
+            await self._audit.log("model_unavailable", siwe_user_id=siwe_user_id, error=str(exc))
+            code, msg, status = E507_MODEL_UNAVAILABLE
+            raise AppError(code, msg, status, retryable=True) from exc
+        return ChatOutcome(kind="answer", content=reply.content)
 
     async def _load_summary(self, db: AsyncSession, siwe_user_id: str) -> str:
         """摘要注入文本。status=failed 时也注入上一次成功的那份 —— 它仍然有效。"""
@@ -329,37 +388,34 @@ class AgentLoop:
             max_tokens=self._settings.profile_token_max_items,
         )
 
-    async def _load_memories(self, db: AsyncSession, siwe_user_id: str, query: str) -> str:
-        """长期背景：constraint 全量注入，preference / profile 走向量召回。
+    def _render_memories(self, items: list[memory.MemoryItem]) -> str:
+        return memory.render(items, max_chars=self._settings.memory_render_chars)
+
+    async def _recall(
+        self, db: AsyncSession, siwe_user_id: str, query: str, rows: list
+    ) -> list[memory.MemoryItem]:
+        """软记忆的向量召回。没有软记忆时连 embed 都不做。
 
         向量化是新增的失败点，坏了只降级到 constraint —— 记忆是增强项，
         不能因为它把整轮对话拖垮。
         """
-        rows = await memory_repo.active_items(db, siwe_user_id)
-        picked = [_as_item(r) for r in rows if r.memory_type == "constraint"]
-        picked = picked[: self._settings.memory_constraint_max]
-
-        # constraint 已经全量注入，向量召回只为软记忆服务 —— 一条软记忆都没有时
-        # 没必要向量化：那一次 embed 要 2s 以上，还会顺带把 embedding 模型拉进显存。
-        soft = [r for r in rows if r.memory_type != "constraint"]
-        if query.strip() and soft:
-            try:
-                vector = await self._embedder.embed(query)
-                recalled = await memory_repo.recall(
-                    db,
-                    siwe_user_id,
-                    embedding=vector,
-                    limit=self._settings.memory_recall_limit,
-                    max_distance=self._settings.memory_recall_max_distance,
-                )
-            except ModelUnavailable as exc:
-                await self._audit.log(
-                    "memory_recall_degraded", siwe_user_id=siwe_user_id, error=str(exc)[:200]
-                )
-                recalled = []
-            picked.extend(_as_item(r) for r in recalled)
-
-        return memory.render(picked, max_chars=self._settings.memory_render_chars)
+        if not query.strip() or not any(r.memory_type != "constraint" for r in rows):
+            return []
+        try:
+            vector = await self._embedder.embed(query)
+            recalled = await memory_repo.recall(
+                db,
+                siwe_user_id,
+                embedding=vector,
+                limit=self._settings.memory_recall_limit,
+                max_distance=self._settings.memory_recall_max_distance,
+            )
+        except ModelUnavailable as exc:
+            await self._audit.log(
+                "memory_recall_degraded", siwe_user_id=siwe_user_id, error=str(exc)[:200]
+            )
+            return []
+        return [_as_item(r) for r in recalled]
 
     async def _finish(
         self, db: AsyncSession, siwe_user_id: str, outcome: ChatOutcome
@@ -377,10 +433,14 @@ class AgentLoop:
         return outcome
 
 
-def _record(item: dict):
-    from web3_agent.common.types import ToolCallRecord
-
+def _record(item: dict) -> ToolCallRecord:
     return ToolCallRecord(**item)
+
+
+def _constraints_of(rows: list, cap: int) -> list[memory.MemoryItem]:
+    """硬约束全量注入，不受向量召回影响。"""
+    items = [_as_item(r) for r in rows if r.memory_type == "constraint"]
+    return items[:cap]
 
 
 def _as_item(row) -> memory.MemoryItem:

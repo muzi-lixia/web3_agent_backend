@@ -61,18 +61,24 @@ class Summarizer:
             return True
         return fail_count < self._settings.summary_fail_max
 
-    async def run(self, *, siwe_user_id: str, own_address: str) -> None:
-        """后台任务入口。任何异常都不外抛——它已经不挂在任何请求上了。"""
+    async def run(
+        self, *, siwe_user_id: str, own_address: str, job: _Job | None = None
+    ) -> None:
+        """后台任务入口。任何异常都不外抛——它已经不挂在任何请求上了。
+
+        job 由调用方预先探好时直接传进来，省掉重复查一次水位线。
+        """
         take_rpc_calls()  # create_task 会继承主请求的计数，不重置会串回去
         try:
-            job = await self._collect(siwe_user_id)
+            job = job or await self.collect(siwe_user_id)
             if job is None:
                 return
             await self._summarize(siwe_user_id, own_address, job)
         except Exception:  # noqa: BLE001 后台任务不能把异常丢给事件循环
             logger.exception("summarize task crashed: user=%s", siwe_user_id)
 
-    async def _collect(self, siwe_user_id: str) -> _Job | None:
+    async def collect(self, siwe_user_id: str) -> _Job | None:
+        """探水位线并取出待压缩区间。返回 None 表示这轮没活干。"""
         async with session_scope() as db:
             row = await summary_repo.get(db, siwe_user_id)
             since = row.last_summarized_message_id if row else 0
