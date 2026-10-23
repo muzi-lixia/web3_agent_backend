@@ -58,6 +58,7 @@ class HistoryItem(BaseModel):
     role: str
     content: str
     tool_calls: list[dict[str, Any]] | None = Field(default=None, alias="toolCalls")
+    citations: list[dict[str, Any]] = Field(default_factory=list)
     created_at: datetime = Field(alias="createdAt")
 
 

@@ -25,3 +25,4 @@ class ReadState(TypedDict):
     rag_status: str
     rag_required: bool
     rag_args: dict
+    rag_answer_context: str

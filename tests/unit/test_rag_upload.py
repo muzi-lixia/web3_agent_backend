@@ -281,3 +281,14 @@ def test_pdf_pages_and_offsets_survive_pipeline():
     assert chunks[0].page_number==1 and chunks[-1].page_end==2
     assert all(parsed.text[c.char_start:c.char_end]==c.content for c in chunks)
     assert all(c.token_count>0 and c.token_count_method=="approx_v1" for c in chunks)
+
+
+@pytest.mark.parametrize("filename", ["guide.md", "guide.txt"])
+def test_normal_english_document_is_not_rejected_as_mnemonic(filename):
+    text = "this document explains how users can safely manage their digital assets across different networks"
+    assert parse_document(text.encode(), filename) == text
+
+
+def test_transaction_hash_in_document_is_not_rejected_as_private_key():
+    text = "Transaction hash: 0x" + "ab" * 32
+    assert parse_document(text.encode(), "transaction.md") == text

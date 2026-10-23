@@ -123,6 +123,8 @@ async def history(
                 role=r.role,
                 content=r.content,
                 tool_calls=r.tool_calls,
+                citations=next((call.get("citations", []) for call in (r.tool_calls or [])
+                                if call.get("name") == "rag_general_knowledge" and call.get("citations")), []),
                 created_at=r.created_at,
             )
             for r in reversed(rows)

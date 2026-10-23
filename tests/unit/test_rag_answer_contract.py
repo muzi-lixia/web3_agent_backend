@@ -1,73 +1,61 @@
-"""Evidence contract: exact source quotes, cautious translations and numeric safety."""
-import json
+"""RAG responses are summarized by the model, not rewritten by literal checks."""
 import pytest
-from web3_agent.rag.answer import grounded_answer, _normalized
+from web3_agent.rag.answer import render_answer
 from web3_agent.agent.graph.read_graph import initial_state
+from web3_agent.agent.prompts import RAG_SYSTEM
 from web3_agent.config.constants import Intent
 
 
-def hit(content, key='S1'):
-    return dict(id=key, title='规则', section='FAQ', version='v1', kb_id='default',
-                doc_category='faq', updated_at='2026-01-01', content=content, source_url='')
+def hit(content):
+    return dict(id="S1", title="overview", section="正文", version="v1", kb_id="default",
+                doc_category="faq", updated_at="2026-01-01", content=content, source_url="")
 
 
-def draft(text, quote, key='S1'):
-    return json.dumps({'claims':[{'text':text,'source_id':key,'quote':quote}]},ensure_ascii=False)
+@pytest.mark.parametrize("draft", [
+    "Berachain 是兼容 EVM 的第 1 层区块链，区块时间约 2 秒。[S1]",
+    "解锁期为七天。[S1]",
+    "提前退出可能产生罚金，具体条件以文档为准。[S1]",
+    "Berachain is an EVM-compatible layer 1 blockchain.[S1]",
+])
+def test_natural_language_summary_is_preserved(draft):
+    answer = render_answer(draft, [hit("English source material.")])
+    assert answer.startswith(draft)
+    assert "未通过证据校验" not in answer and "无法自动核实" not in answer
+    assert answer == draft
+    assert "来源：" not in answer and "overview" not in answer
 
 
-@pytest.mark.parametrize(('text','expected'), [('七天','7天'),('十二天','12天'),
-    ('三十天','30天'),('二零二六年','2026年'),('一百天','一百天')])
-def test_conservative_numerals(text, expected):
-    assert _normalized(text) == expected
-
-
-@pytest.mark.parametrize('wrong', ['锁仓二零二六年。[S1]','锁仓七点六年。[S1]','锁仓十六年。[S1]'])
-def test_wrong_numbers_never_equal_six(wrong):
-    assert grounded_answer(wrong,[hit('锁仓6年。')])[1]
+def test_source_content_is_not_dumped_into_answer():
+    answer = render_answer("DEX 是去中心化交易所。",[hit("Unrelated source paragraph.")])
+    assert "Unrelated source paragraph" not in answer
 
 
 def test_chat_discards_all_model_generated_scope_fields():
-    state = initial_state([], '什么是DEX？',intent=Intent.QUERY_KNOWLEDGE,
-        slots={'protocol_id':'通用','doc_category':'DEX','chain_id':56},kb_id='guides')
-    assert state['rag_args'] == {'query_str':'什么是DEX？','kb_id':'guides'}
+    state = initial_state([], "什么是DEX？", intent=Intent.QUERY_KNOWLEDGE,
+        slots={"protocol_id":"通用","doc_category":"DEX","chain_id":56},kb_id="guides")
+    assert state["rag_args"] == {"query_str":"什么是DEX？","kb_id":"guides"}
 
 
-def test_checked_unlock_translation_preserves_quote_and_chinese():
-    quote = 'The unlock period is 7 days.'
-    result, degraded = grounded_answer(draft('解锁期为7天。',quote),[hit(quote)])
-    assert not degraded and '解锁期为7天。 [S1]' in result and quote in result
-    assert 'claims' not in result
+def test_prompt_requests_user_language_and_plain_answer():
+    assert "中文提问用中文，英文提问用英文" in RAG_SYSTEM
+    assert "准确翻译" in RAG_SYSTEM
+    assert "前端独立展示" in RAG_SYSTEM
+    assert "只输出 JSON" not in RAG_SYSTEM
 
 
-def test_wrong_translated_number_is_replaced_by_related_quote_only():
-    quote = 'The unlock period is 7 days.'
-    result, degraded = grounded_answer(draft('解锁期为6天。',quote),[hit(quote)])
-    assert degraded and '解锁期为6天' not in result and quote in result
-
-
-def test_sensitive_translation_with_conditions_is_not_auto_certified():
-    quote = 'Early exit within the lockup window incurs a penalty of 2%.'
-    result, degraded = grounded_answer(draft('提前退出罚金为2%。',quote),[hit(quote+' Unrelated FAQ text.')])
-    assert degraded and quote in result and 'Unrelated FAQ' not in result
-    assert '提前退出罚金为2%' not in result
-
-
-@pytest.mark.parametrize(('quote','key'), [('penalty of 2%.','S1'),
-    ('Invented rule.','S1'),('The unlock period is 7 days.','S2')])
-def test_incomplete_fabricated_or_wrong_source_quote_is_rejected(quote,key):
-    source = 'Early exit within the lockup window incurs a penalty of 2%.'
-    result, degraded = grounded_answer(draft('解锁期为7天。',quote,key),[hit(source)])
-    assert degraded and '未通过证据校验' in result and quote not in result
-
-
-def test_non_sensitive_translation_renders_only_bound_source():
-    quote = 'DEX means decentralized exchange.'
-    result, degraded = grounded_answer(draft('DEX 是去中心化交易所。',quote),
-                                       [hit(quote),hit('Unrelated content.','S2')])
-    assert not degraded and 'DEX 是去中心化交易所' in result and quote in result
-    assert 'Unrelated content' not in result and '[S2]' not in result
-
-
-def test_malformed_structured_response_cannot_leak_json():
-    result, degraded = grounded_answer('{"claims": "bad"}',[hit('source')])
-    assert degraded and 'claims' not in result
+def test_history_keeps_citations_separate_in_existing_json_metadata():
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from web3_agent.agent.agent_loop import AgentLoop
+    from web3_agent.common.types import ChatOutcome, ToolCallRecord
+    source = hit('source paragraph')
+    outcome = ChatOutcome(kind='answer',content='中文回答。[S1]',citations=[source],
+                          tool_calls=[ToolCallRecord(name='rag_general_knowledge',ok=True)])
+    conversation = SimpleNamespace(save=AsyncMock())
+    instance = SimpleNamespace(_conversation=conversation)
+    result = asyncio.run(AgentLoop._finish(instance,None,'user',outcome))
+    saved = conversation.save.call_args.kwargs
+    assert saved['content'] == '中文回答。[S1]'
+    assert saved['tool_calls'][0]['citations'] == [source]
+    assert result.citations == [source]

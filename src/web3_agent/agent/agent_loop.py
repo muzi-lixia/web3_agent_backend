@@ -18,7 +18,7 @@ from web3_agent.agent.intent_router import route_intent
 from web3_agent.agent.json_guard import JsonGuard
 from web3_agent.agent.llm_adapter import LlmAdapter
 from web3_agent.agent.prompts import CHAT_SYSTEM
-from web3_agent.rag.answer import grounded_answer
+from web3_agent.rag.answer import render_answer
 from web3_agent.rag.retriever import NO_DOCUMENTS, UNAVAILABLE
 from web3_agent.agent.sanitize import sanitize_free_text
 from web3_agent.common.exceptions import E507_MODEL_UNAVAILABLE, AppError, ModelUnavailable
@@ -341,8 +341,7 @@ class AgentLoop:
                 no_data = True
                 citations = []
             else:
-                answer, excerpted = grounded_answer(str(answer), citations)
-                no_data = excerpted
+                answer = render_answer(str(answer), citations)
         outcome = ChatOutcome(
             kind=kind,
             content=answer if isinstance(answer, str) else str(answer),
@@ -457,6 +456,12 @@ class AgentLoop:
         # 工具轨迹随消息落库：历史记录要能复原「这条回答查了什么」。
         # 没有调工具时留 NULL，不要写空数组 —— 绝大多数轮次都是这种。
         calls = [call.model_dump() for call in outcome.tool_calls]
+        # Keep citation snapshots with the existing JSON tool metadata, without DDL.
+        # This preserves references after the frontend reloads conversation history.
+        for call in calls:
+            if call["name"] == "rag_general_knowledge" and call["ok"] and outcome.citations:
+                call["citations"] = outcome.citations
+                break
         await self._conversation.save(
             db,
             siwe_user_id=siwe_user_id,

@@ -2,7 +2,6 @@
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from web3_agent.agent.secret_detector import detect
 
 
 class DocumentParseError(ValueError):
@@ -63,8 +62,6 @@ def parse_document_with_spans(data: bytes, filename: str, *, max_bytes=5_000_000
         raise DocumentParseError("文档没有可提取文本；扫描 PDF 请先完成 OCR")
     if len(content) > max_text_chars:
         raise DocumentParseError("解析文本超过长度限制")
-    if detect(content) is not None:
-        raise DocumentParseError("文档疑似含有私钥或助记词，拒绝入库")
     return ParsedDocument(content,tuple(spans))
 
 

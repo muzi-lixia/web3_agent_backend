@@ -21,7 +21,7 @@ from web3_agent.rag.chunker import split_document
 from web3_agent.rag.config import normalize_filters
 from web3_agent.rag.tool import build_rag_general_knowledge
 from web3_agent.rag.retriever import KnowledgeRetriever, NO_DOCUMENTS, UNAVAILABLE
-from web3_agent.rag.answer import grounded_answer
+from web3_agent.rag.answer import render_answer
 from web3_agent.rag.ingestion_job import prepare, ingest
 from web3_agent.rag.vector_store import active_scope
 from web3_agent.persistence.pg.orm_models import RagDocument
@@ -152,30 +152,12 @@ def test_tool_exposes_optional_filters_and_allows_global_terms():
     assert retriever.search.call_args.kwargs["chain_id"] == 56
 
 
-def test_sensitive_claims_require_complete_source_sentence_and_valid_citation():
-    hits=[citation().model_dump()]
-    answer,degraded=grounded_answer("解锁期为7天。[S1]",hits)
-    assert not degraded and "https://example.com/rules" in answer
-    for invented in ["解锁期为1天。[S1]","罚金为2%。[S1]","解锁期为7天。[S9]","不收罚金。"]:
-        answer,degraded=grounded_answer(invented,hits)
-        assert degraded and "未通过证据校验" in answer
-        assert "仅在锁定期内" not in answer
-
-
-def test_percentage_cannot_match_different_unit():
-    hits=[citation(content="罚金为2 USDC。").model_dump()]
-    assert grounded_answer("罚金为2%。[S1]",hits)[1]
-
-
-def test_english_sentence_and_chinese_numeral_match_the_same_fact():
-    hits=[citation(content="Unlock period is 7 days. Early exit within the lockup window incurs a penalty of 2%.").model_dump()]
-    # 英文按句号切开后，只引其中一句也是原文，不能判成编造。
-    assert not grounded_answer("Unlock period is 7 days.[S1]",hits)[1]
-    assert not grounded_answer("Early exit within the lockup window incurs a penalty of 2%.[S1]",hits)[1]
-    # 中文数词与原文的阿拉伯数字是同一事实；改错仍然要拦住。
-    zh=[citation().model_dump()]
-    assert not grounded_answer("解锁期为七天。[S1]",zh)[1]
-    assert grounded_answer("解锁期为三十天。[S1]",zh)[1]
+def test_rag_translation_is_presented_without_literal_matching():
+    hits = [citation(content="The unlock period is 7 days.").model_dump()]
+    draft = "解锁期为七天。[S1]"
+    answer = render_answer(draft, hits)
+    assert answer.startswith(draft)
+    assert "https://example.com/rules" not in answer
 
 
 def test_document_success_is_not_live_chain_evidence():
@@ -238,7 +220,7 @@ def test_agent_never_keeps_fabricated_rules_when_retrieval_failed(monkeypatch):
     assert outcome.content==NO_DOCUMENTS and outcome.degraded and outcome.citations==[]
 
 
-def test_agent_rejects_unsupported_sensitive_answer_without_dumping_evidence(monkeypatch):
+def test_agent_returns_rag_model_answer_with_sources_without_literal_validation(monkeypatch):
     from tests.unit.test_agent_loop_evidence import _loop, _without_db
     class Graph:
         async def ainvoke(self,state,config=None):
@@ -249,8 +231,8 @@ def test_agent_rejects_unsupported_sensitive_answer_without_dumping_evidence(mon
     loop._settings=settings()
     loop._llm.extract_intent=AsyncMock(return_value=LlmOutput(intent=Intent.QUERY_KNOWLEDGE,confidence=.99,slots={"protocol_id":"100"}))
     outcome=asyncio.run(loop.handle(None,siwe_user_id="u",wallet_address="0x"+"1"*40,chain_id=1,user_message="池100有罚金吗"))
-    assert "罚金为0%" not in outcome.content
-    assert "未通过证据校验" in outcome.content and outcome.citations[0]["protocol_id"]=="100"
+    assert outcome.content.startswith("罚金为0%。[S1]")
+    assert not outcome.degraded and outcome.citations[0]["protocol_id"] == "100"
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -323,8 +305,9 @@ def test_local_document_without_url_retains_citation_title_and_version():
     spec=DocumentSpec(path="local.md",title="内部知识",doc_category="faq",version="v1",valid_from="2026-01-01T00:00:00Z")
     assert spec.source_url == ""
     hits=[citation(source_url="").model_dump()]
-    answer,degraded=grounded_answer("解锁期为7天。[S1]",hits)
-    assert not degraded and "测试规则" in answer and "版本 v1" in answer
+    answer=render_answer("解锁期为7天。[S1]",hits)
+    assert answer == "解锁期为7天。[S1]"
+    assert hits[0]["title"] == "测试规则" and hits[0]["version"] == "v1"
     assert "http" not in answer and "None" not in answer
 
 

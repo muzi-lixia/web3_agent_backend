@@ -14,6 +14,7 @@ from langgraph.graph import END, StateGraph
 
 from web3_agent.agent.graph.state import ReadState
 from web3_agent.agent.prompts import READ_SYSTEM, RAG_SYSTEM
+from web3_agent.rag.answer_prompt import answer_messages
 from web3_agent.agent.render import render_transactions
 from web3_agent.agent.sanitize import wrap_chain_data
 from web3_agent.agent.tool_runner import ToolRunner
@@ -77,9 +78,14 @@ def build_read_graph(
             if rag_answer_model is None:
                 raise RuntimeError("RAG 回答模型未配置")
             model = rag_answer_model
+            messages = answer_messages(
+                state.get("rag_query", ""), state.get("rag_citations", []),
+                state.get("rag_answer_context", ""),
+            )
         else:
             model = model_with_tools
-        response = await model.ainvoke(state["messages"])
+            messages = state["messages"]
+        response = await model.ainvoke(messages)
         return {"messages": [response], "steps": state.get("steps", 0) + 1}
 
     async def call_tools(state: ReadState) -> dict:
@@ -266,6 +272,11 @@ def initial_state(
         "rag_citations": [],
         "rag_status": "",
         "rag_required": intent is Intent.QUERY_KNOWLEDGE,
+        # Earlier assistant messages can contain old source lists and stale facts.
+        # The answer model sees only bounded prior user questions for disambiguation.
+        "rag_answer_context": "\n".join(
+            content for role, content in history if role == "user"
+        )[-2000:] if is_rag else "",
         "rag_args": rag_args
     }
 
