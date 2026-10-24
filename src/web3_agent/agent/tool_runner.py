@@ -19,13 +19,33 @@ from web3_agent.config.constants import CallSource
 logger = logging.getLogger(__name__)
 
 
+# 数据职责：工具统一执行边界，校验来源并生成成败和耗时轨迹。
 class ToolRunner:
     def __init__(self, registry: ToolRegistry) -> None:
+        """绑定工具注册表，统一处理调用来源与执行轨迹。
+
+        Args:
+            registry: 按名称管理工具与调用权限的注册表。
+        """
         self._registry = registry
 
     async def run(
         self, name: str, args: dict, *, source: CallSource
     ) -> tuple[str, ToolCallRecord]:
+        """检查工具调用来源，执行注册工具并返回 JSON 正文与含耗时的调用轨迹。
+
+        Args:
+            name: 注册表中的工具名称。
+            args: 工具输入参数字典。
+            source: 调用者来源；修改状态的工具仅允许 STATE_MACHINE。
+
+        Returns:
+            tuple[str, ToolCallRecord]: 序列化的工具结果及调用轨迹。
+
+        Raises:
+            ToolSourceViolation: 非状态机来源试图调用修改链上状态的工具。
+            AppError: 工具返回需要直接交给接口处理的业务错误。
+        """
         spec = self._registry.get(name)
         if spec.mutating and source is not CallSource.STATE_MACHINE:
             raise ToolSourceViolation(f"{name} 只允许状态机调用")

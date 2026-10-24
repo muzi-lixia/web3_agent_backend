@@ -35,19 +35,27 @@ from web3_agent.common.metering import start_metering
 logger = logging.getLogger(__name__)
 
 
+# 数据职责：后台记忆抽取任务快照，携带版本、水位线和租约供安全写回。
 @dataclass
 class _Job:
+    # until_id：本批处理区间的最大消息 ID。
     until_id: int
+    # messages：按角色组织的消息序列；后台任务为 (role, content)，图状态为 LangChain 消息。
     messages: list[tuple[str, str]]
+    # existing_texts：取数时已有的有效长期记忆正文，供模型避免重复抽取。
     existing_texts: list[str]
     # 取数时的会话生命周期版本。写回时若已被清空推进，记忆与水印都不写。
+    # generation：用户会话生命周期版本；清空时递增，旧任务写回前必须比对。
     generation: int
     # 取数时的水位线。写回时要求它没变 —— 变了说明这段已经被别人抽过。
+    # watermark：取数时的记忆抽取水位线，写回时必须保持不变。
     watermark: int
     # 本次抽取的租约。写回和失败计数都要求它还在自己手里。
+    # claim_token：本次后台任务的唯一租约标识；写回时校验，防止旧执行者覆盖新任务。
     claim_token: str
 
 
+# 数据职责：后台长期记忆抽取服务，借助租约、水位线和会话版本保护写回。
 class MemoryExtractor:
     def __init__(
         self,
@@ -56,17 +64,38 @@ class MemoryExtractor:
         audit: AuditLogger,
         quota: QuotaController,
     ) -> None:
+        """初始化 MemoryExtractor 所需的依赖和运行状态。
+
+        Args:
+            settings: 运行配置对象，提供本模块所需开关、阈值和服务地址。
+            llm: 统一模型适配器，负责结构化抽取及回答。
+            audit: 审计日志写入服务。
+            quota: 请求限流和资源记账服务。
+        """
         self._settings = settings
         self._llm = llm
         self._audit = audit
         self._quota = quota
 
     def should_run(self, *, pending: int, fail_count: int) -> bool:
+        """按待处理消息数及当前对象的失败限制判断是否应触发后台任务。
+
+        Args:
+            pending: 尚未处理的消息条数。
+            fail_count: 当前累计的抽取失败次数。
+        """
         if pending < self._settings.memory_trigger_messages:
             return False
         return fail_count < self._settings.memory_fail_max
 
     async def run(self, *, siwe_user_id: str, job: _Job | None = None) -> None:
+        # 后台处理建立独立账本，避免继承并继续累加触发它的聊天请求用量。
+        """启动独立计量的长期记忆后台抽取，异常记录日志而不影响聊天响应。
+
+        Args:
+            siwe_user_id: 数据所属用户的稳定标识。
+            job: 本次已领取的后台任务快照。
+        """
         start_metering(scope="background")  # 后台任务用自己的计费表，不串进任何一轮对话
         try:
             job = job or await self.collect(siwe_user_id)
@@ -82,6 +111,9 @@ class MemoryExtractor:
         先抢租约再读水位线，顺序不能反：反过来的话，两个任务会读到同一个水位线，
         抢到租约的后一个拿着过期的 `since` 去抽一段已经被抽过的消息，
         写回时才发现水位线变了 —— 模型调用已经白花了。
+
+        Args:
+            siwe_user_id: 数据所属用户的稳定标识。
         """
         token = uuid.uuid4().hex
         async with session_scope() as db:
@@ -118,6 +150,12 @@ class MemoryExtractor:
             )
 
     async def _extract(self, siwe_user_id: str, job: _Job) -> None:
+        """调用模型抽取记忆，清洗去重后按租约、版本和水位线校验写回。
+
+        Args:
+            siwe_user_id: 数据所属用户的稳定标识。
+            job: 本次已领取的后台任务快照。
+        """
         run = langsmith_tracer.run_config(
             "memory.extract",
             trace_id=get_trace_id(),
@@ -135,6 +173,7 @@ class MemoryExtractor:
             await self._on_failure(siwe_user_id, exc, job)
             return
 
+        # 先过滤不可信候选并按主题取舍，再进入持久化事务。
         items = _dedupe(raw.items, existing=job.existing_texts)
         await self._charge()
 
@@ -170,6 +209,13 @@ class MemoryExtractor:
         )
 
     async def _on_failure(self, siwe_user_id: str, exc: Exception, job: _Job) -> None:
+        """在仍持有有效任务资格时记录抽取失败，并写入日志与审计。
+
+        Args:
+            siwe_user_id: 数据所属用户的稳定标识。
+            exc: 需要转换、记录或判断是否重试的原始异常。
+            job: 本次已领取的后台任务快照。
+        """
         async with session_scope() as db:
             await memory_repo.mark_failed(
                 db, siwe_user_id, claim_token=job.claim_token, expected_generation=job.generation
@@ -178,6 +224,7 @@ class MemoryExtractor:
         await self._audit.log("memory_failed", siwe_user_id=siwe_user_id, error=str(exc)[:200])
 
     async def _charge(self) -> None:
+        """把后台模型调用记入内部主体配额，避免消耗用户交互额度。"""
         async with session_scope() as db:
             await self._quota.charge(
                 db, key=INTERNAL_QUOTA_KEY, metric=QuotaMetric.STEPS, amount=1
@@ -185,7 +232,12 @@ class MemoryExtractor:
 
 
 def _dedupe(drafts, *, existing: list[str]) -> list[memory.MemoryItem]:
-    """白名单过滤 + 同 subject 只留一条 + 与已有一字不差的丢掉。"""
+    """白名单过滤 + 同 subject 只留一条 + 与已有一字不差的丢掉。
+
+    Args:
+        drafts: 待清洗去重的模型记忆候选列表。
+        existing: 已持久化的记忆文本或常用代币集合。
+    """
     seen: dict[str, memory.MemoryItem] = {}
     for draft in drafts:
         item = memory.sanitize(draft.model_dump() if hasattr(draft, "model_dump") else draft)

@@ -28,11 +28,22 @@ router = APIRouter(prefix="/auth", tags=["auth"], dependencies=[Depends(auth_rat
 
 
 def _short(address: str) -> str:
+    """把钱包地址转换为首尾保留的缩略文本。
+
+    Args:
+        address: 待校验、登录或查询的钱包地址。
+    """
     return f"{address[:8]}…{address[-4:]}"
 
 
 @router.post("/nonce", response_model=NonceResponse, response_model_by_alias=True)
 async def issue_nonce(payload: NonceRequest, request: Request) -> NonceResponse:
+    """校验钱包和网络，生成绑定身份的一次性 nonce 与完整待签名消息。
+
+    Args:
+        payload: 经过字段校验的登录请求。
+        request: 当前 HTTP 请求，可读取应用依赖和请求上下文。
+    """
     settings = request.app.state.container.settings
     address = normalize_address(payload.address)
     if address is None:
@@ -66,6 +77,12 @@ async def issue_nonce(payload: NonceRequest, request: Request) -> NonceResponse:
 
 @router.post("/verify", response_model=VerifyResponse, response_model_by_alias=True)
 async def verify(payload: VerifyRequest, request: Request) -> VerifyResponse:
+    """解析并校验 SIWE 消息、恢复签名地址、核销 nonce，成功后签发 JWT。
+
+    Args:
+        payload: 经过字段校验的登录请求。
+        request: 当前 HTTP 请求，可读取应用依赖和请求上下文。
+    """
     container = request.app.state.container
     settings = container.settings
     audit = container.audit

@@ -10,7 +10,9 @@ import logging
 
 from web3_agent.common.tracing import get_trace_id
 
+# _FORMAT：模型响应结构异常类型集合，可进入结构化重试。
 _FORMAT = "%(asctime)s %(levelname)-5s [%(trace_id)s] %(name)s: %(message)s"
+# _DATE_FORMAT：日志时间字段的格式字符串。
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # uvicorn 自带 handler 且 propagate=False，不接管就还是它自己的格式。
@@ -21,11 +23,21 @@ class TraceIdFilter(logging.Filter):
     """给没有 trace_id 的记录补 "-"，否则 formatter 会抛 KeyError 把日志本身弄坏。"""
 
     def filter(self, record: logging.LogRecord) -> bool:
+        """给日志记录补充当前请求的 trace_id，供统一格式化输出。
+
+        Args:
+            record: 待补充请求追踪字段的日志记录。
+        """
         record.trace_id = get_trace_id() or "-"
         return True
 
 
 def setup_logging(level: str) -> None:
+    """配置日志级别、输出格式与请求追踪字段过滤器。
+
+    Args:
+        level: 日志级别名称。
+    """
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter(_FORMAT, datefmt=_DATE_FORMAT))
     handler.addFilter(TraceIdFilter())

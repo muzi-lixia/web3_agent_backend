@@ -22,6 +22,14 @@ def route_intent(
     confidence_threshold: float,
     required_slots: dict[Intent, tuple[str, ...]] | None = None,
 ) -> RouteDecision:
+    # 返回值：RouteDecision，包含最终路由、原因和缺失槽位。
+    """依据置信度、意图类别和必填槽位选择处理路径，不执行工具。
+
+    Args:
+        output: 已通过结构化校验的 LlmOutput 意图结果。
+        confidence_threshold: 低于此置信度时要求用户先澄清。
+        required_slots: 各业务意图必须具备的参数名集合。
+    """
     if output.confidence < confidence_threshold:
         return RouteDecision(route=Route.CLARIFY, reason="low_confidence")
 

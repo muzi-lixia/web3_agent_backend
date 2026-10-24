@@ -41,28 +41,38 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["chat"], dependencies=[Depends(chat_rate_limit)])
 
+# _KIND_TO_TYPE：内部回答种类到 HTTP 响应种类的转换映射。
 _KIND_TO_TYPE = {"answer": "answer", "ask": "ask", "reject": "answer"}
 
 # 幂等占位的存活上限 = 整轮硬超时 + 这段余量。余量留给超时判定后的事务收尾，
 # 余量之后仍在 running 的行，只可能是进程在写回前就不在了。
+# _IDEMPOTENCY_STALE_GRACE：聊天硬超时之外预留的幂等收尾宽限，单位为秒。
 _IDEMPOTENCY_STALE_GRACE = 30
 
 # 上一轮还在跑时告诉客户端等多久再来。真实一轮十几秒，3 秒足够让第一次
 # 重试落在「还在跑」之外又不至于空等；拿不到答案就再来一次，有上限兜底。
+# _IDEMPOTENCY_RETRY_AFTER：幂等请求仍在处理时建议客户端等待的秒数。
 _IDEMPOTENCY_RETRY_AFTER = 3
 
 # 后台任务（摘要、长期记忆抽取）。不 await：都慢，不能拖住回复。
 # 集合持有引用，否则任务可能被 GC 掉。
+# _BACKGROUND：对尚未结束的请求辅助任务保持强引用，结束后自动移除。
 _BACKGROUND: set[asyncio.Task] = set()
 
 
 def _spawn_background(coro) -> None:
-    """后台任务的消耗单独记账：它跑在请求结束之后，不能算进任何一轮对话。"""
+    """后台任务的消耗单独记账：它跑在请求结束之后，不能算进任何一轮对话。
+
+    Args:
+        coro: 待派发为后台任务的协程。
+    """
 
     async def tracked():
+        """包装后台协程，确保退出时取走并记录该任务的资源用量。"""
         try:
             return await coro
         finally:
+            # 先取走并清空本范围的资源账本，防止成功、取消或后台路径重复结算。
             usage = take_usage()
             if any(usage.values()):
                 logger.info("background usage=%s", {r.value: n for r, n in usage.items() if n})
@@ -77,6 +87,10 @@ async def _start_aux_tasks(container, identity: Identity) -> None:
 
     两条水位线互不依赖：一条探测失败不挡住另一条。任何失败都只落日志，
     因为这时候答案已经在库里、响应也已经在路上。
+
+    Args:
+        container: 应用生命周期内共享的依赖集合。
+        identity: 经服务端验证的登录用户与钱包身份。
     """
     try:
         job = await container.summarizer.collect(identity.user_id)
@@ -112,7 +126,13 @@ async def _settle(
 
     放在 finally 里：超时、异常、取消时这一轮照样花掉了模型和下游请求，
     按成功返回后的 outcome 记账会把这些消耗全部漏掉。
+
+    Args:
+        container: 应用生命周期内共享的依赖集合。
+        quota_key: 本轮资源消耗归属的配额主体键。
+        release: 失败时需要释放的 (用户 ID, 幂等键) 元组。
     """
+    # 先取走并清空本范围的资源账本，防止成功、取消或后台路径重复结算。
     usage = take_usage()
     steps = usage[Resource.MODEL]
     downstream = usage[Resource.RPC] + usage[Resource.EXPLORER] + usage[Resource.EMBEDDING]
@@ -142,9 +162,16 @@ async def _settle_turn(
     quota_key: str | None,
     release: tuple[str, str] | None = None,
 ) -> None:
-    """结算收尾。正常路径当场写完；请求被取消时把写入交给独立任务，别把它一起带走。"""
+    """结算收尾。正常路径当场写完；请求被取消时把写入交给独立任务，别把它一起带走。
+
+    Args:
+        container: 应用生命周期内共享的依赖集合。
+        quota_key: 本轮资源消耗归属的配额主体键。
+        release: 失败时需要释放的 (用户 ID, 幂等键) 元组。
+    """
     task = asyncio.create_task(_settle(container, quota_key=quota_key, release=release))
     try:
+        # 只隔离结算任务的取消传播，HTTP 等待者被取消时写账仍可完成。
         await asyncio.shield(task)
     except asyncio.CancelledError:
         # 取消的是这个等待者，不是那次写入；留个引用，免得任务中途被 GC 掉。
@@ -158,6 +185,12 @@ def _split_citations(calls: list[dict] | None) -> tuple[list[dict] | None, list[
 
     库里仍然存在 tool_calls 内（刷新后要能复原引用了哪几段），
     但响应里只发一份 —— 同一段正文发两遍等于把响应体积翻倍。
+
+    Args:
+        calls: 历史消息保存的工具调用元数据。
+
+    Returns:
+        (去掉引用正文的工具轨迹, 引用列表)，避免传输重复正文。
     """
     if not calls:
         return calls, []
@@ -172,7 +205,14 @@ def _split_citations(calls: list[dict] | None) -> tuple[list[dict] | None, list[
 
 
 def _request_hash(payload: ChatRequest) -> str:
-    """同一个 key 换了内容就拒绝：拿旧答案顶新问题，用户只会觉得消息丢了。"""
+    """同一个 key 换了内容就拒绝：拿旧答案顶新问题，用户只会觉得消息丢了。
+
+    Args:
+        payload: 经过字段校验的聊天请求。
+
+    Returns:
+        请求内容的 SHA-256 十六进制摘要。
+    """
     wallet = payload.wallet.model_dump(by_alias=True) if payload.wallet else None
     material = json.dumps(
         [payload.user_message, payload.knowledge_base_id, wallet],
@@ -187,6 +227,15 @@ async def chat(
     request: Request,
     identity: Identity = Depends(require_identity),
 ) -> ChatResponse:
+    # 响应 data.steps 为图模型步数，toolCalls 为调用轨迹，citations 在有文档证据时出现。
+    # 会话中途清空时 data.discarded=true，正文及工具证据按失效结果处理。
+    """校验身份与网络、处理幂等、限制整轮时间，调用 Agent 后组装响应并结算。
+
+    Args:
+        payload: 经过字段校验的聊天请求。
+        request: 当前 HTTP 请求，可读取应用依赖和请求上下文。
+        identity: 经服务端验证的登录用户与钱包身份。
+    """
     container = request.app.state.container
 
     if payload.wallet and payload.wallet.chain_id not in container.settings.allowed_chain_ids:
@@ -206,6 +255,7 @@ async def chat(
     key = payload.idempotency_key
     if key:
         async with session_scope() as db:
+            # 先在短事务中提交幂等占位，再开始慢调用，确保并发重试看得见处理中状态。
             state, cached = await idempotency_repo.claim(
                 db,
                 siwe_user_id=identity.user_id,
@@ -232,6 +282,7 @@ async def chat(
     # 整轮时间是第四条边界：步数和调用数都有限，链路卡在模型或上游时还得有个上限。
     deadline = asyncio.timeout(container.settings.turn_timeout_seconds)
     try:
+        # 整轮超时覆盖模型及工具调用，达到截止线时中止本轮处理。
         async with deadline:
             outcome = await container.agent.handle(
                 siwe_user_id=identity.user_id,
@@ -277,6 +328,7 @@ async def chat(
     if key and not outcome.discarded:
         try:
             async with session_scope() as db:
+                # 把已组装的 HTTP 响应保存到去重记录，后续相同请求可直接返回。
                 await idempotency_repo.complete(
                     db,
                     siwe_user_id=identity.user_id,
@@ -294,6 +346,13 @@ async def history(
     limit: int = 20,
     identity: Identity = Depends(require_identity),
 ) -> HistoryResp:
+    """按游标读取历史页，恢复工具引用，并按前端展示顺序返回。
+
+    Args:
+        before: 历史分页的消息 ID 游标；为空时读取最新页。
+        limit: 本次查询或展示返回条数上限。
+        identity: 经服务端验证的登录用户与钱包身份。
+    """
     limit = max(1, min(limit, 50))
     async with session_scope() as db:
         rows = await conversation_repo.list_page(db, identity.user_id, limit, before)
@@ -317,6 +376,12 @@ async def history(
 
 @router.post("/clear", response_model=ClearResp, response_model_by_alias=True)
 async def clear(request: Request, identity: Identity = Depends(require_identity)) -> ClearResp:
+    """推进会话版本，清除消息和聊天幂等缓存，保留长期档案与记忆。
+
+    Args:
+        request: 当前 HTTP 请求，可读取应用依赖和请求上下文。
+        identity: 经服务端验证的登录用户与钱包身份。
+    """
     container = request.app.state.container
     started = datetime.now(timezone.utc)
     async with session_scope() as db:
@@ -352,6 +417,10 @@ async def purge_memory(
 
     与 `/chat/clear` 的差别是连长期记忆一起删，且不可恢复 —— 合规诉求走这里，
     清空对话走那里。审计日志不删，它要留下「什么时候删过」这条记录本身。
+
+    Args:
+        request: 当前 HTTP 请求，可读取应用依赖和请求上下文。
+        identity: 经服务端验证的登录用户与钱包身份。
     """
     container = request.app.state.container
     deleted_at = datetime.now(timezone.utc)

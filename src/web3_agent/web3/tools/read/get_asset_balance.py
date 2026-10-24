@@ -16,6 +16,7 @@ from web3_agent.web3.chain_adapter import ChainAdapter, is_evm_address
 
 logger = logging.getLogger(__name__)
 
+# DESCRIPTION：暴露给工具调用模型的能力说明；此字符串保持原样。
 DESCRIPTION = (
     "查询钱包地址原生币与ERC20代币余额；后端会话注入chainId，只读场景可遍历白名单链"
 )
@@ -23,10 +24,17 @@ DESCRIPTION = (
 
 # 展示精度。raw 字段保留原始整数，这里只决定「给人看的那一串」：
 # 满精度串会被模型逐位抄进回答，对用户没有信息量。
+# _PRECISION：余额展示最小刻度，实际原始余额不被截断。
 _PRECISION = Decimal("0.000001")
 
 
 def _human(raw: int, decimals: int) -> str:
+    """按精度缩放原始余额并向下截断展示，保留极小非零余额提示。
+
+    Args:
+        raw: 底层未归一化的值或模型候选。
+        decimals: 代币的小数精度。
+    """
     value = Decimal(raw).scaleb(-decimals)
     if value == 0:
         return "0"
@@ -39,6 +47,18 @@ def _human(raw: int, decimals: int) -> str:
 
 
 async def _query_chain(adapter: ChainAdapter, chain_id: int, address: str, top_n: int) -> dict:
+    # 返回字段 balances：成功取得的资产条目；errors：按网络及数据范围记录的局部失败。
+    # 资产字段 chainId 为网络，symbol 为代币符号，decimals 为精度，raw 为最小单位整数字符串。
+    # 资产字段 human 为截断到展示精度的金额文本；isNative 区分原生币和 ERC20。
+    # 错误字段 chainId 为失败网络，scope 为 native、token_registry 或代币符号，message 为固定说明。
+    """查询单链原生币及白名单代币余额，部分失败保留其余成功结果。
+
+    Args:
+        adapter: 按网络管理 RPC 客户端与只读缓存的链适配器。
+        chain_id: 目标或过滤用的 EVM 网络编号，None 表示未限定。
+        address: 待校验、登录或查询的钱包地址。
+        top_n: 每条链最多查询的白名单 ERC20 数量。
+    """
     balances: list[dict] = []
     errors: list[dict] = []
 
@@ -73,13 +93,20 @@ async def _query_chain(adapter: ChainAdapter, chain_id: int, address: str, top_n
     # 代币余额彼此独立，串行等 N 个 RTT 只会让整轮超时。失败仍然逐条降级：
     # 一个代币查不到不能把同链其它代币一起抹掉。
     async def _balance(token) -> int | None:
+        """查询单个代币余额，RPC 不可用时返回 None 供上层标记部分失败。
+
+        Args:
+            token: 白名单中的代币元数据。
+        """
         try:
             return await adapter.get_erc20_balance(chain_id, token.token_address, address)
         except RpcUnavailable:
             return None
 
+    # 代币查询并发执行并逐项返回失败，单个代币异常不抹掉同链其他余额。
     raws = await asyncio.gather(*(_balance(token) for token in tokens[:top_n]))
 
+    # 按请求顺序关联原始金额与代币元数据，避免不同精度的余额被错配。
     for token, raw in zip(tokens[:top_n], raws):
         if raw is None:
             logger.warning("ERC20 balance unavailable chain_id=%s token=%s", chain_id,
@@ -103,7 +130,20 @@ async def _query_chain(adapter: ChainAdapter, chain_id: int, address: str, top_n
 
 
 def build_get_asset_balance(adapter: ChainAdapter) -> StructuredTool:
+    """将链访问适配器绑定为多链余额查询工具。
+
+    Args:
+        adapter: 按网络管理 RPC 客户端与只读缓存的链适配器。
+    """
     async def get_asset_balance(address: str, topN: int = 20) -> dict:
+        # 返回字段 address 为查询钱包，balances 为跨链成功资产，errors 为局部错误。
+        # status 为 success 全成功、partial 部分失败或 failed 全失败；全失败时额外给出 error 和 message。
+        """校验地址并并发查询可用网络，合并余额与各网络失败信息。
+
+        Args:
+            address: 待校验、登录或查询的钱包地址。
+            topN: 工具公开参数，每条链最多查询的白名单 ERC20 数量。
+        """
         if not is_evm_address(address):
             return {"error": "E101", "message": "地址格式不合法"}
         top_n = max(1, min(topN, 50))

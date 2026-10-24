@@ -19,6 +19,7 @@ from web3_agent.persistence.pg.base import create_all, dispose_engine, init_engi
 
 
 async def main() -> None:
+    """加载配置并创建数据库中缺失的表，结束后关闭引擎。"""
     settings = get_settings()
     init_engine(settings)
     await create_all()

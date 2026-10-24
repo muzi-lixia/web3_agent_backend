@@ -52,7 +52,11 @@ from web3_agent.persistence.pg.repositories.audit_repo import AuditLogger
 
 
 def _turn_inputs(params: dict[str, Any]) -> dict[str, Any]:
-    """self 不进 trace：整对象序列化没有意义。"""
+    """self 不进 trace：整对象序列化没有意义。
+
+    Args:
+        params: 根追踪接收到的方法参数字典。
+    """
     return {
         "user_message": params.get("user_message"),
         "siwe_user_id": params.get("siwe_user_id"),
@@ -62,6 +66,11 @@ def _turn_inputs(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def _turn_outputs(outcome: ChatOutcome) -> dict[str, Any]:
+    """把内部回答转换为追踪输出，记录内容、步数和降级状态。
+
+    Args:
+        outcome: 本轮内部回答及工具轨迹。
+    """
     return {
         "kind": outcome.kind,
         "content": outcome.content,
@@ -74,6 +83,10 @@ def _lacks_evidence(intent: Intent, records: list[ToolCallRecord]) -> bool:
     """需要数据的意图，没有一条「该意图对应的」工具成功调用 —— 这时模型在无据作答。
 
     只认数据工具：问余额却调了知识检索（且成功），同样算没查到余额。
+
+    Args:
+        intent: 已由后端确认的本轮业务意图。
+        records: 工具执行轨迹列表，供证据及错误检查。
     """
     tools = evidence_tools(intent)
     if not tools:
@@ -86,6 +99,9 @@ def _failure_notice(records: list[ToolCallRecord]) -> str:
 
     「稍后再试」对 E202（该合约暂不支持）这类错误是错的 —— 重试不会变好。
     错误码不一致（多源部分失败）时退回通用兜底。
+
+    Args:
+        records: 工具执行轨迹列表，供证据及错误检查。
     """
     codes = {r.error for r in records if not r.ok}
     if records and len(codes) == 1 and all(not r.ok for r in records):
@@ -97,6 +113,7 @@ def _failure_notice(records: list[ToolCallRecord]) -> str:
 
 
 # 重跑图时替换掉模型那句空转回答：它没有数据，留着只会被抄一遍。
+# _RETRY_HINT：模型未调用取证工具时的固定重试提示文本。
 _RETRY_HINT = (
     "你刚才没有调用任何工具就给出了结果。请立即调用合适的工具获取真实数据后再回答；"
     "拿不到数据就直说拿不到，不要编造任何哈希、金额、时间或状态。"
@@ -104,11 +121,16 @@ _RETRY_HINT = (
 
 
 # 工具参数里只留够复盘的分量：问题原文在消息 content 里已经存过一份。
+# _PERSIST_QUERY_CHARS：工具轨迹持久化时保留问题文本的最大字符数。
 _PERSIST_QUERY_CHARS = 200
 
 
 def _trim_args(args: dict[str, Any]) -> dict[str, Any]:
-    """去掉派生参数，截断与消息重复的长文本。"""
+    """去掉派生参数，截断与消息重复的长文本。
+
+    Args:
+        args: 工具输入参数字典。
+    """
     kept = dict(args or {})
     kept.pop("conversation_context", None)
     query = kept.get("query_str")
@@ -117,6 +139,7 @@ def _trim_args(args: dict[str, Any]) -> dict[str, Any]:
     return kept
 
 
+# 数据职责：单轮对话主编排器，负责上下文、路由、工具证据与结果持久化。
 class AgentLoop:
     def __init__(
         self,
@@ -127,10 +150,21 @@ class AgentLoop:
         model_with_tools,
         runner,
     ) -> None:
+        """初始化 AgentLoop 所需的依赖和运行状态。
+
+        Args:
+            settings: 运行配置对象，提供本模块所需开关、阈值和服务地址。
+            llm: 统一模型适配器，负责结构化抽取及回答。
+            guard: 结构化输出有限重试保护器。
+            audit: 审计日志写入服务。
+            model_with_tools: 已绑定只读工具的回答模型。
+            runner: 工具统一执行器，负责来源检查和调用轨迹。
+        """
         self._settings = settings
         self._llm = llm
         self._guard = guard
         self._audit = audit
+        # _graph：初始化时编译的只读 LangGraph，供每轮异步执行。
         self._graph = build_read_graph(
             model_with_tools,
             runner=runner,
@@ -148,6 +182,18 @@ class AgentLoop:
         knowledge_base_id: str = "default",
     ) -> ChatOutcome:
         # 1. 密钥检测必须早于任何模型调用：命中就不外发、不落库。
+        """处理单轮输入：先拦截密钥和清洗文本，再建立追踪并执行 Agent 主流程。
+
+        Args:
+            siwe_user_id: 数据所属用户的稳定标识。
+            wallet_address: 服务端确认的当前钱包地址。
+            chain_id: 目标或过滤用的 EVM 网络编号，None 表示未限定。
+            user_message: 本轮待处理的用户输入。
+            knowledge_base_id: 本轮选定的知识库标识。
+
+        Returns:
+            ChatOutcome: 本轮回答、工具轨迹与降级或失效标志。
+        """
         hit = secret_detector.detect(user_message)
         if hit is not None:
             await self._audit.log(
@@ -158,6 +204,7 @@ class AgentLoop:
             )
             return ChatOutcome(kind="reject", content=MSG_SECRET_REFUSED)
 
+        # 只清洗自由文本，保留结构化钱包和网络参数各自的校验边界。
         sanitized = sanitize_free_text(user_message, max_len=4000)
         if sanitized.hijacked:
             await self._audit.log("prompt_injection_filtered", siwe_user_id=siwe_user_id)
@@ -197,6 +244,15 @@ class AgentLoop:
         # 一轮对话要十几秒，连接不能跟着一起挂到回答生成完。
         # 同一个 turn_id 写在 user 和 assistant 两条消息上：并发轮次的 id 会交错，
         # 加载历史时靠它重建「问题在前、回答在后」。
+        """执行一轮对话：加载上下文、识别意图、路由、调用工具并持久化回答。
+
+        Args:
+            siwe_user_id: 数据所属用户的稳定标识。
+            wallet_address: 服务端确认的当前钱包地址。
+            chain_id: 目标或过滤用的 EVM 网络编号，None 表示未限定。
+            user_message: 本轮待处理的用户输入。
+            knowledge_base_id: 本轮选定的知识库标识。
+        """
         turn_id = uuid.uuid4().hex
         async with session_scope() as db:
             # 读生命周期版本，并在本事务内锁住它：清空接口要拿排他锁，
@@ -224,13 +280,18 @@ class AgentLoop:
         memory_text = self._render_memories(memory_items)
 
         async def finish(outcome: ChatOutcome) -> ChatOutcome:
-            """本轮出口。每一条返回路径都要落库，收成一个口子就不会有人漏写。"""
+            """本轮出口。每一条返回路径都要落库，收成一个口子就不会有人漏写。
+
+            Args:
+                outcome: 本轮内部回答及工具轨迹。
+            """
             return await self._finish(
                 siwe_user_id, outcome, generation=generation, turn_id=turn_id
             )
 
         # 3. Thought：结构化意图，带熔断
         try:
+            # 结构化意图解析只对格式失败有限重试，模型服务故障继续交给外层处理。
             guarded = await self._guard.run(
                 lambda: self._llm.extract_intent(
                     history,
@@ -323,6 +384,7 @@ class AgentLoop:
                 ),
                 config=graph_config,
             )
+            # 将图状态恢复为统一轨迹对象，后续只依据成功且相关的工具判断回答有无证据。
             records = [_record(item) for item in state.get("tool_calls", [])]
             retried = False
             # 只在「一条工具都没调」时重跑：调了但全失败说明是数据源问题，再问一遍也是白问。
@@ -338,6 +400,7 @@ class AgentLoop:
                     {**state, "messages": retry_messages},
                     config=graph_config,
                 )
+                # 将图状态恢复为统一轨迹对象，后续只依据成功且相关的工具判断回答有无证据。
                 records = [_record(item) for item in state.get("tool_calls", [])]
         except ModelUnavailable as exc:
             await self._audit.log("model_unavailable", siwe_user_id=siwe_user_id, error=str(exc))
@@ -417,7 +480,16 @@ class AgentLoop:
 
         摘要和长期约束要一起给：用户可能问的是已经滚出近期窗口的事，
         只给 recent history，模型就只能说不知道 —— 而意图识别那边是看得到摘要的。
+
+        Args:
+            history: 按角色组织的近期对话列表。
+            user_message: 本轮待处理的用户输入。
+            siwe_user_id: 数据所属用户的稳定标识。
+            profile_text: 已渲染的用户结构化偏好文本。
+            memory_text: 已渲染的用户长期背景文本。
+            summary_text: 已渲染的历史摘要文本。
         """
+        # 先建立聊天能力边界，再追加当前可用的偏好、记忆和历史。
         messages = [SystemMessage(content=CHAT_SYSTEM)]
         if profile_text:
             messages.append(SystemMessage(content=profile_text))
@@ -449,7 +521,13 @@ class AgentLoop:
         return ChatOutcome(kind="answer", content=reply.content)
 
     async def _load_summary(self, db: AsyncSession, siwe_user_id: str) -> str:
-        """摘要注入文本。摘要行由后台任务维护，加载时只读最新一条。"""
+        """摘要注入文本。摘要行由后台任务维护，加载时只读最新一条。
+
+        Args:
+            db: 调用方提供的异步数据库会话；事务提交由外层负责。
+            siwe_user_id: 数据所属用户的稳定标识。
+        """
+        # 摘要行自身 ID 是压缩边界；下一批只读取这个边界之后的旧消息。
         row = await conversation_repo.latest_summary(db, siwe_user_id)
         if row is None or not row.content:
             return ""
@@ -465,6 +543,12 @@ class AgentLoop:
         """吸收本轮的显式偏好，返回注入文本。
 
         先合并再渲染：用户说「以后都简洁点」的这一轮，回答就该是简洁的。
+
+        Args:
+            db: 调用方提供的异步数据库会话；事务提交由外层负责。
+            siwe_user_id: 数据所属用户的稳定标识。
+            message: 按当前函数用途传入的用户文本或已解析 SIWE 消息。
+            chain_id: 目标或过滤用的 EVM 网络编号，None 表示未限定。
         """
         patch = profile.extract(message, chain_id=chain_id)
         current = await profile_repo.apply_patch(
@@ -487,6 +571,11 @@ class AgentLoop:
         )
 
     def _render_memories(self, items: list[memory.MemoryItem]) -> str:
+        """按字符预算渲染本轮选中的长期记忆。
+
+        Args:
+            items: 本批记忆或字段条目。
+        """
         return memory.render(items, max_chars=self._settings.memory_render_chars)
 
     async def _finish(
@@ -500,8 +589,20 @@ class AgentLoop:
         # 工具轨迹随消息落库：历史记录要能复原「这条回答查了什么」。
         # 没有调工具时留 NULL，不要写空数组 —— 绝大多数轮次都是这种。
         # 收一遍参数，落库和响应都用这个形态，不各留一份全文。
+        """裁剪工具轨迹，校验会话版本后保存助手回答；过期轮次返回丢弃标志。
+
+        Args:
+            siwe_user_id: 数据所属用户的稳定标识。
+            outcome: 本轮内部回答及工具轨迹。
+            generation: 本轮读取历史时的会话版本，写回前必须与数据库当前版本一致。
+            turn_id: 同一轮用户问题与助手回答共用的标识。
+
+        Returns:
+            ChatOutcome: 已持久化结果；会话失效时返回正文为空且 discarded 为真的结果。
+        """
         for call in outcome.tool_calls:
             call.args = _trim_args(call.args)
+        # 保存工具轨迹快照，刷新历史后仍能看到本轮使用的数据来源。
         calls = [call.model_dump() for call in outcome.tool_calls]
         # Keep citation snapshots with the existing JSON tool metadata, without DDL.
         # This preserves references after the frontend reloads conversation history.
@@ -542,11 +643,21 @@ class AgentLoop:
 
 
 def _record(item: dict) -> ToolCallRecord:
+    """将图中的工具调用字典恢复为 ToolCallRecord 领域对象。
+
+    Args:
+        item: 图状态中的单条工具调用字典。
+    """
     return ToolCallRecord(**item)
 
 
 def _constraints_of(rows: list, cap: int) -> list[memory.MemoryItem]:
-    """硬约束全量注入：它决定「什么不能做」，不该被条数筛掉。"""
+    """硬约束全量注入：它决定「什么不能做」，不该被条数筛掉。
+
+    Args:
+        rows: 已读取的数据库记录列表。
+        cap: 本批处理或选取的最大条数。
+    """
     items = [_as_item(r) for r in rows if r.memory_type == "constraint"]
     return items[:cap]
 
@@ -557,11 +668,20 @@ def _soft_memories(rows: list, cap: int) -> list[memory.MemoryItem]:
     rows 已经是 created_at 倒序 —— 最近提到的就是当下最相关的，够用。
     不做相似度筛选：active 集被 subject 唯一索引压到「主题数」量级，
     为这点候选集付一次 query embedding 不划算。
+
+    Args:
+        rows: 已读取的数据库记录列表。
+        cap: 本批处理或选取的最大条数。
     """
     return [_as_item(r) for r in rows if r.memory_type != "constraint"][:cap]
 
 
 def _as_item(row) -> memory.MemoryItem:
+    """将数据库记忆记录转换为注入提示词使用的 MemoryItem。
+
+    Args:
+        row: 单条 ORM 数据记录。
+    """
     return memory.MemoryItem(
         text=row.text,
         memory_type=row.memory_type,

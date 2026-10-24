@@ -14,6 +14,7 @@ from web3_agent.rag.knowledge_bases import KnowledgeBaseRepository
 from web3_agent.rag.vector_store import PgKnowledgeStore
 
 async def main():
+    """解析管理员命令行选项，按预览、发布或停用模式处理文档清单。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path, nargs="?")
     parser.add_argument("--publish", action="store_true")

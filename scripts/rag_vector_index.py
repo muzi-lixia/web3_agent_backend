@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import create_async_engine  # noqa: E402
 
 from web3_agent.config.settings import get_settings  # noqa: E402
 
+# _DDL：创建向量 HNSW 索引的 SQL，必须在自动提交连接中执行。
 _DDL = """
 CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_rag_chunk_embedding
 ON rag_chunk USING hnsw (embedding vector_cosine_ops)
@@ -27,6 +28,7 @@ WITH (m = 16, ef_construction = 64)
 
 
 async def main() -> None:
+    """使用自动提交连接创建既有数据库缺失的 HNSW 向量索引。"""
     settings = get_settings()
     engine = create_async_engine(settings.database_url, isolation_level="AUTOCOMMIT")
     try:

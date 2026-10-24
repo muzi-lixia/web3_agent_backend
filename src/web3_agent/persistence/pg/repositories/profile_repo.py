@@ -16,10 +16,17 @@ from web3_agent.domain.memory.profile import Profile, ProfilePatch
 from web3_agent.persistence.pg.orm_models import UserProfile
 
 # 档案里留 10 个，注入时只取最近用过的几个。留多一些是为了让长尾偏好不至于立刻被挤掉。
+# _MAX_TOKENS_STORED：用户档案常用代币最多持久保存的条目数。
 _MAX_TOKENS_STORED = 10
 
 
 async def get(db: AsyncSession, siwe_user_id: str) -> Profile:
+    """读取用户档案并转换为领域 Profile；无记录时返回空档案。
+
+    Args:
+        db: 调用方提供的异步数据库会话；事务提交由外层负责。
+        siwe_user_id: 数据所属用户的稳定标识。
+    """
     row = await db.get(UserProfile, siwe_user_id)
     if row is None:
         return Profile()
@@ -42,6 +49,12 @@ async def apply_patch(
     """把偏好补丁合并进档案，返回合并后的结果。
 
     补丁为空时只读不写 —— 绝大多数请求都走这条路径，不该为「什么都没变」付一次写。
+
+    Args:
+        db: 调用方提供的异步数据库会话；事务提交由外层负责。
+        siwe_user_id: 数据所属用户的稳定标识。
+        patch: 本轮明确偏好形成的档案补丁。
+        chain_id: 目标或过滤用的 EVM 网络编号，None 表示未限定。
     """
     current = await get(db, siwe_user_id)
     if patch.is_empty:
@@ -86,7 +99,12 @@ async def apply_patch(
 
 
 async def purge(db: AsyncSession, siwe_user_id: str) -> bool:
-    """删掉整份档案。返回是否真的删到了行。"""
+    """删掉整份档案。返回是否真的删到了行。
+
+    Args:
+        db: 调用方提供的异步数据库会话；事务提交由外层负责。
+        siwe_user_id: 数据所属用户的稳定标识。
+    """
     result = await db.execute(delete(UserProfile).where(UserProfile.siwe_user_id == siwe_user_id))
     return (result.rowcount or 0) > 0
 
@@ -98,6 +116,11 @@ def _merge_tokens(
 
     顺序靠「最近一次插到最前」维持，不靠时间戳排序：同一毫秒内的两次写入
     时间戳相同，排序结果就是随机的。
+
+    Args:
+        existing: 已持久化的记忆文本或常用代币集合。
+        symbols: 本次偏好句中提取的代币符号列表。
+        chain_id: 目标或过滤用的 EVM 网络编号，None 表示未限定。
     """
     kept = [dict(t) for t in existing if isinstance(t, dict) and t.get("symbol")]
     now = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")

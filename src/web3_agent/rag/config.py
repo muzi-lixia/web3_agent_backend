@@ -3,6 +3,17 @@ import re
 
 
 def normalize_filters(chain_id=None, protocol_id=None, doc_category=None, kb_id="default"):
+    """规范化知识库、网络、协议和分类过滤参数，非法值抛 ValueError。
+
+    Args:
+        chain_id: 目标或过滤用的 EVM 网络编号，None 表示未限定。
+        protocol_id: 协议精确过滤，None 表示不限制。
+        doc_category: 文档分类精确过滤，None 表示不限制。
+        kb_id: 目标知识库标识，默认 default。
+
+    Raises:
+        ValueError: 知识库、链编号、协议或分类过滤参数格式不合法。
+    """
     if not isinstance(kb_id,str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}",kb_id):
         raise ValueError("知识库标识格式错误")
     if chain_id is not None:

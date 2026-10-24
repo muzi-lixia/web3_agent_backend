@@ -10,13 +10,25 @@ from langchain_core.tools import StructuredTool
 
 from web3_agent.web3.chain_adapter import ChainAdapter, is_evm_address
 
+# DESCRIPTION：暴露给工具调用模型的能力说明；此字符串保持原样。
 DESCRIPTION = "查询用户在质押合约的质押信息；chainId后端会话注入；只读，不校验siweAddress"
 
 
 def build_get_stake_info(adapter: ChainAdapter, stake_contracts: dict[str, dict]) -> StructuredTool:
-    """stake_contracts: {alias 或 address(lower) -> {"chain_id", "address", "adapter"}}"""
+    """stake_contracts: {alias 或 address(lower) -> {"chain_id", "address", "adapter"}}
+
+    Args:
+        adapter: 按网络管理 RPC 客户端与只读缓存的链适配器。
+        stake_contracts: 质押合约别名或地址到网络及适配信息的白名单。
+    """
 
     async def get_stake_info(userAddress: str, stakeContractAliasOrAddress: str) -> dict:
+        """校验钱包与质押合约白名单，检查链可达性并返回当前适配支持状态。
+
+        Args:
+            userAddress: 待查询质押信息的钱包地址。
+            stakeContractAliasOrAddress: 白名单中的质押合约别名或地址。
+        """
         if not is_evm_address(userAddress):
             return {"error": "E101", "message": "地址格式不合法"}
 

@@ -21,14 +21,22 @@ from web3_agent.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
+# _enabled：本进程 LangSmith 总开关的实际启用状态。
 _enabled = False
+# _endpoint：已配置的 LangSmith 服务 API 地址。
 _endpoint = ""
+# _api_key：已配置的 LangSmith 服务访问凭据。
 _api_key = ""
+# _probe_client：按需创建并复用的追踪服务心跳客户端。
 _probe_client: langsmith.Client | None = None
 
 
 def configure(settings: Settings) -> bool:
-    """在创建任何模型客户端之前调用。返回是否开启。"""
+    """在创建任何模型客户端之前调用。返回是否开启。
+
+    Args:
+        settings: 运行配置对象，提供本模块所需开关、阈值和服务地址。
+    """
     global _enabled, _endpoint, _api_key, _probe_client
     _enabled = settings.langsmith_tracing and bool(settings.langsmith_api_key)
     _probe_client = None
@@ -60,6 +68,7 @@ def configure(settings: Settings) -> bool:
 
 
 def enabled() -> bool:
+    """返回当前是否启用追踪，供其他模块避免无效埋点。"""
     return _enabled
 
 
@@ -68,6 +77,10 @@ def run_config(name: str, **metadata: Any) -> dict[str, Any]:
 
     run_id 由这里生成，调用方据此写审计的 langsmith_run_id —— 事后从 run tree
     里取不可靠（run 结束上下文就没了），自己指定才是确定的。
+
+    Args:
+        name: 本次模型或流程节点的追踪名称。
+        **metadata: 附加追踪元数据或文档元数据。
     """
     if not _enabled:
         return {}
@@ -83,6 +96,9 @@ def root_extra(**metadata: Any) -> dict[str, Any]:
 
     根节点必须是 `@traceable`：只有它进入上下文后，里面的意图抽取、图、工具调用
     才会挂到同一条 trace 下。给顶层 ainvoke 传 run_config 只会得到一个新的根。
+
+    Args:
+        **metadata: 附加追踪元数据或文档元数据。
     """
     if not _enabled:
         return {}
@@ -93,6 +109,7 @@ def root_extra(**metadata: Any) -> dict[str, Any]:
 
 
 def _probe() -> langsmith.Client:
+    """探测追踪服务可用性，供心跳判断上报通道是否正常。"""
     global _probe_client
     if _probe_client is None:
         _probe_client = langsmith.Client(api_url=_endpoint, api_key=_api_key)

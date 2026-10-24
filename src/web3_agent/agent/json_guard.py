@@ -17,18 +17,33 @@ from web3_agent.common.types import LlmOutput
 logger = logging.getLogger(__name__)
 
 
+# 数据职责：结构化意图调用的最终结果，包含实际尝试次数和降级标志。
 @dataclass(frozen=True)
 class GuardResult:
+    # output：通过结构化校验的意图结果；失败降级时为空。
     output: LlmOutput | None
+    # attempts：本轮结构化抽取实际尝试次数，包含首次调用。
     attempts: int
+    # degraded：是否已耗尽格式重试并放弃结构化意图结果。
     degraded: bool
 
 
+# 数据职责：只重试模型输出格式错误的有限重试保护器。
 class JsonGuard:
     def __init__(self, max_attempts: int = 2) -> None:
+        """设置结构化输出允许的最大尝试次数。
+
+        Args:
+            max_attempts: 最大执行或重试次数，具体以当前流程为准。
+        """
         self._max_attempts = max_attempts
 
     async def run(self, call: Callable[[], Awaitable[LlmOutput]]) -> GuardResult:
+        """在限定次数内尝试结构化意图调用；只重试输出格式错误，耗尽后返回降级结果。
+
+        Args:
+            call: 工具调用描述，或不带参数的可等待模型调用函数。
+        """
         last_error: Exception | None = None
         for attempt in range(1, self._max_attempts + 1):
             try:

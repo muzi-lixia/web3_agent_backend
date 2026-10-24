@@ -29,6 +29,7 @@ from web3_agent.common.metering import Resource, reserve
 logger = logging.getLogger(__name__)
 
 # 这些工具的地址参数来自会话身份，不允许模型自己编。
+# _ADDRESS_ARG：不同链上工具需要注入的钱包参数名称映射。
 _ADDRESS_ARG = {
     "get_asset_balance": "address",
     "get_transaction_records": "address",
@@ -37,13 +38,16 @@ _ADDRESS_ARG = {
 
 # 地址必须等于当前登录地址的工具：模型传什么都不采纳，直接覆盖。
 # 交易记录只允许查自己的账户，这是业务限制，不能在提示词或某条路由里兑现。
+# _SESSION_BOUND：必须绑定当前登录钱包、不允许模型选择其他地址的工具集合。
 _SESSION_BOUND = frozenset({"get_transaction_records"})
 
+# _RAG_TOOL：知识问答使用的检索工具稳定名称。
 _RAG_TOOL = "rag_general_knowledge"
 
 # 意图 → 本轮要拿到数据的工具。意图识别已经做过一次判断，这个结果要传进图里，
 # 否则图里的模型会拿着同一句话从零再判断一遍要不要调工具。
 # 一张表两个用途：执行闸看它（加上知识检索），证据校验也看它。
+# _INTENT_TOOLS：意图与业务工具及标签的映射，供执行限制和证据检查使用。
 _INTENT_TOOLS: dict[Intent, frozenset[str]] = {
     Intent.QUERY_ASSET: frozenset({"get_asset_balance"}),
     Intent.QUERY_TX: frozenset({"get_transaction_records"}),
@@ -56,6 +60,9 @@ def evidence_tools(intent: Intent | None) -> frozenset[str]:
     """该意图必须拿到结果的工具。不在表内（闲聊、越界、写意图）返回空集，不做证据校验。
 
     知识检索在表外单独放：它回答「这是什么、为什么」，不能证明「我账上有多少钱」。
+
+    Args:
+        intent: 已由后端确认的本轮业务意图。
     """
     if intent is None:
         return frozenset()
@@ -69,6 +76,9 @@ def allowed_tools(intent: Intent | None) -> frozenset[str] | None:
     最后一道闸，与提示词和正常路由无关。
 
     知识检索对所有查询意图都开放：一句话既要数据又要解释时，两个工具都该能调。
+
+    Args:
+        intent: 已由后端确认的本轮业务意图。
     """
     if intent is None:
         return None
@@ -80,11 +90,17 @@ def allowed_tools(intent: Intent | None) -> frozenset[str] | None:
 
 # 结果本身就是答案的工具：调用成功即成形返回，模型不再复述一遍。
 # 这一类连「要不要调工具」都不必再问模型 —— 工具和参数都已经确定。
+# _DIRECT_RENDER：支持由工具结果确定性渲染答案的工具及对应渲染器。
 _DIRECT_RENDER = {"get_transaction_records": render_transactions}
 
 
 def _render_direct(name: str, payload: str) -> str:
-    """工具原始输出 → 直出文本。出错或形状不对时返回空串，交回模型解释。"""
+    """工具原始输出 → 直出文本。出错或形状不对时返回空串，交回模型解释。
+
+    Args:
+        name: 工具名、知识库名称或追踪节点名，具体由当前方法职责决定。
+        payload: 工具返回的 JSON 文本。
+    """
     renderer = _DIRECT_RENDER.get(name)
     if renderer is None:
         return ""
@@ -103,7 +119,21 @@ def build_read_graph(
         max_steps: int,
         rag_answer_model: Runnable | None = None
 ) -> Runnable:
+    # 返回值：已编译的 LangGraph Runnable，可通过 ainvoke 执行。
+    """构造并编译只读图，连接模型、工具执行和直接回答节点。
+
+    Args:
+        model_with_tools: 已绑定只读工具的回答模型。
+        runner: 工具统一执行器，负责来源检查和调用轨迹。
+        max_steps: 图允许的最大模型调用步数。
+        rag_answer_model: 只接收检索证据的知识回答模型。
+    """
     async def call_model(state: ReadState) -> dict:
+        """根据图状态选择普通回答或知识回答模型，调用前记录模型消耗并递增步数。
+
+        Args:
+            state: 当前只读图的状态快照。
+        """
         if state.get("rag_required"):
             if rag_answer_model is None:
                 raise RuntimeError("RAG 回答模型未配置")
@@ -123,6 +153,13 @@ def build_read_graph(
         return {"messages": [response], "steps": state.get("steps", 0) + 1}
 
     async def call_tools(state: ReadState) -> dict:
+        # 节点返回 messages 与 tool_calls 追加到历史状态；rag_citations、rag_status、rag_question 覆盖更新。
+        # 工具可直接渲染成功时补 direct_answer，供路由立即终止而无需模型复述。
+        """执行当前模型消息中的工具调用，校验工具范围和身份，累积结果及引用。
+
+        Args:
+            state: 当前只读图的状态快照。
+        """
         last = state["messages"][-1]
         if not isinstance(last, AIMessage):
             return {}
@@ -136,7 +173,13 @@ def build_read_graph(
         wallet = state.get("wallet_address", "")
 
         def refuse(call: dict, code: str, message: str) -> None:
-            """拒绝一次调用：给模型一条明确的 ToolMessage，同时记成失败，不构成证据。"""
+            """拒绝一次调用：给模型一条明确的 ToolMessage，同时记成失败，不构成证据。
+
+            Args:
+                call: 工具调用描述，或不带参数的可等待模型调用函数。
+                code: 已登记的业务错误码。
+                message: 按当前函数用途传入的用户文本或已解析 SIWE 消息。
+            """
             outputs.append(
                 ToolMessage(
                     content=wrap_chain_data(
@@ -227,6 +270,11 @@ def build_read_graph(
         return update
 
     def should_continue(state: ReadState) -> str:
+        """根据知识问答状态、模型步数和工具调用决定终止或执行工具。
+
+        Args:
+            state: 当前只读图的状态快照。
+        """
         if state.get("rag_required"):
             return END
         if state.get("steps", 0) >= max_steps:
@@ -238,6 +286,11 @@ def build_read_graph(
 
     def after_tools(state: ReadState) -> str:
         # 知识检索失败时直接使用固定兜底，不让模型凭空补规则。
+        """根据证据和直出结果决定结束图或回到回答模型。
+
+        Args:
+            state: 当前只读图的状态快照。
+        """
         if state.get("rag_required") and state.get("rag_status") and not state.get("rag_citations"):
             return END
         # 结果已成形就直接收尾，省掉一整步复述。
@@ -247,6 +300,9 @@ def build_read_graph(
         """直出意图：直接合成这一次工具调用。
 
         模型在这一步只做两件事 —— 选工具、填参数 —— 两者都已经有确定值。
+
+        Args:
+            state: 当前只读图的状态快照。
         """
         if state.get("rag_required"):
             name = "rag_general_knowledge"
@@ -259,6 +315,11 @@ def build_read_graph(
         return {"messages": [AIMessage(content="", tool_calls=[call])]}
 
     def first_step(state: ReadState) -> str:
+        """决定图入口走确定性工具计划还是模型推理节点。
+
+        Args:
+            state: 当前只读图的状态快照。
+        """
         if state.get("rag_required") or state.get("direct_tool"):
             return "plan"
         return "agent"
@@ -274,8 +335,11 @@ def build_read_graph(
     return builder.compile()
 
 
+# _ASSISTANT_CONTEXT_CHARS：提供给 RAG 指代消解的单条助手历史字符上限。
 _ASSISTANT_CONTEXT_CHARS = 200
+# _SOURCE_TAIL：旧助手回答末尾来源清单的匹配规则。
 _SOURCE_TAIL = re.compile(r"(来源[:：].*)$", re.S)
+# _CITATION_MARK：历史引用编号匹配规则，用于避免旧证据进入当前回答。
 _CITATION_MARK = re.compile(r"\[S\d+\]")
 
 
@@ -284,6 +348,9 @@ def _answer_context(history: list[tuple[str, str]]) -> str:
 
     助手的话截到 200 字并去掉来源清单与引用编号：上一轮列过什么要能看见，
     但旧来源和旧结论不能跟着进证据区。真正的依据只有本轮检索材料。
+
+    Args:
+        history: 按角色组织的近期对话列表。
     """
     lines = []
     for role, content in history[-4:]:
@@ -305,6 +372,19 @@ def initial_state(
     intent: Intent | None = None,
     kb_id: str = "default",
 ) -> ReadState:
+    # 返回值：包含消息、执行限制、钱包和知识检索参数的 ReadState。
+    """初始化图消息、身份、意图及 RAG 状态，并构造可确定的工具参数。
+
+    Args:
+        history: 按角色组织的近期对话列表。
+        user_message: 本轮待处理的用户输入。
+        wallet_address: 服务端确认的当前钱包地址。
+        summary: 已渲染的历史摘要文本。
+        profile: 用户偏好对象或知识库嵌入配置，取决于当前模块。
+        memories: 已渲染的用户长期背景文本。
+        intent: 已由后端确认的本轮业务意图。
+        kb_id: 目标知识库标识，默认 default。
+    """
     is_rag = intent is Intent.QUERY_KNOWLEDGE
     tools = evidence_tools(intent)
     tool = next((t for t in sorted(tools) if t in _DIRECT_RENDER), "")

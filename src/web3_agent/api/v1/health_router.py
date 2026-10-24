@@ -12,6 +12,11 @@ router = APIRouter(tags=["health"])
 
 @router.get("/health")
 async def health(request: Request) -> dict:
+    """返回进程健康状态及当前服务的基本信息。
+
+    Args:
+        request: 当前 HTTP 请求，可读取应用依赖和请求上下文。
+    """
     container = request.app.state.container
     db_ok = True
     try:
@@ -31,6 +36,11 @@ async def health(request: Request) -> dict:
 
 @router.get("/health/ready")
 async def ready(request: Request) -> dict:
+    """探测模型服务就绪状态，失败时返回未就绪结果。
+
+    Args:
+        request: 当前 HTTP 请求，可读取应用依赖和请求上下文。
+    """
     container = request.app.state.container
     try:
         info = await container.llm.check_model()

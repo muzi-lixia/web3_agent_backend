@@ -47,30 +47,53 @@ from web3_agent.web3.tools.read.get_transaction_records import build_get_transac
 setup_logging(get_settings().log_level)
 logger = logging.getLogger(__name__)
 
+# _HEARTBEAT_INTERVAL_SECONDS：追踪服务心跳检查间隔，单位为秒。
 _HEARTBEAT_INTERVAL_SECONDS = 3600
+# _NONCE_CLEANUP_INTERVAL_SECONDS：过期登录挑战清理间隔，单位为秒。
 _NONCE_CLEANUP_INTERVAL_SECONDS = 3600
+# _QUOTA_CLEANUP_INTERVAL_SECONDS：旧配额桶清理间隔，单位为秒。
 _QUOTA_CLEANUP_INTERVAL_SECONDS = 3600
 
 
+# 数据职责：应用进程依赖集合，由 build_container 统一构造并挂在 app.state。
 @dataclass
 class Container:
+    # settings：运行配置对象，提供本模块所需开关、阈值和服务地址。
     settings: Settings
+    # adapter：按网络管理 RPC 客户端与只读缓存的链适配器。
     adapter: ChainAdapter
+    # llm：统一模型适配器，负责结构化抽取及回答。
     llm: LlmAdapter
+    # agent：对话主编排服务，处理聊天入口请求。
     agent: AgentLoop
+    # audit：审计日志写入服务。
     audit: AuditLogger
+    # quota：请求限流和资源记账服务。
     quota: QuotaController
+    # summarizer：后台历史摘要服务。
     summarizer: Summarizer
+    # memory：后台长期记忆抽取服务。
     memory: MemoryExtractor
+    # tracing_enabled：当前进程是否启用了 LangSmith 上报。
     tracing_enabled: bool
+    # knowledge_bases：知识库容器及嵌入配置管理仓储。
     knowledge_bases: KnowledgeBaseRepository
+    # rag_jobs：入库任务队列仓储。
     rag_jobs: JobRepository
+    # rag_store：文档和向量切片仓储。
     rag_store: PgKnowledgeStore
+    # rag_retriever：静态知识检索编排器。
     rag_retriever: KnowledgeRetriever
+    # rag_worker：后台文档入库消费者。
     rag_worker: IngestionWorker
 
 
 def build_container(settings: Settings) -> Container:
+    """在唯一组装点创建模型、链访问、工具、仓储和后台任务依赖。
+
+    Args:
+        settings: 运行配置对象，提供本模块所需开关、阈值和服务地址。
+    """
     tracing_enabled = langsmith_tracer.configure(settings)
 
     adapter = ChainAdapter(settings)
@@ -130,6 +153,11 @@ def build_container(settings: Settings) -> Container:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """管理应用启动检查、后台循环和退出时的任务取消与资源关闭。
+
+    Args:
+        app: 当前 FastAPI 应用实例。
+    """
     settings = get_settings()
     container = build_container(settings)
     app.state.container = container
@@ -161,6 +189,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        # 退出时先取消本生命周期创建的循环，再等待取消收敛并关闭外部连接。
         for task in background:
             task.cancel()
         await asyncio.gather(*background, return_exceptions=True)
@@ -215,6 +244,7 @@ async def _quota_cleanup_loop() -> None:
 
 
 def create_app() -> FastAPI:
+    """创建 FastAPI 应用，注册中间件、错误处理及全部路由。"""
     app = FastAPI(title="Web3 链上智能 Agent 助手", version="0.8", lifespan=lifespan)
     app.add_middleware(TraceMiddleware)
     register_exception_handlers(app)

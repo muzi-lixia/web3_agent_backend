@@ -13,11 +13,24 @@ from web3_agent.config.constants import NATIVE_FALLBACK, NATIVE_META
 
 
 def _symbol(event: dict, chain_id: int) -> tuple[str, int]:
+    """按事件代币符号或网络原生币元数据确定展示符号。
+
+    Args:
+        event: 交易内的一条资产变动事件。
+        chain_id: 目标或过滤用的 EVM 网络编号，None 表示未限定。
+    """
     symbol, decimals = NATIVE_META.get(chain_id, NATIVE_FALLBACK)
     return event.get("tokenSymbol") or symbol, int(event.get("decimals") or decimals)
 
 
 def _amount(value: str | None, decimals: int, symbol: str) -> str:
+    """按代币精度把原始金额转换为适合展示的金额文本。
+
+    Args:
+        value: 待校验、转换或缓存的值。
+        decimals: 代币的小数精度。
+        symbol: 金额展示使用的代币符号。
+    """
     try:
         raw = Decimal(str(value or "0")) / Decimal(10) ** decimals
     except (InvalidOperation, ValueError):
@@ -28,6 +41,11 @@ def _amount(value: str | None, decimals: int, symbol: str) -> str:
 
 
 def _is_zero(value: object) -> bool:
+    """判断金额是否为零；异常或缺失数据按当前函数约定处理。
+
+    Args:
+        value: 待校验、转换或缓存的值。
+    """
     try:
         return Decimal(str(value or 0)) == 0
     except (InvalidOperation, ValueError):
@@ -35,12 +53,22 @@ def _is_zero(value: object) -> bool:
 
 
 def _short(address: str | None) -> str:
+    """把钱包地址转换为首尾保留的缩略文本。
+
+    Args:
+        address: 待校验、登录或查询的钱包地址。
+    """
     if not address:
         return "—"
     return f"{address[:6]}…{address[-4:]}" if len(address) > 12 else address
 
 
 def _time(ts: int | str | None) -> str:
+    """把交易时间戳转换为可读时间字符串。
+
+    Args:
+        ts: 交易发生时间戳，单位为秒。
+    """
     try:
         moment = datetime.fromtimestamp(int(ts or 0), tz=timezone.utc)
     except (TypeError, ValueError, OSError):
@@ -49,6 +77,12 @@ def _time(ts: int | str | None) -> str:
 
 
 def _direction(record: dict, wallet: str) -> str:
+    """依次按发送方、接收方判断转出或转入，其余标为关联交易。
+
+    Args:
+        record: 包含聚合资产事件的单笔交易。
+        wallet: 用于判断交易方向的当前钱包地址。
+    """
     owner = wallet.lower()
     if (record.get("from") or "").lower() == owner:
         return "转出"
@@ -59,6 +93,7 @@ def _direction(record: dict, wallet: str) -> str:
 
 # 单笔交易的资产变动展示上限。批量空投一笔可能有几十条，全排出来会挤爆上下文；
 # 超出部分明确写「另有 N 项」，不做静默截断。
+# _MAX_EVENTS_SHOWN：单笔交易最多展示的资产变动项数，超过时给出剩余数量。
 _MAX_EVENTS_SHOWN = 8
 
 
@@ -67,6 +102,10 @@ def _assets(record: dict, wallet: str) -> str:
 
     零值事件是合约调用本身，没有资产移动；只要这笔交易还有非零事件就不展示它们，
     否则一笔 swap 会因为「转出 0 ETH」占掉一格。
+
+    Args:
+        record: 包含聚合资产事件的单笔交易。
+        wallet: 用于判断交易方向的当前钱包地址。
     """
     events = record.get("events") or []
     moved = [event for event in events if not _is_zero(event.get("value"))]
@@ -84,7 +123,11 @@ def _assets(record: dict, wallet: str) -> str:
 
 
 def render_transactions(payload: dict) -> str:
-    """交易记录 → 列表文本。hash 保留全量，用户要拿去浏览器核对。"""
+    """交易记录 → 列表文本。hash 保留全量，用户要拿去浏览器核对。
+
+    Args:
+        payload: 交易工具返回的聚合交易数据。
+    """
     records = payload.get("records") or []
     wallet = payload.get("address") or ""
     errors = payload.get("errors") or []

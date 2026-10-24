@@ -9,6 +9,7 @@ from __future__ import annotations
 import httpx
 
 # 两次：一次失败就放弃太脆，再多就把整轮时间花在一个数据源上。
+# MAX_ATTEMPTS：下游 HTTP 调用允许的总尝试次数，包含首次请求。
 MAX_ATTEMPTS = 2
 
 
@@ -16,6 +17,9 @@ def is_transient(exc: httpx.HTTPError) -> bool:
     """同一请求再发一次可能成功的错误：传输层失败与 5xx。
 
     4xx 是确定性失败（方法不存在、参数不对、Key 无效），重试只是把等待时间翻倍。
+
+    Args:
+        exc: 需要转换、记录或判断是否重试的原始异常。
     """
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code >= 500

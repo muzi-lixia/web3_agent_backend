@@ -14,10 +14,12 @@ from sqlalchemy.dialects.postgresql import insert
 from web3_agent.persistence.pg.orm_models import ChatIdempotency as Row
 
 # 同一个 key 的响应保留一天。逾期未再出现的记录在下次带 key 的请求里顺手删掉。
+# KEEP_SECONDS：聊天幂等响应保留时长，单位为秒。
 KEEP_SECONDS = 24 * 3600
 
 
 def _now() -> datetime:
+    """返回当前带 UTC 时区的时间，作为仓储时间判断基准。"""
     return datetime.now(timezone.utc)
 
 
@@ -35,6 +37,16 @@ async def claim(
     行会永远停在 running，客户端拿着同一个 key 一天内都重试不了 —— 所以超过
     一轮实际耗时上限的 running 行当作孤儿，直接接管。正常并发重试不会踩到它，
     因为真实的一轮远短于这个窗口。
+
+    Args:
+        db: 调用方提供的异步数据库会话；事务提交由外层负责。
+        siwe_user_id: 数据所属用户的稳定标识。
+        key: 客户端提交的幂等键。
+        request_hash: 请求内容的稳定摘要，防止幂等键内容复用。
+        stale_after: 允许 running 占位存活的最大秒数，超过后可接管。
+
+    Returns:
+        tuple[str, dict | None]: 占位状态和已完成响应；状态为 new、done、running 或 conflict。
     """
     now = _now()
     await db.execute(
@@ -83,6 +95,14 @@ async def claim(
 
 
 async def complete(db, *, siwe_user_id: str, key: str, response: dict) -> None:
+    """把指定聊天幂等记录更新为 done，并保存完整响应快照。
+
+    Args:
+        db: 调用方提供的异步数据库会话；事务提交由外层负责。
+        siwe_user_id: 数据所属用户的稳定标识。
+        key: 客户端提交的幂等键。
+        response: 要持久保存的完整响应快照。
+    """
     await db.execute(
         update(Row)
         .where(Row.siwe_user_id == siwe_user_id, Row.idempotency_key == key)
@@ -91,7 +111,13 @@ async def complete(db, *, siwe_user_id: str, key: str, response: dict) -> None:
 
 
 async def release(db, *, siwe_user_id: str, key: str) -> None:
-    """本轮没跑成，把占位撤掉 —— 客户端拿同一个 key 重试要能真的重跑。"""
+    """本轮没跑成，把占位撤掉 —— 客户端拿同一个 key 重试要能真的重跑。
+
+    Args:
+        db: 调用方提供的异步数据库会话；事务提交由外层负责。
+        siwe_user_id: 数据所属用户的稳定标识。
+        key: 客户端提交的幂等键。
+    """
     await db.execute(
         delete(Row).where(
             Row.siwe_user_id == siwe_user_id,
@@ -106,6 +132,10 @@ async def purge_user(db, *, siwe_user_id: str) -> int:
 
     不清的话，用户删完数据还能拿旧 key 换回删除前那条答案和它的引用 ——
     generation 只拦写回，拦不住这条读路径。
+
+    Args:
+        db: 调用方提供的异步数据库会话；事务提交由外层负责。
+        siwe_user_id: 数据所属用户的稳定标识。
     """
     result = await db.execute(delete(Row).where(Row.siwe_user_id == siwe_user_id))
     return result.rowcount or 0

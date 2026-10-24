@@ -12,50 +12,84 @@ from web3_agent.config.constants import NATIVE_FALLBACK, NATIVE_META, Intent, Ro
 class LlmOutput(BaseModel):
     """LLM 的闭合枚举输出，也是结构化输出（format=json_schema）的约束对象。"""
 
+    # intent：模型识别的闭合业务意图；实际路由由后端计算。
     intent: Intent = Intent.OUT_OF_SCOPE
+    # confidence：意图识别置信度，用于与 confidence_threshold 比较决定是否澄清。
     confidence: float = 0.0
+    # slots：模型抽取的业务参数字典，例如 tokenSymbol、humanAmount、toAddress。
     slots: dict[str, Any] = Field(default_factory=dict)
 
 
+# 数据职责：后端路由决策结果，包含处理路径、原因及需补充的参数。
 class RouteDecision(BaseModel):
+    # route：后端决定的处理路径：read 查询、write 写操作、clarify 澄清、reject 拒绝。
     route: Route
+    # reason：决策或校验失败的原因，供调用方判断和审计使用。
     reason: str
+    # missing_slots：本次操作缺失的必填业务参数名。
     missing_slots: list[str] = Field(default_factory=list)
 
 
+# 数据职责：一次工具执行的可持久化轨迹，不保存完整原始数据响应。
 class ToolCallRecord(BaseModel):
+    # name：对象的展示名称；具体对象由所属模型决定。
     name: str
+    # args：工具执行参数的快照，便于返回轨迹和复盘调用。
     args: dict[str, Any] = Field(default_factory=dict)
+    # ok：本次调用是否取得可用结果；失败结果不能作为回答证据。
     ok: bool = True
+    # error：失败错误码或错误信息；无错误时为空。
     error: str | None = None
+    # latency_ms：本次工具执行耗时，单位为毫秒。
     latency_ms: int = 0
 
 
+# 数据职责：Agent 内部的一轮处理结果，由 HTTP 层转换为对外响应。
 class ChatOutcome(BaseModel):
+    # kind：内部回答类型：answer 普通回答、ask 追问、reject 拒答。
     kind: str  # answer | ask | reject
+    # content：本轮最终回复正文；失效轮次会被清空。
     content: str
+    # tool_calls：本轮工具调用轨迹，包含名称、参数及执行结果；未调用时可为空。
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
+    # steps：只读图模型调用步数；意图模型等额外调用由独立账本计量。
     steps: int = 0
+    # degraded：是否使用降级结果，例如缺少数据证据或结构化输出失败。
     degraded: bool = False
+    # citations：当前回答使用的文档证据快照，供引用展示和历史恢复。
     citations: list[dict[str, Any]] = Field(default_factory=list)
     # 读历史之后会话被清空：答案基于已删除的内容，既不落库也不该交给调用方渲染。
+    # discarded：生成期间会话已被清空时置真，表示本轮结果应丢弃。
     discarded: bool = False
 
 
+# 数据职责：网络内的代币元数据，供余额查询和金额精度换算使用。
 class TokenMeta(BaseModel):
+    # chain_id：EVM 网络编号，如 1 为以太坊主网；可空的场景表示未限定网络。
     chain_id: int
+    # symbol：代币符号，例如 ETH、USDC。
     symbol: str
+    # decimals：代币精度：原始整数金额需要除以 10 的该次方才是人类可读金额。
     decimals: int
+    # token_address：ERC20 合约地址；合成原生币元数据时使用空字符串。
     token_address: str
+    # is_whitelisted：代币是否在系统允许查询的白名单内。
     is_whitelisted: bool
+    # name：代币的完整名称；原生币合成元数据时取符号。
     name: str
     # 写链路 E205 的判定依据（PRD 8.3）：转账带税代币一律拒绝授权/质押。
+    # is_fee_on_transfer：是否为转账扣税代币；用于描述代币的转账特性。
     is_fee_on_transfer: bool = False
 
     @classmethod
     def native(cls, chain_id: int) -> TokenMeta:
         """原生币没有 token_registry 条目（PRD 6.4 的 transfer 支持原生币/ERC20），
-        由调用方用这个合成一个，符号与精度按链取，不要一律当 ETH。"""
+
+        由调用方用这个合成一个，符号与精度按链取，不要一律当 ETH。
+
+        Args:
+            chain_id: 目标或过滤用的 EVM 网络编号，None 表示未限定。
+        """
         symbol, decimals = NATIVE_META.get(chain_id, NATIVE_FALLBACK)
         return cls(
             chain_id=chain_id,

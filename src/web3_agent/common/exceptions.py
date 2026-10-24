@@ -8,6 +8,7 @@ E507 / E508 是 PRD 表未覆盖的两处，在此补登（见注释）。
 from __future__ import annotations
 
 
+# 数据职责：可直接映射为统一 HTTP 响应的业务异常。
 class AppError(Exception):
     def __init__(
         self,
@@ -17,6 +18,15 @@ class AppError(Exception):
         retryable: bool = False,
         retry_after: int | None = None,
     ) -> None:
+        """保存固定错误码、用户文案、HTTP 状态和重试信息，交由全局异常处理器响应。
+
+        Args:
+            code: 已登记的业务错误码。
+            message: 按当前函数用途传入的用户文本或已解析 SIWE 消息。
+            http_status: 对外 HTTP 状态码。
+            retryable: 当前失败是否允许客户端重试。
+            retry_after: 建议重试等待秒数；为空则不设置提示。
+        """
         super().__init__(message)
         self.code = code
         self.message = message
@@ -34,6 +44,7 @@ class BudgetExhausted(Exception):
     """本轮某类资源预算已用完。调用方按数据源降级，不当成服务故障。"""
 
 
+# 数据职责：链上 RPC 不可用、协议不合法或预算不足的内部故障信号。
 class RpcUnavailable(Exception):
     pass
 
@@ -51,6 +62,7 @@ class ModelBadOutput(Exception):
 
 
 # code -> (用户可见固定文案, HTTP 状态码)
+# ERROR_TABLE：全局错误码到固定文案和 HTTP 状态码的映射。
 ERROR_TABLE: dict[str, tuple[str, int]] = {
     "E101": ("请求参数格式不正确", 400),
     "E102": ("暂不支持该网络", 400),
@@ -102,7 +114,11 @@ ERROR_TABLE: dict[str, tuple[str, int]] = {
 
 
 def error_tuple(code: str) -> tuple[str, str, int]:
-    """取 (code, 固定文案, HTTP)。未登记的码直接抛，避免悄悄发出没有文案的错误。"""
+    """取 (code, 固定文案, HTTP)。未登记的码直接抛，避免悄悄发出没有文案的错误。
+
+    Args:
+        code: 已登记的业务错误码。
+    """
     try:
         message, http_status = ERROR_TABLE[code]
     except KeyError as exc:
@@ -111,17 +127,33 @@ def error_tuple(code: str) -> tuple[str, str, int]:
 
 
 def error_message(code: str) -> str:
+    """按已登记错误码读取固定用户提示文案。
+
+    Args:
+        code: 已登记的业务错误码。
+    """
     return ERROR_TABLE[code][0]
 
 
+# E101_INVALID_PARAM：该业务错误对应的 (错误码, 固定文案, HTTP 状态码) 三元组。
 E101_INVALID_PARAM = error_tuple("E101")
+# E102_CHAIN_NOT_ALLOWED：该业务错误对应的 (错误码, 固定文案, HTTP 状态码) 三元组。
 E102_CHAIN_NOT_ALLOWED = error_tuple("E102")
+# E301_RPC_TIMEOUT：该业务错误对应的 (错误码, 固定文案, HTTP 状态码) 三元组。
 E301_RPC_TIMEOUT = error_tuple("E301")
+# E302_RPC_ERROR：该业务错误对应的 (错误码, 固定文案, HTTP 状态码) 三元组。
 E302_RPC_ERROR = error_tuple("E302")
+# E501_QUOTA_EXHAUSTED：该业务错误对应的 (错误码, 固定文案, HTTP 状态码) 三元组。
 E501_QUOTA_EXHAUSTED = error_tuple("E501")
+# E503_UNAUTHENTICATED：该业务错误对应的 (错误码, 固定文案, HTTP 状态码) 三元组。
 E503_UNAUTHENTICATED = error_tuple("E503")
+# E507_MODEL_UNAVAILABLE：该业务错误对应的 (错误码, 固定文案, HTTP 状态码) 三元组。
 E507_MODEL_UNAVAILABLE = error_tuple("E507")
+# E509_CHAIN_IDENTITY_MISMATCH：该业务错误对应的 (错误码, 固定文案, HTTP 状态码) 三元组。
 E509_CHAIN_IDENTITY_MISMATCH = error_tuple("E509")
+# E510_TURN_BUDGET：该业务错误对应的 (错误码, 固定文案, HTTP 状态码) 三元组。
 E510_TURN_BUDGET = error_tuple("E510")
+# E511_DUPLICATE_REQUEST：该业务错误对应的 (错误码, 固定文案, HTTP 状态码) 三元组。
 E511_DUPLICATE_REQUEST = error_tuple("E511")
+# E512_IDEMPOTENCY_CONFLICT：该业务错误对应的 (错误码, 固定文案, HTTP 状态码) 三元组。
 E512_IDEMPOTENCY_CONFLICT = error_tuple("E512")

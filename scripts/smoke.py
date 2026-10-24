@@ -24,6 +24,7 @@ from web3_agent.web3.tools.read.get_transaction_records import build_get_transac
 
 
 async def main() -> None:
+    """构造真实模型和链工具执行人工冒烟流程，可按 --graph 额外运行只读图。"""
     settings = Settings()
     print("model:", settings.ollama_model)
 
