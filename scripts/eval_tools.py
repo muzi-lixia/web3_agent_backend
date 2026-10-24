@@ -54,6 +54,10 @@ class CaseResult:
     intent: str | None = None
     # route：后端决定的处理路径：read 查询、write 写操作、clarify 澄清、reject 拒绝。
     route: str | None = None
+    # confidence：模型自报的意图置信度，用于衡量自评分是否饱和。
+    confidence: float | None = None
+    # needs_clarification：模型自报的信息不足标记，是当前唯一的澄清来源。
+    needs_clarification: bool | None = None
     # tools：模型本次选择的工具名称列表。
     tools: list[str] | None = None
     # degraded：是否使用降级结果，例如缺少数据证据或结构化输出失败。
@@ -141,12 +145,14 @@ def _score_slots(expected: dict[str, Any], actual: dict[str, Any]) -> tuple[bool
 
 
 def _intent_ok(expected: Any, actual: str | None) -> bool:
-    """判断实际意图是否在用例允许的单个或多个意图中。
+    """判断实际意图是否在用例允许的单个或多个意图中。期望为 None 表示不判意图。
 
     Args:
         expected: 用例要求的期望值。
         actual: 模型实际输出值。
     """
+    if expected is None:
+        return True
     if actual is None:
         return False
     wanted = expected if isinstance(expected, list) else [expected]
@@ -191,18 +197,19 @@ async def _evaluate(cases: list[dict], settings: Settings) -> list[CaseResult]:
             continue
 
         result.intent = guarded.output.intent.value
+        result.confidence = guarded.output.confidence
+        result.needs_clarification = guarded.output.needs_clarification
         # 以确定性后端规则选择路径，不让模型输出直接决定执行权限。
-        decision = route_intent(
-            guarded.output, confidence_threshold=settings.confidence_threshold
-        )
+        decision = route_intent(guarded.output, user_message=message)
         result.route = decision.route.value
-        result.intent_ok = _intent_ok(case["intent"], result.intent)
+        result.intent_ok = _intent_ok(case.get("intent"), result.intent)
         result.route_ok = result.route == case["route"]
         result.slot_ok, result.missing_slots, result.wrong_slots = _score_slots(
             case.get("slots", {}), guarded.output.slots
         )
 
-        if decision.route is Route.READ:
+        # route_only：只考察「路由该不该放行」，不进入选工具阶段（知识类用例没有注册检索工具）。
+        if decision.route is Route.READ and not case.get("route_only"):
             state = initial_state(
                 history, message, wallet_address=WALLET, intent=guarded.output.intent
             )
@@ -270,6 +277,12 @@ def _print_group(title: str, results: list[CaseResult]) -> None:
     print(f"  {'路由':<8}{_rate(route_hit, total):>8}  {_pct(route_hit, total):>7}")
     print(f"  {'工具集合':<6}{_rate(tools_hit, total):>8}  {_pct(tools_hit, total):>7}")
     print(f"  {'槽位':<8}{_rate(slots_hit, slots_total):>8}  {_pct(slots_hit, slots_total):>7}")
+    confs = [r.confidence for r in results if r.confidence is not None]
+    if confs:
+        print(
+            f"  自报置信度 min={min(confs):.2f} 均值={sum(confs) / len(confs):.2f} "
+            f"max={max(confs):.2f}"
+        )
     print(f"  冗余调用 {redundant} 次 ｜ JSON 降级 {degraded} 次")
 
 
@@ -296,8 +309,10 @@ def _print_failures(results: list[CaseResult]) -> None:
         )
         print(f"  {r.case['id']:<8} {marks}")
         print(f"           {r.case['message']}")
-        want_intent = r.case["intent"]
-        if not r.intent_ok:
+        print(f"           实得 intent={r.intent} confidence={r.confidence} "
+              f"needs_clarification={r.needs_clarification}")
+        want_intent = r.case.get("intent")
+        if not r.intent_ok and want_intent is not None:
             print(f"           意图：期望 {want_intent} 实际 {r.intent}")
         if not r.route_ok:
             print(f"           路由：期望 {r.case['route']} 实际 {r.route}")
@@ -326,9 +341,11 @@ async def main() -> None:
     parser = argparse.ArgumentParser(description="工具调用评估集跑批")
     parser.add_argument("--only", default=None, help="只跑 id 包含该子串的用例")
     parser.add_argument("--json", default=None, help="把逐条结果写到该路径")
+    parser.add_argument("--cases", default=None, help="用例文件路径，默认 tool_cases.json")
     args = parser.parse_args()
 
-    payload = json.loads(CASES_PATH.read_text(encoding="utf-8"))
+    cases_path = Path(args.cases) if args.cases else CASES_PATH
+    payload = json.loads(cases_path.read_text(encoding="utf-8"))
     cases = payload["cases"]
     if args.only:
         cases = [c for c in cases if args.only in c["id"]]
@@ -337,7 +354,7 @@ async def main() -> None:
         return
 
     settings = Settings()
-    print(f"模型 {settings.ollama_model} ｜ 用例 {len(cases)} 条 ｜ {CASES_PATH.name}")
+    print(f"模型 {settings.ollama_model} ｜ 用例 {len(cases)} 条 ｜ {cases_path.name}")
 
     started = time.perf_counter()
     results = await _evaluate(cases, settings)
@@ -370,6 +387,8 @@ async def main() -> None:
                         "actual": {
                             "intent": r.intent,
                             "route": r.route,
+                            "confidence": r.confidence,
+                            "needs_clarification": r.needs_clarification,
                             "tools": r.tools,
                             "degraded": r.degraded,
                             "error": r.error,

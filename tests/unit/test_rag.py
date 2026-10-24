@@ -191,9 +191,9 @@ def test_document_success_is_not_live_chain_evidence():
 
 def test_knowledge_routes_read_and_stake_commands_still_route_write():
     knowledge=LlmOutput(intent=Intent.QUERY_KNOWLEDGE,confidence=.99,slots={"protocol_id":"100"})
-    assert route_intent(knowledge,confidence_threshold=.75).route is Route.READ
+    assert route_intent(knowledge,user_message="什么是Gas").route is Route.READ
     command=LlmOutput(intent=Intent.STAKE,confidence=.99,slots={"stakeContractAliasOrAddress":"100","tokenSymbol":"ETH","humanAmount":"0.1"})
-    assert route_intent(command,confidence_threshold=.75).route is Route.WRITE
+    assert route_intent(command,user_message="质押 0.1 ETH 到 A 池").route is Route.WRITE
 
 
 def test_graph_retrieves_with_the_original_query():
@@ -218,7 +218,7 @@ def test_graph_retrieves_with_the_original_query():
 
 def test_general_knowledge_does_not_require_protocol_or_pool():
     output=LlmOutput(intent=Intent.QUERY_KNOWLEDGE,confidence=.99,slots={})
-    assert route_intent(output,confidence_threshold=.75).route is Route.READ
+    assert route_intent(output,user_message="奖励怎么算").route is Route.READ
 
 
 def test_agent_write_command_never_enters_rag_graph(monkeypatch):
@@ -276,7 +276,7 @@ def test_rag_toggle_preserves_three_original_tools(monkeypatch, enabled):
 
 def test_missing_pool_is_a_router_clarification():
     output=LlmOutput(intent=Intent.QUERY_KNOWLEDGE,confidence=.99,slots={})
-    decision=route_intent(output,confidence_threshold=.75)
+    decision=route_intent(output,user_message="这个池子多久解锁")
     assert decision.route is Route.READ and not decision.missing_slots
 
 

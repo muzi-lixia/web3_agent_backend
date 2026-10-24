@@ -1,0 +1,198 @@
+{
+  "_legend": {
+    "用途": "澄清判定基线集。只测「这句话该不该被放行到执行层」，不测工具选择。",
+    "intent": "null 表示不判意图——输入本身不足以确定意图，这正是要测的东西。",
+    "route": "期望路由。underspecified 组期望 clarify；explicit 组期望 read。",
+    "route_only": "true 表示不进选工具阶段。本批全部为 true，工具维度不参与判定。",
+    "rationale": "该期望的理由，供改判定规则时复核，不参与打分。",
+    "组别": "underspecified = 信息不足，应追问；explicit = 信息充分，不应追问（用于测过度澄清）。",
+    "known_gap": "当前代码尚不具备该行为，跑分时单独计数，不计入可用准确率。"
+  },
+  "version": 1,
+  "updated": "2026-10-24",
+  "cases": [
+    {
+      "id": "cl-01",
+      "group": "underspecified",
+      "tags": [
+        "no-object"
+      ],
+      "message": "查询",
+      "intent": null,
+      "route": "clarify",
+      "route_only": true,
+      "rationale": "单个动词，没有查询对象，也没有可执行的默认值"
+    },
+    {
+      "id": "cl-02",
+      "group": "underspecified",
+      "tags": [
+        "no-object"
+      ],
+      "message": "查一下",
+      "intent": null,
+      "route": "clarify",
+      "route_only": true,
+      "rationale": "同上，动词+语气词，缺宾语"
+    },
+    {
+      "id": "cl-03",
+      "group": "underspecified",
+      "tags": [
+        "no-object"
+      ],
+      "message": "帮我看看",
+      "intent": null,
+      "route": "clarify",
+      "route_only": true,
+      "rationale": "请求动作但没说看什么"
+    },
+    {
+      "id": "cl-04",
+      "group": "underspecified",
+      "tags": [
+        "no-object"
+      ],
+      "message": "看一下我的",
+      "intent": null,
+      "route": "clarify",
+      "route_only": true,
+      "rationale": "有所有者无对象，资产/交易/质押三者皆可能"
+    },
+    {
+      "id": "cl-05",
+      "group": "underspecified",
+      "tags": [
+        "pronoun"
+      ],
+      "message": "这个呢",
+      "intent": null,
+      "route": "clarify",
+      "route_only": true,
+      "rationale": "代词且无上文，指代无法解析"
+    },
+    {
+      "id": "cl-06",
+      "group": "underspecified",
+      "tags": [
+        "pronoun"
+      ],
+      "message": "那个怎么样",
+      "intent": null,
+      "route": "clarify",
+      "route_only": true,
+      "rationale": "同上，且「怎么样」不指向任何数据类型"
+    },
+    {
+      "id": "cl-07",
+      "group": "underspecified",
+      "tags": [
+        "missing-slot"
+      ],
+      "message": "查一下我的质押",
+      "intent": null,
+      "route": "clarify",
+      "route_only": true,
+      "rationale": "query_stake 的合约参数无默认值，必须命中白名单才能查",
+      "known_gap": "STAKE_CONTRACTS 为空，缺合约白名单校验：追问了也查不到；等白名单配好再实现"
+    },
+    {
+      "id": "cl-08",
+      "group": "underspecified",
+      "tags": [
+        "missing-slot"
+      ],
+      "message": "我质押了多少",
+      "intent": null,
+      "route": "clarify",
+      "route_only": true,
+      "rationale": "同上，缺合约就无从确定查哪个仓位",
+      "known_gap": "STAKE_CONTRACTS 为空，缺合约白名单校验：追问了也查不到；等白名单配好再实现"
+    },
+    {
+      "id": "cl-09",
+      "group": "underspecified",
+      "tags": [
+        "missing-subject"
+      ],
+      "message": "怎么算",
+      "intent": null,
+      "route": "clarify",
+      "route_only": true,
+      "rationale": "问方法但没说算的是什么，检索无从构造查询"
+    },
+    {
+      "id": "ck-01",
+      "group": "explicit",
+      "tags": [
+        "knowledge"
+      ],
+      "message": "什么是 Gas",
+      "intent": "query_knowledge",
+      "route": "read",
+      "route_only": true,
+      "rationale": "概念明确，检索可直接构造"
+    },
+    {
+      "id": "ck-02",
+      "group": "explicit",
+      "tags": [
+        "asset"
+      ],
+      "message": "我的资产",
+      "intent": "query_asset",
+      "route": "read",
+      "route_only": true,
+      "rationale": "对象明确，地址由会话注入，不缺参数"
+    },
+    {
+      "id": "ck-03",
+      "group": "explicit",
+      "tags": [
+        "tx"
+      ],
+      "message": "我最近 10 笔交易",
+      "intent": "query_tx",
+      "route": "read",
+      "route_only": true,
+      "rationale": "对象与范围都明确"
+    },
+    {
+      "id": "ck-04",
+      "group": "explicit",
+      "tags": [
+        "knowledge"
+      ],
+      "message": "授权失败通常是什么原因",
+      "intent": "query_knowledge",
+      "route": "read",
+      "route_only": true,
+      "rationale": "现象明确，属于知识问题"
+    },
+    {
+      "id": "ck-05",
+      "group": "explicit",
+      "tags": [
+        "asset",
+        "other-address"
+      ],
+      "message": "0x63a9f8df422e1983d42565234557d46d18dbece9 这个地址有多少 USDC",
+      "intent": "query_asset",
+      "route": "read",
+      "route_only": true,
+      "rationale": "地址与代币都给了"
+    },
+    {
+      "id": "ck-06",
+      "group": "explicit",
+      "tags": [
+        "chitchat"
+      ],
+      "message": "你好",
+      "intent": "chitchat",
+      "route": "read",
+      "route_only": true,
+      "rationale": "闲聊不应被当成信息不足而追问"
+    }
+  ]
+}

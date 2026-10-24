@@ -71,6 +71,8 @@ WRITE_INTENTS: frozenset[Intent] = frozenset(
 
 # 写意图必须由 LLM 提供的槽位。chainId 与各类地址由后端注入，不在其中。
 # REQUIRED_SLOTS：各写意图需要用户提供的业务参数名，钱包身份及网络由服务端约束。
+# 读意图暂时不在此表：query_stake 的合约参数虽然必填，但白名单当前为空，
+# 追问了也查不到，只会让用户以为补上就能查（见 tests/golden_suite/BASELINE.md）。
 REQUIRED_SLOTS: dict[Intent, tuple[str, ...]] = {
     Intent.TRANSFER: ("toAddress", "tokenSymbol", "humanAmount"),
     Intent.APPROVE: ("spenderContractAddress", "tokenSymbol", "humanAmount"),

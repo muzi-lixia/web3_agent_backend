@@ -57,8 +57,6 @@ class Settings(BaseSettings):
     stake_contracts: dict[str, dict] = Field(default_factory=dict)
 
     # --- Agent ---
-    # confidence_threshold：意图识别最低置信度，低于该值先向用户澄清。
-    confidence_threshold: float = 0.75
     # read_max_react_steps：只读 ReAct 图允许的最大模型调用步数。
     read_max_react_steps: int = 5
     # 单轮的三条边界各管一层：模型步数（上面那条）、下游请求数、整轮时间。

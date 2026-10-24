@@ -319,24 +319,19 @@ class AgentLoop:
             )
 
         # 4. IntentRouter：唯一路由决策点
-        decision = route_intent(
-            guarded.output, confidence_threshold=self._settings.confidence_threshold
-        )
+        decision = route_intent(guarded.output, user_message=user_message)
         await self._audit.log(
             "intent_routed",
             siwe_user_id=siwe_user_id,
             intent=guarded.output.intent.value,
             confidence=guarded.output.confidence,
+            needs_clarification=guarded.output.needs_clarification,
             route=decision.route.value,
             reason=decision.reason,
         )
 
         if decision.route is Route.CLARIFY:
-            kind, content = "ask", MSG_CLARIFY
-            if guarded.output.intent is Intent.QUERY_KNOWLEDGE:
-                if not self._settings.rag_enabled:
-                    kind, content = "answer", UNAVAILABLE
-            return await finish(ChatOutcome(kind=kind, content=content))
+            return await finish(ChatOutcome(kind="ask", content=MSG_CLARIFY))
         if decision.route is Route.REJECT:
             return await finish(ChatOutcome(kind="reject", content=MSG_OUT_OF_SCOPE))
         if decision.route is Route.WRITE:

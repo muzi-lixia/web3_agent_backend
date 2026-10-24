@@ -14,8 +14,10 @@ class LlmOutput(BaseModel):
 
     # intent：模型识别的闭合业务意图；实际路由由后端计算。
     intent: Intent = Intent.OUT_OF_SCOPE
-    # confidence：意图识别置信度，用于与 confidence_threshold 比较决定是否澄清。
+    # confidence：模型自报的把握程度，只作观测记录，不参与路由判定。
     confidence: float = 0.0
+    # needs_clarification：输入缺少确定查询对象所需的信息时为真，由后端直接转澄清。
+    needs_clarification: bool = False
     # slots：模型抽取的业务参数字典，例如 tokenSymbol、humanAmount、toAddress。
     slots: dict[str, Any] = Field(default_factory=dict)
 

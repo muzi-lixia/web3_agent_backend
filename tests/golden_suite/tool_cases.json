@@ -7,7 +7,7 @@
     "slots": "必需槽位，逐项比对：地址小写比较、代币符号大写比较、数量按数值比较。未列出的槽位不判分。",
     "history": "多轮用例的前置对话，格式 [[role, content]]，role 只能是 user / assistant。",
     "known_gap": "当前代码尚不具备该行为（写链路未接入等）。跑分时单独计数，不计入可用准确率。",
-    "threshold": "route=clarify 有两条来源：confidence < 0.75，或写意图缺必填槽位。两者都判 clarify 为正确。"
+    "clarify": "route=clarify 有三条来源：模型自报信息不足、查询意图剥离语气词后没有查询对象、缺必填槽位。三者都判 clarify 为正确。"
   },
   "version": 1,
   "updated": "2026-10-22",
