@@ -2265,6 +2265,7 @@ source = { editable = "." }
 dependencies = [
     { name = "asyncpg" },
     { name = "eth-account" },
+    { name = "eth-utils" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "langchain-core" },
@@ -2278,6 +2279,7 @@ dependencies = [
     { name = "pypdf" },
     { name = "python-multipart" },
     { name = "sqlalchemy", extra = ["asyncio"] },
+    { name = "starlette" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -2290,6 +2292,7 @@ dev = [
 requires-dist = [
     { name = "asyncpg" },
     { name = "eth-account" },
+    { name = "eth-utils" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "langchain-core" },
@@ -2303,6 +2306,7 @@ requires-dist = [
     { name = "pypdf", specifier = ">=6.21.2" },
     { name = "python-multipart", specifier = ">=0.0.32" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2" },
+    { name = "starlette" },
     { name = "uvicorn", extras = ["standard"] },
 ]
 
