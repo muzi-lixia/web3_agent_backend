@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from decimal import ROUND_DOWN, Decimal
 
 from langchain_core.tools import StructuredTool
@@ -12,6 +13,8 @@ from web3_agent.config.constants import NATIVE_FALLBACK, NATIVE_META
 from web3_agent.persistence.pg.base import session_scope
 from web3_agent.persistence.pg.repositories import token_registry_repo
 from web3_agent.web3.chain_adapter import ChainAdapter, is_evm_address
+
+logger = logging.getLogger(__name__)
 
 DESCRIPTION = (
     "查询钱包地址原生币与ERC20代币余额；后端会话注入chainId，只读场景可遍历白名单链"
@@ -44,6 +47,7 @@ async def _query_chain(adapter: ChainAdapter, chain_id: int, address: str, top_n
         async with session_scope() as db:
             tokens = await token_registry_repo.list_whitelisted(db, chain_id)
     except Exception:  # noqa: BLE001
+        logger.warning("token registry unavailable chain_id=%s", chain_id, exc_info=True)
         tokens = []
         errors.append(
             {"chainId": chain_id, "scope": "token_registry", "message": "代币注册表不可用，仅返回原生币"}
@@ -62,15 +66,26 @@ async def _query_chain(adapter: ChainAdapter, chain_id: int, address: str, top_n
                 "isNative": True,
             }
         )
-    except RpcUnavailable as exc:
-        errors.append({"chainId": chain_id, "scope": "native", "message": str(exc)})
+    except RpcUnavailable:
+        logger.warning("native balance unavailable chain_id=%s", chain_id, exc_info=True)
+        errors.append({"chainId": chain_id, "scope": "native", "message": "链上余额服务暂时不可用"})
 
-    for token in tokens[:top_n]:
+    # 代币余额彼此独立，串行等 N 个 RTT 只会让整轮超时。失败仍然逐条降级：
+    # 一个代币查不到不能把同链其它代币一起抹掉。
+    async def _balance(token) -> int | None:
         try:
-            raw = await adapter.get_erc20_balance(chain_id, token.token_address, address)
-        except RpcUnavailable as exc:
+            return await adapter.get_erc20_balance(chain_id, token.token_address, address)
+        except RpcUnavailable:
+            return None
+
+    raws = await asyncio.gather(*(_balance(token) for token in tokens[:top_n]))
+
+    for token, raw in zip(tokens[:top_n], raws):
+        if raw is None:
+            logger.warning("ERC20 balance unavailable chain_id=%s token=%s", chain_id,
+                           token.symbol)
             errors.append(
-                {"chainId": chain_id, "scope": token.symbol, "message": str(exc)}
+                {"chainId": chain_id, "scope": token.symbol, "message": "链上余额服务暂时不可用"}
             )
             continue
         balances.append(
@@ -97,13 +112,26 @@ def build_get_asset_balance(adapter: ChainAdapter) -> StructuredTool:
             return {"error": "E102", "message": "没有可用的白名单链 RPC"}
 
         results = await asyncio.gather(
-            *[_query_chain(adapter, c, address, top_n) for c in chains]
+            *[_query_chain(adapter, c, address, top_n) for c in chains],
+            return_exceptions=True,
         )
-        return {
-            "address": address,
-            "balances": [b for r in results for b in r["balances"]],
-            "errors": [e for r in results for e in r["errors"]],
-        }
+        balances, errors = [], []
+        for chain_id, result in zip(chains, results):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, BaseException):
+                logger.warning("chain balance query failed chain_id=%s", chain_id,
+                               exc_info=(type(result), result, result.__traceback__))
+                errors.append({"chainId": chain_id, "scope": "chain",
+                               "message": "该链余额查询失败"})
+            else:
+                balances.extend(result["balances"])
+                errors.extend(result["errors"])
+        payload = {"address": address, "balances": balances, "errors": errors,
+                   "status": "partial" if errors else "success"}
+        if not balances:
+            payload.update(error="E301", status="failed", message="所有链上余额查询均失败，请稍后重试")
+        return payload
 
     return StructuredTool.from_function(
         coroutine=get_asset_balance,

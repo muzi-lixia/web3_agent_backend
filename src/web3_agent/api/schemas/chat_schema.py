@@ -1,4 +1,9 @@
-"""聊天接口的 HTTP 契约。字段名与 PRD 7.1 一致，与领域模型分开维护。"""
+"""聊天接口的 HTTP 契约。
+
+PRD 7.1 的请求体带 `sessionId`，架构 7.7 却是单线性会话：一个用户一条历史，
+`conversation_message` 只按 siwe_user_id 归属，没有第二个分区键。V1 按架构实现，
+因此不收 `sessionId`。其余字段名与 PRD 7.1 一致。
+"""
 
 from __future__ import annotations
 
@@ -21,6 +26,11 @@ class ChatRequest(BaseModel):
     wallet: WalletRef | None = None
     user_message: str = Field(alias="userMessage", min_length=1, max_length=4000)
     knowledge_base_id: str = Field(default="default",alias="knowledgeBaseId",pattern=r"^[A-Za-z0-9_.:-]{1,64}$")
+    # 客户端重试时带同一个值，服务端只跑一轮并复用上次的响应。
+    idempotency_key: str | None = Field(
+        default=None, alias="idempotencyKey", min_length=8, max_length=128,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    )
 
 
 class IntentPreview(BaseModel):
@@ -70,15 +80,14 @@ class HistoryResp(BaseModel):
 
 class ClearResp(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
+    # 摘要就是 conversation_message 里的一行，已计入 cleared_messages。
     cleared_messages: int = Field(alias="clearedMessages")
-    cleared_summary: bool = Field(alias="clearedSummary")
     started_at: datetime = Field(alias="startedAt")
 
 
 class PurgeResp(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     deleted_messages: int = Field(alias="deletedMessages")
-    deleted_summaries: int = Field(alias="deletedSummaries")
     deleted_profile: bool = Field(alias="deletedProfile")
     deleted_memories: int = Field(alias="deletedMemories")
     deleted_at: datetime = Field(alias="deletedAt")

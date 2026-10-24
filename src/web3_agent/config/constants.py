@@ -58,71 +58,6 @@ TOOL_GET_TRANSACTION_RECORDS = "get_transaction_records"
 TOOL_GET_STAKE_INFO = "get_stake_info"
 
 
-class WorkflowState(str, Enum):
-    """写链路状态全集（架构 §4 / PRD 9 章）。CHECK_ALLOWANCE、APPROVE_REQUIRED 仅在 stake 子流程出现。"""
-
-    VALIDATE = "VALIDATE"
-    INTENT_CONFIRM = "INTENT_CONFIRM"
-    CHECK_ALLOWANCE = "CHECK_ALLOWANCE"
-    APPROVE_REQUIRED = "APPROVE_REQUIRED"
-    SIMULATE = "SIMULATE"
-    PREVIEW = "PREVIEW"
-    SUBMITTED = "SUBMITTED"
-    SETTLED = "SETTLED"
-    FAILED = "FAILED"
-    REPLACED = "REPLACED"
-    ABORTED = "ABORTED"
-    EXPIRED_UNSIGNED = "EXPIRED_UNSIGNED"
-    EXPIRED_UNVERIFIED = "EXPIRED_UNVERIFIED"
-
-
-# 终态：到达即停止轮询。SETTLED 的语义是"该 workflow 全部交易完成"，不是"本笔回执成功"。
-TERMINAL_STATES: frozenset[WorkflowState] = frozenset(
-    {
-        WorkflowState.SETTLED,
-        WorkflowState.FAILED,
-        WorkflowState.REPLACED,
-        WorkflowState.ABORTED,
-        WorkflowState.EXPIRED_UNSIGNED,
-        WorkflowState.EXPIRED_UNVERIFIED,
-    }
-)
-
-
-class TxKind(str, Enum):
-    APPROVE = "approve"
-    STAKE = "stake"
-    TRANSFER = "transfer"
-
-
-class TxRecordStatus(str, Enum):
-    PENDING = "PENDING"
-    CONFIRMED = "CONFIRMED"
-    FAILED = "FAILED"
-    REPLACED = "REPLACED"
-
-
-class GroupStatus(str, Enum):
-    IDLE = "idle"
-    PARTIAL = "partial"
-    COMPLETED = "completed"
-    ABANDONED = "abandoned"
-    REVOKED = "revoked"
-
-
-class ExpireType(str, Enum):
-    NONE = "NONE"
-    EXPIRED_UNSIGNED = "EXPIRED_UNSIGNED"
-    EXPIRED_UNVERIFIED = "EXPIRED_UNVERIFIED"
-
-
-class SimulationStatus(str, Enum):
-    OK = "ok"
-    REVERT = "revert"
-    ESTIMATE_FAILED = "estimate_failed"
-    RPC_ERROR = "rpc_error"
-
-
 class QuotaMetric(str, Enum):
     """资源配额维度。落 quota_counter 时拼进 subject：`{userId}|{metric}`。"""
 
@@ -131,16 +66,6 @@ class QuotaMetric(str, Enum):
     RPC_CALLS = "rpcCalls"
     TX_COUNT = "txCount"
     QPS = "qps"
-
-
-# 单 workflow 的 TxIntent 上限：stake 走 USDT 时是 approve(0) + approve(needed) + stake。
-# 其余意图一律只允许一笔。
-MAX_TX_COUNT_BY_INTENT: dict[Intent, int] = {
-    Intent.STAKE: 3,
-    Intent.TRANSFER: 1,
-    Intent.APPROVE: 1,
-    Intent.REVOKE_APPROVE: 1,
-}
 
 
 # 固定文案：错误与降级回复一律不走 LLM 生成。
@@ -179,8 +104,5 @@ CHAIN_ALIASES: dict[str, int] = {
 PRICE_FEED_SYMBOLS: frozenset[str] = frozenset(
     {"ETH", "BNB", "POL", "BERA", "WETH", "WBTC", "USDT", "USDC", "DAI"}
 )
-# 稳定币价格按 1 计，不依赖外部喂价，避免没接 feed 时把正常授权全拦掉。
-STABLECOIN_SYMBOLS: frozenset[str] = frozenset({"USDT", "USDC", "DAI"})
-
 # 单笔写操作等值金额上限（PRD 12 章）。运行期可用同名 settings 覆盖，这里是默认值。
 DEFAULT_MAX_AMOUNT_USD = 5000

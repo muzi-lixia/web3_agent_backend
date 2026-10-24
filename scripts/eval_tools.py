@@ -119,7 +119,7 @@ async def _evaluate(cases: list[dict], settings: Settings) -> list[CaseResult]:
     registry = ToolRegistry()
     registry.register(build_get_asset_balance(adapter), ToolGroup.LLM_VISIBLE, mutating=False)
     registry.register(
-        build_get_transaction_records(adapter, settings), ToolGroup.LLM_VISIBLE, mutating=False
+        build_get_transaction_records(settings), ToolGroup.LLM_VISIBLE, mutating=False
     )
     registry.register(
         build_get_stake_info(adapter, settings.stake_contracts),

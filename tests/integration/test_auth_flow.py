@@ -104,11 +104,32 @@ def test_quota_counts_and_raises_at_limit() -> None:
     assert asyncio.run(flow()) == 3
 
 
+def _clear_qps_window() -> None:
+    """清掉当前分钟的匿名计费窗口。
+
+    限流按 IP 计数，同一分钟内别的用例把 `ip:testclient` 打满之后，
+    这里发 nonce 会先撞 429 —— 与鉴权逻辑无关，只是共享了一个时间窗。
+    """
+
+    async def run() -> None:
+        pg.init_engine(get_settings())
+        await pg.create_all()
+        try:
+            async with pg.session_scope() as db:
+                # -1 秒把当前窗口也纳入回收范围
+                await quota_repo.cleanup(db, older_than_seconds=-1)
+        finally:
+            await pg.dispose_engine()
+
+    asyncio.run(run())
+
+
 def test_auth_flow_over_http() -> None:
     from fastapi.testclient import TestClient
 
     from web3_agent.main import app
 
+    _clear_qps_window()
     with TestClient(app) as client:
         nonce_resp = client.post(
             "/api/v1/auth/nonce", json={"address": ADDRESS, "chainId": CHAIN_ID}
@@ -141,6 +162,7 @@ def test_verify_rejects_message_signed_by_another_wallet() -> None:
     from web3_agent.main import app
 
     attacker = Account.from_key("0x" + "44" * 32)
+    _clear_qps_window()
     with TestClient(app) as client:
         resp = client.post("/api/v1/auth/nonce", json={"address": ADDRESS, "chainId": CHAIN_ID})
         message = resp.json()["message"]

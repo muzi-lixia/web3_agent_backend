@@ -1,4 +1,4 @@
-"""数据类意图的证据校验：没有成功的工具调用就不能给数据性回答。"""
+"""数据类意图的证据校验：没有对应工具的成功调用就不能给数据性回答。"""
 
 from __future__ import annotations
 
@@ -8,30 +8,43 @@ from web3_agent.agent.agent_loop import _lacks_evidence
 from web3_agent.common.types import ToolCallRecord
 from web3_agent.config.constants import Intent
 
+_EXPECTED = {
+    Intent.QUERY_ASSET: "get_asset_balance",
+    Intent.QUERY_TX: "get_transaction_records",
+    Intent.QUERY_STAKE: "get_stake_info",
+}
 
-def _record(name: str = "get_asset_balance", *, ok: bool = True) -> ToolCallRecord:
+
+def _record(name: str, *, ok: bool = True) -> ToolCallRecord:
     return ToolCallRecord(name=name, ok=ok, error=None if ok else "E303")
 
 
-@pytest.mark.parametrize(
-    "intent", [Intent.QUERY_ASSET, Intent.QUERY_TX, Intent.QUERY_STAKE]
-)
+@pytest.mark.parametrize("intent", list(_EXPECTED))
 def test_no_tool_call_at_all_has_no_evidence(intent: Intent) -> None:
     assert _lacks_evidence(intent, []) is True
 
 
-@pytest.mark.parametrize(
-    "intent", [Intent.QUERY_ASSET, Intent.QUERY_TX, Intent.QUERY_STAKE]
-)
+@pytest.mark.parametrize("intent", list(_EXPECTED))
 def test_all_tool_calls_failed_has_no_evidence(intent: Intent) -> None:
-    assert _lacks_evidence(intent, [_record(ok=False), _record(ok=False)]) is True
+    tool = _EXPECTED[intent]
+    assert _lacks_evidence(intent, [_record(tool, ok=False), _record(tool, ok=False)]) is True
 
 
-@pytest.mark.parametrize(
-    "intent", [Intent.QUERY_ASSET, Intent.QUERY_TX, Intent.QUERY_STAKE]
-)
+@pytest.mark.parametrize("intent", list(_EXPECTED))
 def test_one_successful_call_is_enough(intent: Intent) -> None:
-    assert _lacks_evidence(intent, [_record(ok=False), _record(ok=True)]) is False
+    tool = _EXPECTED[intent]
+    assert _lacks_evidence(intent, [_record(tool, ok=False), _record(tool, ok=True)]) is False
+
+
+@pytest.mark.parametrize("intent", list(_EXPECTED))
+def test_other_tool_success_is_not_evidence(intent: Intent) -> None:
+    # 问余额却调了质押：调了、也成功了，但没查到余额。
+    other = next(tool for i, tool in _EXPECTED.items() if i is not intent)
+    assert _lacks_evidence(intent, [_record(other, ok=True)]) is True
+
+
+def test_document_success_is_not_live_chain_evidence() -> None:
+    assert _lacks_evidence(Intent.QUERY_ASSET, [_record("rag_general_knowledge", ok=True)]) is True
 
 
 def test_chitchat_needs_no_evidence() -> None:

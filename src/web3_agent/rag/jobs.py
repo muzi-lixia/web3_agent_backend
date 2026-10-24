@@ -1,5 +1,7 @@
 """PostgreSQL durable queue with bounded leases and claim-token fencing."""
 import hashlib
+import logging
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import select, update, or_, and_, func
@@ -8,6 +10,13 @@ from web3_agent.persistence.pg.base import session_scope
 from web3_agent.persistence.pg.orm_models import RagIngestionJob as Job, RagDocument, RagChunk
 from web3_agent.common.exceptions import AppError, error_tuple
 from web3_agent.rag.knowledge_bases import KnowledgeBaseRepository
+
+logger = logging.getLogger(__name__)
+
+# 原始文件只留 3 天：够排查、够重试，之后正文不再占库。任务行本身一直保留。
+PAYLOAD_RETENTION_DAYS = 3
+_PURGE_INTERVAL_SECONDS = 3600.0
+_last_purge = 0.0
 
 
 def now():
@@ -66,8 +75,29 @@ class JobRepository:
             rows = (await db.execute(select(Job).where(*([Job.kb_id==kb_id] if kb_id else [])).order_by(Job.created_at.desc(), Job.id).limit(limit+1).offset(offset))).scalars().all()
             return {"items": [job_view(row) for row in rows[:limit]], "has_more": len(rows)>limit}
 
+    async def _purge_payloads(self, db):
+        """抹掉过了保留期的原始文件。只看已终结的任务，排队中的一律不动。
+
+        worker 每次轮询都会进 claim，所以清理跟着 worker 走，不需要额外定时器；
+        一小时最多真扫一次。清理是附加动作，失败只记日志 —— 不能让「清旧文件」
+        把「领新任务」一起拖下水，所以套一层 savepoint。
+        """
+        global _last_purge
+        if time.monotonic() - _last_purge < _PURGE_INTERVAL_SECONDS:
+            return
+        _last_purge = time.monotonic()
+        try:
+            async with db.begin_nested():
+                await db.execute(update(Job).where(
+                    Job.payload.is_not(None), Job.status.in_(("succeeded", "failed")),
+                    Job.updated_at < now() - timedelta(days=PAYLOAD_RETENTION_DAYS),
+                ).values(payload=None))
+        except Exception:  # noqa: BLE001
+            logger.exception("rag payload purge failed")
+
     async def claim(self, *, timeout_seconds, max_attempts):
         async with session_scope() as db:
+            await self._purge_payloads(db)
             expired = and_(Job.status == "processing", Job.lease_until < now())
             await db.execute(update(Job).where(expired, Job.attempts >= max_attempts).values(
                 status="failed", error_code="WORKER_INTERRUPTED", error_message="处理多次中断，已达到重试上限",
@@ -95,6 +125,17 @@ class JobRepository:
             if not result.rowcount:
                 raise LostClaim()
 
+    async def succeed(self, job_id, token, document_id, chunks):
+        """内容与索引都没变：任务算成功，但没有重算任何向量。"""
+        async with session_scope() as db:
+            result = await db.execute(update(Job).where(Job.id == job_id, Job.claim_token == token,
+                Job.status == "processing", Job.lease_until > now()).values(
+                status="succeeded", stage="succeeded", document_id=document_id,
+                total_chunks=chunks, embedded_chunks=chunks, claim_token=None, lease_until=None,
+                error_code=None, error_message=None, updated_at=now()))
+            if not result.rowcount:
+                raise LostClaim()
+
     async def fail(self, job_id, token, code, message):
         async with session_scope() as db:
             await db.execute(update(Job).where(Job.id == job_id, Job.claim_token == token,
@@ -103,10 +144,12 @@ class JobRepository:
 
     async def retry(self, job_id, max_attempts):
         async with session_scope() as db:
-            row = (await db.execute(select(Job).where(Job.id == job_id).with_for_update())).scalar_one_or_none()
+            row = (await db.execute(select(Job).options(undefer(Job.payload))
+                                    .where(Job.id == job_id).with_for_update())).scalar_one_or_none()
             if row is None:
                 raise AppError(*error_tuple("E608"))
-            if row.status != "failed" or row.attempts >= max_attempts:
+            # 原始文件过了保留期就重试不了：只能重新上传一份。
+            if row.status != "failed" or row.attempts >= max_attempts or row.payload is None:
                 raise AppError(*error_tuple("E609"))
             row.status = row.stage = "queued"
             row.error_code = row.error_message = None

@@ -1,6 +1,6 @@
 """ORM 表定义。只做存储，不含业务方法。
 
-会话、消息、审计、代币注册表（V1a）+ workflow / tx record / quota（写链路）。
+会话、记忆、审计、代币注册表、配额、nonce、RAG 与幂等表。
 领域模型在 common/types.py，与这里的 ORM 严格分离，由 repositories 做转换。
 """
 
@@ -34,24 +34,45 @@ EMBEDDING_DIM = 1024  # bge-m3
 
 class ConversationMessage(Base):
     __tablename__ = "conversation_message"
-    __table_args__ = (Index("ix_conv_msg_user_id_desc", "siwe_user_id", text("id DESC")),)
+    __table_args__ = (
+        Index("ix_conv_msg_user_id_desc", "siwe_user_id", text("id DESC")),
+        # 摘要最多一条：删旧插新的并发靠这条索引定胜负，不靠应用层先查后写。
+        Index(
+            "uq_conv_summary_user",
+            "siwe_user_id",
+            unique=True,
+            postgresql_where=text("role = 'summary'"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     siwe_user_id: Mapped[str] = mapped_column(String(64))
     role: Mapped[str] = mapped_column(String(16))  # user | assistant | tool | summary
     content: Mapped[str] = mapped_column(Text)
     tool_calls: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    # 一轮对话的标识。同一轮先写 user、后写 assistant，中间隔着模型调用，
+    # 两台设备并发时 id 顺序会变成 u1,u2,a1,a2 —— 靠 id 拼历史等于把 a1 读成回答 u2。
+    # 加载时按 turn_id 分组、组内 user 在前，重建出 u1,a1,u2,a2。
+    # 摘要行（role='summary'）没有 turn_id：它不属于任何一轮，也不进对话窗口。
+    turn_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
-class ConversationSummary(Base):
-    __tablename__ = "conversation_summary"
+class ConversationGeneration(Base):
+    """会话生命周期版本。清空或彻底删除数据时 +1，旧任务据此放弃写回。
+
+    后台任务（摘要、记忆抽取）和跨十几秒的对话轮次都在删除边界之外运行：
+    它们读到的水位线、历史、档案可能已经被清掉，写回时若不做版本比对，
+    用户刚删掉的内容就会在几秒后重新出现。
+
+    这一行只存用户 id 和一个计数器，不含任何对话内容，因此 purge 也保留它：
+    删掉再重建会让版本回到 0，正好与清空前启动的任务撞上。
+    """
+
+    __tablename__ = "conversation_generation"
+
     siwe_user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    content: Mapped[str] = mapped_column(Text)
-    last_summarized_message_id: Mapped[int] = mapped_column(BigInteger, default=0)
-    version: Mapped[int] = mapped_column(Integer, default=0)
-    status: Mapped[str] = mapped_column(String(16), default="ok")
-    fail_count: Mapped[int] = mapped_column(Integer, default=0)
+    generation: Mapped[int] = mapped_column(BigInteger, default=0)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
@@ -78,6 +99,9 @@ class UserMemory(Base):
     与 user_profile 的分工：档案只放枚举/链号/代币符号，装不下的背景放这里。
     同一 subject 只允许一条 active —— 用部分唯一索引保证，不靠相似度去重。
     旧行改成 superseded 保留，可回溯用户什么时候改的主意。
+
+    不存向量：active 集被上一条唯一索引压到「主题数」量级，注入时整批取出来
+    按时间倒序就够，向量召回要为这个规模付一次 query embedding。
     """
 
     __tablename__ = "user_memory"
@@ -89,13 +113,6 @@ class UserMemory(Base):
             unique=True,
             postgresql_where=text("status = 'active'"),
         ),
-        Index(
-            "ix_user_memory_embedding",
-            "embedding",
-            postgresql_using="hnsw",
-            postgresql_with={"m": 16, "ef_construction": 64},
-            postgresql_ops={"embedding": "vector_cosine_ops"},
-        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -103,7 +120,6 @@ class UserMemory(Base):
     text: Mapped[str] = mapped_column(Text)
     memory_type: Mapped[str] = mapped_column(String(16))  # preference | constraint | profile
     subject: Mapped[str] = mapped_column(String(64))
-    embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM))
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     status: Mapped[str] = mapped_column(String(16), default="active")
     superseded_at: Mapped[datetime | None] = mapped_column(
@@ -116,6 +132,10 @@ class UserMemoryState(Base):
     """抽取水位线。没有它就无法判断「最近这批消息抽过没有」，会重复抽同一段。
 
     只记位置上不记轮数：轮次要靠 message 计数推，消息一删计数就错位。
+
+    claim_token / claim_expires_at 是抽取任务的租约：同一用户同一时刻只允许
+    一个任务在跑。多个后台任务同时抽同一段区间，除了白花一次模型调用，还会
+    互相覆盖 —— 慢的那个后写回，把水位线拉回去、并用自己的旧结论把新结论顶掉。
     """
 
     __tablename__ = "user_memory_state"
@@ -123,6 +143,10 @@ class UserMemoryState(Base):
     siwe_user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     last_extracted_message_id: Mapped[int] = mapped_column(BigInteger, default=0)
     fail_count: Mapped[int] = mapped_column(Integer, default=0)
+    claim_token: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    claim_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
@@ -151,64 +175,6 @@ class TokenRegistry(Base):
     raw_chain_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     decimals: Mapped[int] = mapped_column(Integer)
     is_whitelisted: Mapped[bool] = mapped_column(Boolean, default=True)
-
-
-class WorkflowPersistent(Base):
-    """写链路主表。运行态与归档同表；过期靠 expire_at 惰性判定，不做 TTL 自动删除。
-
-    expire_type 区分两种过期（从未广播 / 已广播未核实），这是 PRD 9 章的要求，
-    不能只存一个 expire_at 了事。
-    """
-
-    __tablename__ = "workflow_persistent"
-
-    workflow_id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    task_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
-    siwe_user_id: Mapped[str] = mapped_column(String(64), index=True)
-    siwe_address: Mapped[str] = mapped_column(String(64), index=True)
-    chain_id: Mapped[int] = mapped_column(Integer)
-    intent: Mapped[str] = mapped_column(String(32))
-    status: Mapped[str] = mapped_column(String(32), index=True)
-    slots_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    generated_tx_count: Mapped[int] = mapped_column(Integer, default=0)
-    max_tx_count: Mapped[int] = mapped_column(Integer, default=1)
-    approve_fingerprints: Mapped[list | None] = mapped_column(JSONB, nullable=True)
-    transaction_group_id: Mapped[str] = mapped_column(String(36), index=True)
-    group_status: Mapped[str] = mapped_column(String(16), default="idle")
-    expire_at: Mapped[int] = mapped_column(BigInteger, index=True)  # unix 秒
-    expire_type: Mapped[str] = mapped_column(String(24), default="NONE")
-    error_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    error_msg: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
-
-
-class WorkflowTxRecord(Base):
-    """单笔交易。tx_intent_snapshot 是 PREVIEW 幂等的载体：重复查询必须返回同一份，
-    不重建、不递增 generated_tx_count、expiresAt 不变。
-
-    nonce 在 broadcast 后回填，REPLACED 判定要用它和链上已用 nonce 比对——
-    只靠 getTransactionReceipt 判不出来，被替换的交易那个 hash 永远是 null。
-    """
-
-    __tablename__ = "workflow_tx_record"
-    __table_args__ = (UniqueConstraint("workflow_id", "index", name="uq_workflow_tx_index"),)
-
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    workflow_id: Mapped[str] = mapped_column(String(36), index=True)
-    index: Mapped[int] = mapped_column(Integer)
-    kind: Mapped[str] = mapped_column(String(16))  # approve | stake | transfer
-    tx_hash: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
-    tx_status: Mapped[str] = mapped_column(String(16), default="PENDING")
-    nonce: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    chain_id: Mapped[int] = mapped_column(Integer)
-    tx_intent_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
 
 
 class QuotaCounter(Base):
@@ -257,6 +223,25 @@ class RagKnowledgeBase(Base):
     embedding_version: Mapped[str] = mapped_column(String(64))
     created_by: Mapped[str] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class RagIndexVersion(Base):
+    """关键词索引版本，每个知识库一行。发布或停用文档时 +1。
+
+    索引是进程内对象，"该不该重建"此前靠每次查询把有效集读一遍、拿正文算指纹：
+    命中缓存也逃不掉一次全量读取。改成事件推进的版本号之后，查询只读这一行；
+    正文只在版本变化（或下文的有效期边界到达）时才读一次。
+    """
+
+    __tablename__ = "rag_index_version"
+
+    kb_id: Mapped[str] = mapped_column(
+        ForeignKey("rag_knowledge_base.id", ondelete="RESTRICT"), primary_key=True
+    )
+    revision: Mapped[int] = mapped_column(BigInteger, default=0)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -275,6 +260,9 @@ class RagDocument(Base):
     doc_category: Mapped[str] = mapped_column(String(64), index=True)
     version: Mapped[str] = mapped_column(String(64))
     checksum: Mapped[str] = mapped_column(String(64))
+    # 索引构建指纹：内容 + 切块器版本 + 切块参数 + 嵌入配置。checksum 只描述内容，
+    # 改切块参数时它不变，靠这一列判断切片是否过期。
+    index_signature: Mapped[str] = mapped_column(String(64), default="", server_default="")
     status: Mapped[str] = mapped_column(String(16), default="active")
     valid_from: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -283,7 +271,18 @@ class RagDocument(Base):
 
 class RagChunk(Base):
     __tablename__ = "rag_chunk"
-    __table_args__ = (UniqueConstraint("document_id", "ordinal", name="uq_rag_chunk_order"),)
+    __table_args__ = (
+        UniqueConstraint("document_id", "ordinal", name="uq_rag_chunk_order"),
+        # 相似度检索走的是 ORDER BY cosine_distance LIMIT k，没有这条索引就是全表扫。
+        # 见 scripts/rag_vector_index.py：既有库要 CONCURRENTLY 单独建，create_all 不会补。
+        Index(
+            "ix_rag_chunk_embedding",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     document_id: Mapped[str] = mapped_column(ForeignKey("rag_document.id", ondelete="CASCADE"), index=True)
     ordinal: Mapped[int] = mapped_column(Integer)
@@ -309,7 +308,7 @@ class RagIngestionJob(Base):
     idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     fingerprint: Mapped[str] = mapped_column(String(64))
     filename: Mapped[str] = mapped_column(String(255))
-    payload: Mapped[bytes] = mapped_column(LargeBinary, deferred=True)
+    payload: Mapped[bytes | None] = mapped_column(LargeBinary, deferred=True, nullable=True)
     document_metadata: Mapped[dict] = mapped_column(JSONB)
     status: Mapped[str] = mapped_column(String(16), default="queued", index=True)
     stage: Mapped[str] = mapped_column(String(16), default="queued")
@@ -323,3 +322,23 @@ class RagIngestionJob(Base):
     error_message: Mapped[str | None] = mapped_column(String(300), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ChatIdempotency(Base):
+    """客户端重试的去重记录：同一用户同一个 key 只跑一轮，重试直接取回上次的响应。
+
+    response 存的是已经组装好的响应体（不含引用正文之外的额外内容），
+    保留一天后由下一次带 key 的请求顺手删掉。
+    """
+
+    __tablename__ = "chat_idempotency"
+
+    siwe_user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    request_hash: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), default="running")
+    response: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+

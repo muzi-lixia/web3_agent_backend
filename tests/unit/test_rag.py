@@ -20,8 +20,7 @@ from web3_agent.rag.models import Citation, DocumentSpec
 from web3_agent.rag.chunker import split_document
 from web3_agent.rag.config import normalize_filters
 from web3_agent.rag.tool import build_rag_general_knowledge
-from web3_agent.rag.retriever import KnowledgeRetriever, NO_DOCUMENTS, UNAVAILABLE
-from web3_agent.rag.answer import render_answer
+from web3_agent.rag.retriever import KnowledgeRetriever, NO_DOCUMENTS, UNAVAILABLE, _select_evidence
 from web3_agent.rag.ingestion_job import prepare, ingest
 from web3_agent.rag.vector_store import active_scope
 from web3_agent.persistence.pg.orm_models import RagDocument
@@ -59,8 +58,8 @@ def test_chunking_retains_headings_overlap_and_long_content():
 
 def test_manifest_validation_and_dry_run_do_not_embed():
     spec=DocumentSpec.model_validate(json.loads((FIXTURES/"manifest.json").read_text())[0])
-    chunks,checksum=prepare(spec,FIXTURES,settings())
-    assert len(checksum)==64 and chunks and not spec.reviewed
+    chunks,checksum,signature=prepare(spec,FIXTURES,settings())
+    assert len(checksum)==64 and len(signature)==64 and chunks and not spec.reviewed
     with pytest.raises(ValueError):
         DocumentSpec.model_validate({**spec.model_dump(),"protocol_id":""})
     with pytest.raises(ValueError,match="时区"):
@@ -82,10 +81,25 @@ def test_ingestion_embeds_before_atomic_publication():
     spec=DocumentSpec.model_validate(json.loads((FIXTURES/"manifest.json").read_text())[0]).model_copy(update={"reviewed":True})
     async def embed(texts):
         return [[1.0]+[0.0]*1023 for _ in texts]
-    store=SimpleNamespace(validate_kb=AsyncMock(),publish=AsyncMock(return_value={"chunks":3}))
+    store=SimpleNamespace(validate_kb=AsyncMock(),publish=AsyncMock(return_value={"chunks":3}),
+                          plan_index=AsyncMock(return_value=("doc1",False)))
     result=asyncio.run(ingest(spec,FIXTURES,settings(),SimpleNamespace(embed_many=embed),store))
     assert result=={"chunks":3}
     assert len(store.publish.call_args.args[1])==len(store.publish.call_args.args[2])
+    # 索引指纹必须跟着发布一起落库，否则下次无法判断切片是不是过期了。
+    assert store.publish.call_args.kwargs["signature"]
+
+
+def test_unchanged_document_skips_embedding_entirely():
+    """同一份内容、同一套索引配置：一个向量都不该算。"""
+    spec=DocumentSpec.model_validate(json.loads((FIXTURES/"manifest.json").read_text())[0]).model_copy(update={"reviewed":True})
+    embedder=SimpleNamespace(embed_many=AsyncMock())
+    store=SimpleNamespace(validate_kb=AsyncMock(),publish=AsyncMock(),
+                          plan_index=AsyncMock(return_value=("doc1",True)))
+    result=asyncio.run(ingest(spec,FIXTURES,settings(),embedder,store))
+    assert result=={"document_id":"doc1","chunks":0,"unchanged":True}
+    embedder.embed_many.assert_not_awaited()
+    store.publish.assert_not_awaited()
 
 
 def test_pg_query_filters_scope_version_and_expiry_before_limit():
@@ -136,6 +150,23 @@ def test_retrieval_enforces_scope_limit_distance_and_returns_sources():
     assert kwargs["max_distance"]==.42
 
 
+def test_non_hybrid_hits_are_numbered_like_the_hybrid_path():
+    store=SimpleNamespace(has_documents=AsyncMock(return_value=True),
+        search=AsyncMock(return_value=[citation(chunk_id="a",content="第一段"),
+                                       citation(chunk_id="b",content="第二段")]))
+    embedder=SimpleNamespace(embed=AsyncMock(return_value=[0.0]*1024))
+    result=asyncio.run(KnowledgeRetriever(settings(),embedder,store).search("解锁",chain_id=1))
+    assert [hit["id"] for hit in result["hits"]]==["S1","S2"]
+
+
+def test_evidence_selection_skips_oversized_chunks_and_stops_at_limit():
+    chunks=[citation(chunk_id="a",content="x"*50),citation(chunk_id="b",content="yy"),
+            citation(chunk_id="c",content="zz"),citation(chunk_id="d",content="ww")]
+    selected=_select_evidence(chunks,max_chars=4,limit=2)
+    assert [item["chunk_id"] for item in selected]==["b","c"]
+    assert [item["id"] for item in selected]==["S1","S2"]
+
+
 def test_store_failure_degrades_without_rules_or_sensitive_exception():
     store=SimpleNamespace(has_documents=AsyncMock(side_effect=RuntimeError("secret DB URL")))
     result=asyncio.run(KnowledgeRetriever(settings(),None,store).search("解锁",chain_id=1,protocol_id="100"))
@@ -152,14 +183,6 @@ def test_tool_exposes_optional_filters_and_allows_global_terms():
     assert retriever.search.call_args.kwargs["chain_id"] == 56
 
 
-def test_rag_translation_is_presented_without_literal_matching():
-    hits = [citation(content="The unlock period is 7 days.").model_dump()]
-    draft = "解锁期为七天。[S1]"
-    answer = render_answer(draft, hits)
-    assert answer.startswith(draft)
-    assert "https://example.com/rules" not in answer
-
-
 def test_document_success_is_not_live_chain_evidence():
     records=[ToolCallRecord(name="rag_general_knowledge",ok=True)]
     assert _lacks_evidence(Intent.QUERY_STAKE,records)
@@ -173,7 +196,7 @@ def test_knowledge_routes_read_and_stake_commands_still_route_write():
     assert route_intent(command,confidence_threshold=.75).route is Route.WRITE
 
 
-def test_graph_uses_original_query_and_passes_explicit_slots_as_filters():
+def test_graph_retrieves_with_the_original_query():
     seen=[]
     class Model:
         count=0
@@ -184,7 +207,7 @@ def test_graph_uses_original_query_and_passes_explicit_slots_as_filters():
         async def run(self,name,args,source):
             seen.append(args)
             return json.dumps({"status":"success","hits":[citation().model_dump()]},ensure_ascii=False),ToolCallRecord(name=name,args=args,ok=True)
-    state=initial_state([],"池100多久解锁",intent=Intent.QUERY_KNOWLEDGE,slots={"protocol_id":"100"},chain_id=1)
+    state=initial_state([],"池100多久解锁",intent=Intent.QUERY_KNOWLEDGE)
     model=Model()
     result=asyncio.run(build_read_graph(None,Runner(),5,rag_answer_model=model).ainvoke(state))
     assert seen==[{"query_str":"池100多久解锁","kb_id":"default"}]
@@ -205,7 +228,7 @@ def test_agent_write_command_never_enters_rag_graph(monkeypatch):
     loop._settings=settings()
     loop._llm.extract_intent=AsyncMock(return_value=LlmOutput(intent=Intent.STAKE,confidence=.99,slots={
         "stakeContractAliasOrAddress":"100","tokenSymbol":"ETH","humanAmount":"0.1"}))
-    outcome=asyncio.run(loop.handle(None,siwe_user_id="u",wallet_address="0x"+"1"*40,chain_id=1,user_message="帮我质押0.1ETH到池100"))
+    outcome=asyncio.run(loop.handle(siwe_user_id="u",wallet_address="0x"+"1"*40,chain_id=1,user_message="帮我质押0.1ETH到池100"))
     from web3_agent.config.constants import MSG_WRITE_NOT_ENABLED
     assert graph.calls==0 and outcome.content==MSG_WRITE_NOT_ENABLED and outcome.citations==[]
 
@@ -216,7 +239,7 @@ def test_agent_never_keeps_fabricated_rules_when_retrieval_failed(monkeypatch):
     loop=_without_db(_loop(graph,Intent.QUERY_KNOWLEDGE),monkeypatch)
     loop._settings=settings()
     loop._llm.extract_intent=AsyncMock(return_value=LlmOutput(intent=Intent.QUERY_KNOWLEDGE,confidence=.99,slots={"protocol_id":"100"}))
-    outcome=asyncio.run(loop.handle(None,siwe_user_id="u",wallet_address="0x"+"1"*40,chain_id=1,user_message="池100有罚金吗"))
+    outcome=asyncio.run(loop.handle(siwe_user_id="u",wallet_address="0x"+"1"*40,chain_id=1,user_message="池100有罚金吗"))
     assert outcome.content==NO_DOCUMENTS and outcome.degraded and outcome.citations==[]
 
 
@@ -230,7 +253,7 @@ def test_agent_returns_rag_model_answer_with_sources_without_literal_validation(
     loop=_without_db(_loop(Graph(),Intent.QUERY_KNOWLEDGE),monkeypatch)
     loop._settings=settings()
     loop._llm.extract_intent=AsyncMock(return_value=LlmOutput(intent=Intent.QUERY_KNOWLEDGE,confidence=.99,slots={"protocol_id":"100"}))
-    outcome=asyncio.run(loop.handle(None,siwe_user_id="u",wallet_address="0x"+"1"*40,chain_id=1,user_message="池100有罚金吗"))
+    outcome=asyncio.run(loop.handle(siwe_user_id="u",wallet_address="0x"+"1"*40,chain_id=1,user_message="池100有罚金吗"))
     assert outcome.content.startswith("罚金为0%。[S1]")
     assert not outcome.degraded and outcome.citations[0]["protocol_id"] == "100"
 
@@ -264,7 +287,7 @@ def test_question_tail_protocol_id_reaches_intent_model(monkeypatch):
     extract=AsyncMock(return_value=LlmOutput(intent=Intent.QUERY_KNOWLEDGE,confidence=.99,slots={}))
     loop._llm.extract_intent=extract
     text="请参考协议官方规则解释提前退出的各种限制条件，尤其是罚金和冷却期，池子ID是100"
-    asyncio.run(loop.handle(None,siwe_user_id="u",wallet_address="0x"+"1"*40,chain_id=1,user_message=text))
+    asyncio.run(loop.handle(siwe_user_id="u",wallet_address="0x"+"1"*40,chain_id=1,user_message=text))
     assert extract.call_args.args[1]==text
 
 
@@ -278,7 +301,7 @@ def test_empty_retrieval_ends_graph_without_model_inventing_rules():
             return AIMessage(content="",tool_calls=[{"name":"rag_general_knowledge","args":{},"id":"x"}])
     model=Model()
     runner=SimpleNamespace(run=AsyncMock(return_value=(json.dumps({"error":"E602","status":"empty","hits":[]}),ToolCallRecord(name="rag_general_knowledge",ok=False,error="E602"))))
-    state=initial_state([],"池100多久解锁",intent=Intent.QUERY_KNOWLEDGE,slots={"protocol_id":"100"},chain_id=1)
+    state=initial_state([],"池100多久解锁",intent=Intent.QUERY_KNOWLEDGE)
     result=asyncio.run(build_read_graph(model,runner,5).ainvoke(state))
     assert model.count==0 and result["rag_status"]=="empty" and result["rag_citations"]==[]
 
@@ -305,10 +328,7 @@ def test_local_document_without_url_retains_citation_title_and_version():
     spec=DocumentSpec(path="local.md",title="内部知识",doc_category="faq",version="v1",valid_from="2026-01-01T00:00:00Z")
     assert spec.source_url == ""
     hits=[citation(source_url="").model_dump()]
-    answer=render_answer("解锁期为7天。[S1]",hits)
-    assert answer == "解锁期为7天。[S1]"
     assert hits[0]["title"] == "测试规则" and hits[0]["version"] == "v1"
-    assert "http" not in answer and "None" not in answer
 
 
 def test_chunk_provenance_is_exact_in_normalized_text_and_overlap():
@@ -358,3 +378,15 @@ def test_real_knowledge_base_repository_guards_status_and_model(state,model,expe
         assert exc.value.code==expected
     else:
         assert asyncio.run(KnowledgeBaseRepository().require_active("default",db)) is row
+
+
+def test_index_signature_tracks_chunking_and_embedding_config():
+    """内容没变但切块参数变了，签名必须变，否则旧切片会被当成 unchanged 留下。"""
+    from web3_agent.rag.ingestion_job import index_signature
+    checksum = "c" * 64
+    base = index_signature(checksum, settings())
+    assert base == index_signature(checksum, settings())
+    assert index_signature(checksum, settings(rag_chunk_tokens=500)) != base
+    assert index_signature(checksum, settings(rag_chunk_overlap=0.2)) != base
+    assert index_signature(checksum, settings(rag_embedding_version="v2")) != base
+    assert index_signature("d" * 64, settings()) != base

@@ -5,6 +5,7 @@ description = "Web3 链上智能 Agent 助手 — 后端"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi",
+    "starlette",
     "uvicorn[standard]",
     "pydantic>=2",
     "pydantic-settings",
@@ -13,6 +14,7 @@ dependencies = [
     "httpx",
     "pyjwt",
     "eth-account",
+    "eth-utils",
     "langchain-core",
     "langchain-ollama",
     "langgraph",

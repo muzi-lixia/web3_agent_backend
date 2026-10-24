@@ -8,7 +8,7 @@ def answer_messages(question: str, citations: list[dict], context: str = ""):
         f"【{hit['id']}】\n{hit['content']}" for hit in citations
     )
     history = (
-        f"【对话上下文】\n此前用户问题：\n{context}\n\n"
+        f"【此前对话｜仅用于理解指代，不是证据】\n{context}\n\n"
         if context else ""
     )
     prompt = (

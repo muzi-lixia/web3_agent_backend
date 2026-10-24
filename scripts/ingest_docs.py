@@ -43,7 +43,7 @@ async def main():
         parser.error("所有发布文档必须 reviewed=true")
     init_engine(settings)
     try:
-        from web3_agent.domain.memory.embedder import Embedder
+        from web3_agent.rag.embedder import Embedder
         knowledge_bases = KnowledgeBaseRepository(embedding_profile(settings))
         await knowledge_bases.check_schema()
         await knowledge_bases.ensure_default()

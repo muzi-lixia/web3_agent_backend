@@ -68,6 +68,8 @@ class Jobs:
                 return deepcopy(row)
     async def progress(self,job_id,token,stage,**kwargs): self.rows[job_id].update(stage=stage,**kwargs)
     async def fail(self,job_id,token,code,message): self.rows[job_id].update(status="failed",error=dict(code=code,message=message))
+    async def succeed(self,job_id,token,document_id,chunks):
+        self.rows[job_id].update(status="succeeded",stage="succeeded",document_id=document_id)
     async def retry(self,job_id,max_attempts):
         self.rows[job_id].update(status="queued",stage="queued",error=None)
         return self.view(job_id)
@@ -86,6 +88,9 @@ class Store:
             chain_id=spec.chain_id,protocol_id=spec.protocol_id,updated_at="2026-01-01T00:00:00Z",
             content=c.content,distance=0) for i,c in enumerate(chunks,1)])
         self.jobs.rows[kwargs["job_id"]].update(status="succeeded",stage="succeeded",document_id=str(uuid4()))
+    async def plan_index(self,spec,checksum,signature):
+        # 桩里每次都是新文档；unchanged 分支由 test_rag.py 单独覆盖。
+        return "pending", False
     async def has_documents(self,**filters):
         await self.validate_kb(filters.get("kb_id","default"))
         return any(h.kb_id==filters.get("kb_id","default") for h in self.hits)
@@ -277,7 +282,7 @@ def test_pdf_pages_and_offsets_survive_pipeline():
     parsed=parse_document_with_spans(target.getvalue(),"pages.pdf")
     assert [p[2] for p in parsed.page_spans]==[1,2]
     spec=DocumentSpec(path="pages.pdf",**METADATA)
-    chunks,_=prepare_content(spec,parsed,settings())
+    chunks,_,_=prepare_content(spec,parsed,settings())
     assert chunks[0].page_number==1 and chunks[-1].page_end==2
     assert all(parsed.text[c.char_start:c.char_end]==c.content for c in chunks)
     assert all(c.token_count>0 and c.token_count_method=="approx_v1" for c in chunks)

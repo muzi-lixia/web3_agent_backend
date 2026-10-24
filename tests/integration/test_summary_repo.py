@@ -1,4 +1,7 @@
-"""摘要仓储：区间计算、水位线幂等、清空后不复活。走真实 PG，缺库时整组跳过。"""
+"""摘要存储：区间计算、删旧插新的幂等、清空后不复活。走真实 PG，缺库时整组跳过。
+
+摘要就是 conversation_message 里 role='summary' 的一行，它的 id 同时是水位线。
+"""
 
 from __future__ import annotations
 
@@ -10,7 +13,7 @@ import pytest
 from web3_agent.config.settings import get_settings
 from web3_agent.persistence.pg import base as pg
 from web3_agent.persistence.pg.orm_models import ConversationMessage
-from web3_agent.persistence.pg.repositories import conversation_repo, summary_repo
+from web3_agent.persistence.pg.repositories import conversation_repo
 
 
 def _pg_ready() -> bool:
@@ -48,7 +51,6 @@ async def _seed(uid: str, count: int) -> list[int]:
 async def _cleanup(uid: str) -> None:
     async with pg.session_scope() as db:
         await conversation_repo.clear_user_messages(db, uid)
-        await summary_repo.delete(db, uid)
 
 
 def _run(coro):
@@ -116,41 +118,87 @@ def test_range_empty_when_all_inside_window() -> None:
         _run(lambda: _cleanup(uid))
 
 
-def test_watermark_rejects_stale_write() -> None:
+def test_summary_row_does_not_take_a_window_slot() -> None:
+    """摘要行自己也有 id，但它不是对话内容。
+
+    算进窗口的话，每压一次就会把一条真实消息挤出窗口之外 —— 越压越早，
+    最后摘要覆盖的区间和窗口对不上。
+    """
     uid = _uid()
 
-    async def flow() -> tuple[bool, bool, bool]:
+    async def flow() -> tuple[int, int | None]:
+        await _seed(uid, 45)
         async with pg.session_scope() as db:
-            created = await summary_repo.upsert_with_watermark(
-                db,
-                siwe_user_id=uid,
-                content='{"core_needs": ["旧"]}',
-                last_summarized_message_id=5,
-                expected_watermark=None,
+            await conversation_repo.write_summary(
+                db, uid, content='{"core_needs":["x"]}', expected_id=None, expected_generation=0
             )
         async with pg.session_scope() as db:
-            stale = await summary_repo.upsert_with_watermark(
-                db,
-                siwe_user_id=uid,
-                content='{"core_needs": ["过期结果"]}',
-                last_summarized_message_id=9,
-                expected_watermark=3,
+            return await conversation_repo.summarizable_range(
+                db, uid, window=20, since_id=0, cap=30
             )
-        async with pg.session_scope() as db:
-            fresh = await summary_repo.upsert_with_watermark(
-                db,
-                siwe_user_id=uid,
-                content='{"core_needs": ["新"]}',
-                last_summarized_message_id=9,
-                expected_watermark=5,
-            )
-        return created, stale, fresh
 
     try:
-        created, stale, fresh = _run(flow)
-        assert created is True
+        count, _ = _run(flow)
+        # 45 条消息 + 1 条摘要，窗口 20 仍然只数消息：挤出 25 条。
+        assert count == 25
+    finally:
+        _run(lambda: _cleanup(uid))
+
+
+def test_write_rejects_when_someone_else_wrote_first() -> None:
+    uid = _uid()
+
+    async def flow() -> tuple[bool, bool, str]:
+        async with pg.session_scope() as db:
+            first = await conversation_repo.write_summary(
+                db, uid, content='{"core_needs":["先到的"]}',
+                expected_id=None, expected_generation=0,
+            )
+        # 第二个任务也是从「还没有摘要」开始读的，它的区间更旧，必须放弃。
+        async with pg.session_scope() as db:
+            stale = await conversation_repo.write_summary(
+                db, uid, content='{"core_needs":["迟到的"]}',
+                expected_id=None, expected_generation=0,
+            )
+        async with pg.session_scope() as db:
+            row = await conversation_repo.latest_summary(db, uid)
+        return first, stale, (row.content if row else "")
+
+    try:
+        first, stale, content = _run(flow)
+        assert first is True
         assert stale is False
-        assert fresh is True
+        assert "先到的" in content
+    finally:
+        _run(lambda: _cleanup(uid))
+
+
+def test_write_replaces_and_advances_watermark() -> None:
+    uid = _uid()
+
+    async def flow() -> tuple[bool, int | None, int]:
+        async with pg.session_scope() as db:
+            await conversation_repo.write_summary(
+                db, uid, content='{"core_needs":["第一版"]}',
+                expected_id=None, expected_generation=0,
+            )
+        async with pg.session_scope() as db:
+            row = await conversation_repo.latest_summary(db, uid)
+            old_id = row.id if row else None
+        async with pg.session_scope() as db:
+            written = await conversation_repo.write_summary(
+                db, uid, content='{"core_needs":["第二版"]}',
+                expected_id=old_id, expected_generation=0,
+            )
+        async with pg.session_scope() as db:
+            row = await conversation_repo.latest_summary(db, uid)
+        return written, old_id, (row.id if row else -1)
+
+    try:
+        written, old_id, new_id = _run(flow)
+        assert written is True
+        # 删旧插新：新行的 id 更大，水位线跟着前进，而不是原地 UPDATE。
+        assert old_id is not None and new_id > old_id
     finally:
         _run(lambda: _cleanup(uid))
 
@@ -158,68 +206,47 @@ def test_watermark_rejects_stale_write() -> None:
 def test_stale_write_after_clear_does_not_resurrect() -> None:
     uid = _uid()
 
-    async def flow() -> tuple[bool, bool, str]:
+    async def flow() -> tuple[bool, str]:
         async with pg.session_scope() as db:
-            await summary_repo.upsert_with_watermark(
-                db,
-                siwe_user_id=uid,
-                content='{"core_needs": ["要查余额"]}',
-                last_summarized_message_id=5,
-                expected_watermark=None,
+            await conversation_repo.write_summary(
+                db, uid, content='{"core_needs":["要查余额"]}',
+                expected_id=None, expected_generation=0,
             )
-        # 清空：消息与摘要一起删
+        # 清空：摘要行跟消息一起删
         async with pg.session_scope() as db:
             await conversation_repo.clear_user_messages(db, uid)
-            await summary_repo.delete(db, uid)
-        # 后台任务拿着旧水位线写回
+        # 后台任务拿着清空前读到的 id 写回
         async with pg.session_scope() as db:
-            written = await summary_repo.upsert_with_watermark(
-                db,
-                siwe_user_id=uid,
-                content='{"core_needs": ["清空前的对话"]}',
-                last_summarized_message_id=5,
-                expected_watermark=5,
+            written = await conversation_repo.write_summary(
+                db, uid, content='{"core_needs":["清空前的对话"]}',
+                expected_id=1, expected_generation=0,
             )
         async with pg.session_scope() as db:
-            row = await summary_repo.get(db, uid)
-        return written, row is None, (row.content if row else "")
+            row = await conversation_repo.latest_summary(db, uid)
+        return written, (row.content if row else "")
 
     try:
-        written, gone, content = _run(flow)
+        written, content = _run(flow)
         assert written is False
-        assert gone is True
         assert content == ""
     finally:
         _run(lambda: _cleanup(uid))
 
 
-def test_mark_failed_counts_and_success_resets() -> None:
+def test_write_after_generation_bump_is_rejected() -> None:
+    """用户清空时如果原本没有摘要行，删除条数判断不出来 —— 版本号是最后一道闸。"""
     uid = _uid()
 
-    async def flow() -> tuple[int, str, int]:
+    async def flow() -> bool:
         async with pg.session_scope() as db:
-            await summary_repo.mark_failed(db, uid)
+            await conversation_repo.bump_generation(db, uid)
         async with pg.session_scope() as db:
-            await summary_repo.mark_failed(db, uid)
-        async with pg.session_scope() as db:
-            row = await summary_repo.get(db, uid)
-            failed_count, status = row.fail_count, row.status
-        async with pg.session_scope() as db:
-            await summary_repo.upsert_with_watermark(
-                db,
-                siwe_user_id=uid,
-                content='{"core_needs": ["x"]}',
-                last_summarized_message_id=5,
-                expected_watermark=0,
+            return await conversation_repo.write_summary(
+                db, uid, content='{"core_needs":["清空前的对话"]}',
+                expected_id=None, expected_generation=0,
             )
-        async with pg.session_scope() as db:
-            row = await summary_repo.get(db, uid)
-        return failed_count, status, row.fail_count
 
     try:
-        failed_count, status, after_success = _run(flow)
-        assert failed_count == 2
-        assert status == "failed"
-        assert after_success == 0
+        assert _run(flow) is False
     finally:
         _run(lambda: _cleanup(uid))

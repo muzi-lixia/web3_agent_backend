@@ -26,14 +26,21 @@ class IngestionWorker:
                 content = await asyncio.to_thread(parse_document_with_spans, job["data"], job["filename"],
                     max_bytes=self.settings.rag_upload_max_bytes, max_text_chars=self.settings.rag_max_text_chars)
                 await self.jobs.progress(job_id, token, "chunking")
-                chunks, checksum = await asyncio.to_thread(prepare_content, spec, content, self.settings)
+                chunks, checksum, signature = await asyncio.to_thread(
+                    prepare_content, spec, content, self.settings)
+                # 先判"要不要重建"，再决定花不花这篇文档的向量化。
+                document_id, unchanged = await self.store.plan_index(spec, checksum, signature)
+                if unchanged:
+                    await self.jobs.succeed(job_id, token, document_id, 0)
+                    return
                 await self.jobs.progress(job_id, token, "embedding", total_chunks=len(chunks))
                 async def progress(count):
                     await self.jobs.progress(job_id, token, "embedding", embedded_chunks=count)
                 vectors = await embed_chunks(spec, chunks, self.settings, self.embedder, progress)
                 await self.jobs.progress(job_id, token, "indexing")
                 # Atomic vector publication and succeeded job state, with claim fencing.
-                await self.store.publish(spec, chunks, vectors, checksum, job_id=job_id, claim_token=token)
+                await self.store.publish(spec, chunks, vectors, checksum, signature=signature,
+                                         job_id=job_id, claim_token=token)
         except asyncio.CancelledError:
             # Leave the durable lease for another worker to reclaim on restart.
             raise

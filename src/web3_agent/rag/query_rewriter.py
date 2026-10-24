@@ -7,6 +7,11 @@ class QueryRewriter:
         self.settings = settings
 
     async def rewrite(self, query, context=""):
+        """返回 (resolved, variants)。
+
+        resolved 是消解了指代之后的问题，召回、重排、回答三个阶段都用它；
+        variants 是召回用的几路表达（原句始终保留），只有这一层允许改写。
+        """
         async with httpx.AsyncClient(timeout=self.settings.rag_rewrite_timeout_seconds) as client:
             response = await client.post(self.settings.ollama_base_url.rstrip("/")+"/api/chat", json={
                 "model": self.settings.ollama_model, "stream": False, "format": "json",
@@ -19,4 +24,7 @@ class QueryRewriter:
             value = json.loads(response.json()["message"]["content"])["query"]
         if not isinstance(value, str) or len(value) > 1000:
             raise ValueError("invalid rewrite")
-        return [query] if not value.strip() or value.strip() == query else [query, value.strip()]
+        resolved = value.strip()
+        if not resolved or resolved == query:
+            return query, [query]
+        return resolved, [query, resolved]

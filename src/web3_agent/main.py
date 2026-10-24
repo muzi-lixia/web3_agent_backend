@@ -23,24 +23,23 @@ from web3_agent.common.exceptions import ModelUnavailable
 from web3_agent.common.logging_setup import setup_logging
 from web3_agent.config.constants import ToolGroup
 from web3_agent.config.settings import Settings, get_settings
-from web3_agent.domain.memory.embedder import Embedder
 from web3_agent.domain.memory.extractor import MemoryExtractor
 from web3_agent.domain.memory.summarizer import Summarizer
 from web3_agent.domain.quotas import QuotaController
 from web3_agent.middlewares.error_handler_middleware import register_exception_handlers
 from web3_agent.middlewares.trace_middleware import TraceMiddleware
-from web3_agent.persistence.conversation_context import ConversationContext
 from web3_agent.persistence.pg.base import create_all, dispose_engine, init_engine, session_scope
 from web3_agent.persistence.pg.repositories import nonce_repo, quota_repo
 from web3_agent.persistence.pg.repositories.audit_repo import AuditLogger
-from web3_agent.web3.chain_adapter import ChainAdapter
-from web3_agent.rag.retriever import KnowledgeRetriever
-from web3_agent.rag.vector_store import PgKnowledgeStore
-from web3_agent.rag.tool import build_rag_general_knowledge
+from web3_agent.rag.embedder import Embedder
 from web3_agent.rag.jobs import JobRepository
-from web3_agent.rag.models import embedding_profile
 from web3_agent.rag.knowledge_bases import KnowledgeBaseRepository
+from web3_agent.rag.models import embedding_profile
+from web3_agent.rag.retriever import KnowledgeRetriever
+from web3_agent.rag.tool import build_rag_general_knowledge
+from web3_agent.rag.vector_store import PgKnowledgeStore
 from web3_agent.rag.worker import IngestionWorker
+from web3_agent.web3.chain_adapter import ChainAdapter
 from web3_agent.web3.tools.read.get_asset_balance import build_get_asset_balance
 from web3_agent.web3.tools.read.get_stake_info import build_get_stake_info
 from web3_agent.web3.tools.read.get_transaction_records import build_get_transaction_records
@@ -80,7 +79,7 @@ def build_container(settings: Settings) -> Container:
         build_get_asset_balance(adapter), ToolGroup.LLM_VISIBLE, mutating=False
     )
     registry.register(
-        build_get_transaction_records(adapter, settings), ToolGroup.LLM_VISIBLE, mutating=False
+        build_get_transaction_records(settings), ToolGroup.LLM_VISIBLE, mutating=False
     )
     registry.register(
         build_get_stake_info(adapter, settings.stake_contracts),
@@ -102,10 +101,6 @@ def build_container(settings: Settings) -> Container:
 
     llm = LlmAdapter(settings)
     runner = ToolRunner(registry)
-    conversation = ConversationContext(
-        max_messages=settings.conversation_max_messages,
-        max_chars=settings.conversation_max_chars,
-    )
     audit = AuditLogger()
     quota = QuotaController(settings)
 
@@ -113,16 +108,12 @@ def build_container(settings: Settings) -> Container:
         settings=settings,
         llm=llm,
         guard=JsonGuard(),
-        conversation=conversation,
         audit=audit,
         model_with_tools=llm.bind_tools(registry.llm_tools()),
         runner=runner,
-        embedder=embedder,
     )
     summarizer = Summarizer(settings=settings, llm=llm, audit=audit, quota=quota)
-    memory = MemoryExtractor(
-        settings=settings, llm=llm, embedder=embedder, audit=audit, quota=quota
-    )
+    memory = MemoryExtractor(settings=settings, llm=llm, audit=audit, quota=quota)
     return Container(
         settings=settings,
         adapter=adapter,

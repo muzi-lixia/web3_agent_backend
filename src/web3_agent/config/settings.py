@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -17,6 +18,11 @@ class Settings(BaseSettings):
 
     app_env: str = "dev"
     log_level: str = "INFO"
+
+    # --- 部署：反代层数 ---
+    # 0 表示直接对外（取 socket 对端地址）。部署在 N 层反向代理之后必须改成实际层数，
+    # 否则匿名请求的限流键全部落到代理 IP 上，整站共享一个桶。
+    trusted_proxy_hops: int = 0
 
     # --- 存储：PostgreSQL 单一存储，无缓存中间件 ---
     database_url: str = "postgresql+asyncpg://postgres:postgres@127.0.0.1:5433/web3_agent"
@@ -39,6 +45,11 @@ class Settings(BaseSettings):
     # --- Agent ---
     confidence_threshold: float = 0.75
     read_max_react_steps: int = 5
+    # 单轮的三条边界各管一层：模型步数（上面那条）、下游请求数、整轮时间。
+    # 一条模型消息可以带多个工具调用，一个工具又能并发打出一串下游请求，
+    # 只数步数管不住后两层。
+    turn_max_downstream_calls: int = 24  # RPC、区块浏览器、向量化共用，各自分开计数
+    turn_timeout_seconds: float = 90
     conversation_max_messages: int = 20
     # 条数管不住体积：一条 50 笔交易的直出文本就有 7000 字符，
     # 两三轮下来会把 num_ctx 挤满，而 Ollama 超限是静默截断。
@@ -50,20 +61,21 @@ class Settings(BaseSettings):
     summary_field_max_chars: int = 200
     summary_field_max_items: int = 50
     summary_render_chars: int = 600
-    summary_fail_max: int = 3
 
     # --- 长期记忆：结构化档案 ---
     profile_render_chars: int = 400
     profile_token_max_items: int = 5
 
-    # --- 长期记忆：自由文本（V2，向量）---
+    # --- 长期记忆：自由文本（V2）---
     memory_trigger_messages: int = 10  # ≈5 轮
     memory_batch_cap: int = 20
     memory_fail_max: int = 3
+    # 抽取租约。一次抽取只有一次模型调用，正常几十秒内结束；这个值只决定
+    # 进程被杀死之后，该用户的长期记忆要等多久才会重新开始抽取。
+    memory_claim_ttl_seconds: int = 300
+    # 软记忆每轮最多注入几条。active 集本身只有「主题数」那么多，
+    # 这里按最近写入取前 N 条，不做相似度筛选。
     memory_recall_limit: int = 3
-    # 余弦距离上限（= 1 - 相似度）。不是照抄 0.85 那个相似度：bge-m3 对同域短句
-    # 的相似度普遍偏高，两个阈值不在同一量纲上。这个值在本机语料上标定过。
-    memory_recall_max_distance: float = 0.42
     memory_constraint_max: int = 5
     memory_render_chars: int = 400
 
@@ -97,6 +109,7 @@ class Settings(BaseSettings):
     rag_rerank_min_score: float | None = None
     rag_rewrite_enabled: bool = False
     rag_rewrite_timeout_seconds: float = Field(default=3, gt=0, le=15)
+    rag_degraded_cache_ttl_seconds: float = Field(default=10, ge=0, le=60)
     rag_cache_ttl_seconds: float = Field(default=600, ge=0, le=3600)
     rag_cache_max_entries: int = Field(default=128, ge=1, le=10000)
 
@@ -125,8 +138,9 @@ class Settings(BaseSettings):
     langsmith_endpoint: str = "https://api.smith.langchain.com"
 
     # --- 鉴权（V1a 只读匿名可访问；写链路需要）---
-    jwt_secret: str = "dev-only-change-me-0123456789abcdef"
-    jwt_algorithm: str = "HS256"
+    # 32 字节下限是 HS256 的安全基线，配短了启动就失败，不留到线上才发现。
+    jwt_secret: str = Field(min_length=32)
+    jwt_algorithm: Literal["HS256", "HS384", "HS512"] = "HS256"
     jwt_ttl_seconds: int = 7200
     # SIWE 消息里的 domain / uri 必须与本站一致，防钓鱼页面拿本站 nonce 签出跨站消息
     siwe_domain: str = "localhost"

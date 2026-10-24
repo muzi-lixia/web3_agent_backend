@@ -13,24 +13,30 @@ from web3_agent.common.types import ToolCallRecord
 from web3_agent.config.constants import CallSource, Intent
 
 WALLET = "0x63a9f8df422e1983d42565234557d46d18dbece9"
-PAYLOAD = {
-    "address": WALLET,
-    "records": [
-        {
-            "chainId": 1,
-            "hash": "0x" + "a" * 64,
-            "blockNumber": 21000000,
-            "timeStamp": 1730000000,
-            "from": WALLET,
-            "to": "0x1111111111111111111111111111111111111111",
-            "value": "50000000000000000",
-            "decimals": 18,
-            "tokenSymbol": None,
-            "contractAddress": None,
-            "source": "txlist",
-        }
-    ],
-}
+COUNTERPARTY = "0x1111111111111111111111111111111111111111"
+
+
+def _event(value: str, *, decimals: int = 18, symbol: str | None = None,
+           sender: str = WALLET, recipient: str = COUNTERPARTY,
+           source: str = "txlist", contract: str | None = None) -> dict:
+    return {"source": source, "from": sender, "to": recipient, "value": value,
+            "decimals": decimals, "tokenSymbol": symbol, "contractAddress": contract}
+
+
+def _record(*events: dict, chain_id: int = 1, hash_: str | None = None,
+            sender: str = WALLET, recipient: str = COUNTERPARTY) -> dict:
+    return {
+        "chainId": chain_id,
+        "hash": hash_ or "0x" + "a" * 64,
+        "blockNumber": 21000000,
+        "timeStamp": 1730000000,
+        "from": sender,
+        "to": recipient,
+        "events": list(events),
+    }
+
+
+PAYLOAD = {"address": WALLET, "records": [_record(_event("50000000000000000"))]}
 
 
 def test_render_keeps_amount_and_full_hash() -> None:
@@ -46,22 +52,46 @@ def test_render_marks_incoming_and_token_decimals() -> None:
     payload = {
         "address": WALLET,
         "records": [
-            {
-                "chainId": 1,
-                "hash": "0x" + "b" * 64,
-                "timeStamp": 1730000000,
-                "from": "0x2222222222222222222222222222222222222222",
-                "to": WALLET,
-                "value": "1500000",
-                "decimals": 6,
-                "tokenSymbol": "USDC",
-            }
+            _record(
+                _event("1500000", decimals=6, symbol="USDC", source="tokentx",
+                       sender="0x2222222222222222222222222222222222222222", recipient=WALLET)
+            )
         ],
     }
 
     text = render_transactions(payload)
 
     assert "转入 1.5 USDC" in text
+
+
+def test_one_transaction_shows_every_asset_movement() -> None:
+    """swap：一笔交易里有一进一出两条代币事件，都必须出现。"""
+    record = _record(
+        _event("0", source="txlist"),                                   # 调用 router，无原生转账
+        _event("100000000", decimals=6, symbol="USDC", source="tokentx"),
+        _event("20000000000000000", symbol="WETH", source="tokentx",
+               sender=COUNTERPARTY, recipient=WALLET),
+    )
+
+    text = render_transactions({"address": WALLET, "records": [record]})
+
+    assert "转出 100 USDC" in text and "转入 0.02 WETH" in text
+    # 零值原生腿是合约调用本身，有非零事件时不该占位置。
+    assert "0 ETH" not in text
+
+
+def test_all_zero_events_read_as_contract_call() -> None:
+    text = render_transactions({"address": WALLET, "records": [_record(_event("0"))]})
+    assert "无资产变动" in text
+
+
+def test_many_events_are_capped_with_explicit_count() -> None:
+    record = _record(*[_event("1000000", decimals=6, symbol=f"T{i}", source="tokentx")
+                       for i in range(10)])
+
+    text = render_transactions({"address": WALLET, "records": [record]})
+
+    assert "另有 2 项" in text
 
 
 def test_render_empty_records_says_so() -> None:

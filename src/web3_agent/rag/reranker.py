@@ -2,11 +2,16 @@
 import math
 import httpx
 
+from web3_agent.common.exceptions import BudgetExhausted
+from web3_agent.common.metering import Resource, reserve
+
 class HttpReranker:
     def __init__(self, settings):
         self.settings = settings
 
     async def rerank(self, query, candidates):
+        if not reserve(Resource.EMBEDDING):
+            raise BudgetExhausted("本轮重排次数已达上限")
         async with httpx.AsyncClient(timeout=self.settings.rag_rerank_timeout_seconds) as client:
             response = await client.post(self.settings.rag_rerank_url, json={
                 "query": query, "texts": [c.content for c in candidates], "truncate": True,

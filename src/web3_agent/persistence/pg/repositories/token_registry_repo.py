@@ -1,4 +1,4 @@
-"""token_registry 读取。数据由 scripts/init_registries.py 导入。"""
+"""token_registry 读取。"""
 
 from __future__ import annotations
 

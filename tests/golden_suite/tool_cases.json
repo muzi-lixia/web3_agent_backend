@@ -95,7 +95,8 @@
       "intent": "query_tx",
       "route": "read",
       "tools": ["get_transaction_records"],
-      "slots": { "limit": 5 }
+      "slots": {},
+      "note": "条数固定 10，不解析数量"
     },
     {
       "id": "qt-02",
@@ -557,7 +558,8 @@
       "intent": "query_tx",
       "route": "read",
       "tools": ["get_transaction_records"],
-      "slots": { "limit": 1 }
+      "slots": {},
+      "note": "条数固定 10，不解析数量"
     },
     {
       "id": "ctx-04",

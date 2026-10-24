@@ -42,9 +42,17 @@ class _Runner:
                     "timeStamp": 1730000000,
                     "from": WALLET,
                     "to": "0x1111111111111111111111111111111111111111",
-                    "value": "50000000000000000",
-                    "decimals": 18,
-                    "tokenSymbol": None,
+                    "events": [
+                        {
+                            "source": "txlist",
+                            "from": WALLET,
+                            "to": "0x1111111111111111111111111111111111111111",
+                            "value": "50000000000000000",
+                            "decimals": 18,
+                            "tokenSymbol": None,
+                            "contractAddress": None,
+                        }
+                    ],
                 }
             ],
         }
@@ -57,18 +65,12 @@ def test_query_tx_takes_the_tool_call_from_the_intent() -> None:
 
     state = asyncio.run(
         graph.ainvoke(
-            initial_state(
-                [],
-                "查我最近 3 笔交易",
-                WALLET,
-                intent=Intent.QUERY_TX,
-                slots={"limit": 3},
-            )
+            initial_state([], "查我最近 3 笔交易", WALLET, intent=Intent.QUERY_TX)
         )
     )
 
     assert model.calls == 0
-    assert runner.calls == [{"address": WALLET, "limit": 3}]
+    assert runner.calls == [{"address": WALLET}]
     assert state["direct_answer"].startswith("最近 1 笔交易")
 
 

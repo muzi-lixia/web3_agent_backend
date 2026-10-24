@@ -1,4 +1,7 @@
-"""建表脚本。V1a 用 create_all 起步；写链路开工前换成 Alembic 管理版本。
+"""建表脚本。
+
+create_all 只建缺失的表，不改既有表，也不补索引：
+结构变更需要手写 DDL 执行，向量索引另见 scripts/rag_vector_index.py。
 
 用法：python scripts/migrate_pg.py
 """

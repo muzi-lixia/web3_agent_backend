@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
-from fastapi import Depends, Header, Request
+from ipaddress import ip_address
+
+from fastapi import Header, Request
 
 from web3_agent.common.exceptions import E503_UNAUTHENTICATED, AppError
 from web3_agent.config.settings import get_settings
@@ -46,6 +48,21 @@ async def require_identity(
 
 
 def client_ip(request: Request) -> str:
+    """请求方地址。部署在反代之后按 trusted_proxy_hops 取 X-Forwarded-For。
+
+    取错了不会报错，只会让所有匿名请求共用一个限流桶，所以这里对结果做一次
+    IP 校验：头部是客户端可写的，脏值不能进限流键。
+    """
+    hops = get_settings().trusted_proxy_hops
+    if hops > 0:
+        forwarded = request.headers.get("x-forwarded-for", "")
+        chain = [part.strip() for part in forwarded.split(",") if part.strip()]
+        if len(chain) >= hops:
+            candidate = chain[-hops]
+            try:
+                return str(ip_address(candidate))
+            except ValueError:
+                pass
     return request.client.host if request.client else "unknown"
 
 
@@ -62,8 +79,17 @@ async def _enforce(request: Request, identity: Identity | None, *, auth_endpoint
 
 
 async def chat_rate_limit(
-    request: Request, identity: Identity | None = Depends(optional_identity)
+    request: Request, authorization: str | None = Header(default=None)
 ) -> None:
+    """入口限流。
+
+    凭据无效时按匿名计数，再交给业务依赖去 401 —— 如果这里直接抛，
+    随便带一个坏 token 就能绕过整个计数器：依赖解析失败，计数一行都不会执行。
+    """
+    try:
+        identity = await optional_identity(authorization)
+    except AppError:
+        identity = None
     await _enforce(request, identity, auth_endpoint=False)
 
 

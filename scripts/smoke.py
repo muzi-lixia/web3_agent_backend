@@ -31,7 +31,7 @@ async def main() -> None:
     registry = ToolRegistry()
     registry.register(build_get_asset_balance(adapter), ToolGroup.LLM_VISIBLE, mutating=False)
     registry.register(
-        build_get_transaction_records(adapter, settings), ToolGroup.LLM_VISIBLE, mutating=False
+        build_get_transaction_records(settings), ToolGroup.LLM_VISIBLE, mutating=False
     )
     registry.register(
         build_get_stake_info(adapter, settings.stake_contracts), ToolGroup.LLM_VISIBLE, mutating=False

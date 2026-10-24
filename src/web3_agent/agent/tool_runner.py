@@ -7,11 +7,16 @@ from __future__ import annotations
 
 import json
 import time
+import logging
+from pydantic import ValidationError
 
 from web3_agent.agent.tool_registry import ToolRegistry
-from web3_agent.common.exceptions import ToolSourceViolation
+from web3_agent.common.exceptions import ToolSourceViolation, AppError, error_message
 from web3_agent.common.types import ToolCallRecord
 from web3_agent.config.constants import CallSource
+
+
+logger = logging.getLogger(__name__)
 
 
 class ToolRunner:
@@ -28,15 +33,17 @@ class ToolRunner:
         started = time.monotonic()
         try:
             result = await spec.tool.ainvoke(args)
-        except Exception as exc:  # noqa: BLE001 工具异常要变成可回灌的观察结果
+        except AppError:
+            # Preserve actionable API failures (KB disabled/configuration errors).
+            raise
+        except Exception as exc:  # noqa: BLE001 unexpected exceptions never enter model context
+            logger.warning("tool execution failed tool=%s", name, exc_info=True)
+            code = "E101" if isinstance(exc, ValidationError) else "E304"
             record = ToolCallRecord(
-                name=name,
-                args=args,
-                ok=False,
-                error=str(exc),
+                name=name, args=args, ok=False, error=code,
                 latency_ms=int((time.monotonic() - started) * 1000),
             )
-            return json.dumps({"error": "E302", "message": str(exc)}, ensure_ascii=False), record
+            return json.dumps({"error": code, "message": error_message(code)}, ensure_ascii=False), record
 
         payload = result if isinstance(result, (dict, list)) else {"result": result}
         # 只读工具用 {"error": "E303"} 表示查不到（数据源未配置 / 地址不合法 / 无 RPC）。

@@ -55,7 +55,7 @@ def test_user_id_differs_per_address() -> None:
 def test_decode_rejects_wrong_secret() -> None:
     token, _ = _issue()
     with pytest.raises(AppError) as exc:
-        tokens.decode(secret="another-secret", algorithm=ALGORITHM, token=token)
+        tokens.decode(secret="another-secret-3f8a19c47b0e526d7a", algorithm=ALGORITHM, token=token)
     assert exc.value.code == "E503"
 
 
@@ -70,3 +70,32 @@ def test_decode_rejects_tampered_token() -> None:
     token, _ = _issue()
     with pytest.raises(AppError):
         tokens.decode(secret=SECRET, algorithm=ALGORITHM, token=token[:-2] + "xy")
+
+
+def test_decode_rejects_user_id_that_does_not_match_the_address() -> None:
+    """签名有效但 id 和地址对不上：密钥泄漏时也不能拿 A 的 id 冒充 B。"""
+    import jwt
+
+    payload = {
+        "sub": tokens.user_id_for("0x0000000000000000000000000000000000000001"),
+        "siwe_user_id": tokens.user_id_for("0x0000000000000000000000000000000000000001"),
+        "siwe_address": ADDRESS,
+        "chain_id": 1,
+        "exp": int(datetime.now(timezone.utc).timestamp()) + 600,
+    }
+    forged = jwt.encode(payload, SECRET, algorithm=ALGORITHM)
+    with pytest.raises(AppError) as exc:
+        tokens.decode(secret=SECRET, algorithm=ALGORITHM, token=forged)
+    assert exc.value.code == "E503"
+
+
+def test_decode_normalizes_the_address() -> None:
+    """混合大小写通过 EIP-55 校验后，返回的地址统一成小写。"""
+    token, _ = tokens.issue(
+        secret=SECRET,
+        algorithm=ALGORITHM,
+        ttl_seconds=600,
+        address="0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+        chain_id=1,
+    )
+    assert tokens.decode(secret=SECRET, algorithm=ALGORITHM, token=token).address == ADDRESS

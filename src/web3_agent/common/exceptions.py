@@ -15,16 +15,23 @@ class AppError(Exception):
         message: str,
         http_status: int = 400,
         retryable: bool = False,
+        retry_after: int | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.http_status = http_status
         self.retryable = retryable
+        # 秒数。只在此刻重试必然失败、过一会儿才可能成功的场合给（如上一轮还在跑）。
+        self.retry_after = retry_after
 
 
 class ToolSourceViolation(Exception):
     """LLM 试图调用 mutating 工具。属于内部越界，不是用户错误。"""
+
+
+class BudgetExhausted(Exception):
+    """本轮某类资源预算已用完。调用方按数据源降级，不当成服务故障。"""
 
 
 class RpcUnavailable(Exception):
@@ -32,7 +39,15 @@ class RpcUnavailable(Exception):
 
 
 class ModelUnavailable(Exception):
-    pass
+    """模型服务不可达或超时。对外统一 503，重试有意义。"""
+
+
+class ModelConfigError(ModelUnavailable):
+    """模型名、端点这类配置错误。重试不会变好，只是不需要单独一条兜底路径。"""
+
+
+class ModelBadOutput(Exception):
+    """模型返回了内容但结构不合法。这是唯一值得走一次格式修复的失败。"""
 
 
 # code -> (用户可见固定文案, HTTP 状态码)
@@ -49,6 +64,7 @@ ERROR_TABLE: dict[str, tuple[str, int]] = {
     "E205": ("该代币暂不支持", 400),
     "E301": ("链上服务暂时不可用，请稍后重试", 503),
     "E302": ("交易记录暂时无法获取", 502),
+    "E304": ("工具执行失败，请稍后重试", 502),
     "E401": ("交易被合约拒绝", 422),  # 实际文案由 RevertDecoder 补业务原因
     "E402": ("该质押合约当前不可用", 409),
     "E403": ("交易模拟未通过，链上状态可能已变化", 409),
@@ -71,8 +87,17 @@ ERROR_TABLE: dict[str, tuple[str, int]] = {
     "E609": ("重复请求内容不一致，或当前状态不允许此操作", 409),
     "E611": ("知识库不存在或已停用", 404),
     "E612": ("知识库嵌入配置与当前服务不一致", 409),
+    "E613": ("知识库切片数量超过关键词检索上限，请调整配置或拆分知识库", 409),
     "E610": ("知识库暂时不可用", 503),
     "E509": ("链与登录身份不一致", 403),
+    # PRD 表未列：单轮预算（整轮时间 / 工具调用次数）耗尽。与 E501 的每分钟配额不是
+    # 一回事，那个等一分钟就恢复，这个要把问题拆小或重问一次。
+    "E510": ("本轮处理超出时间或资源上限，请把问题拆小一点再试", 504),
+    # 幂等键：同一个 key 的请求还在跑。等这一轮收尾后拿同一个 key 重试就能拿到答案，
+    # 所以是可重试的；换 key 等于再跑一轮，客户端不该这么做。
+    "E511": ("同一请求正在处理中，请稍后重试", 409),
+    # 幂等键被复用到另一条内容上。重试永远是同一个结果，只能换 key 重新发起。
+    "E512": ("请求内容与上一次不一致，请重新发起", 409),
 }
 
 
@@ -97,3 +122,6 @@ E501_QUOTA_EXHAUSTED = error_tuple("E501")
 E503_UNAUTHENTICATED = error_tuple("E503")
 E507_MODEL_UNAVAILABLE = error_tuple("E507")
 E509_CHAIN_IDENTITY_MISMATCH = error_tuple("E509")
+E510_TURN_BUDGET = error_tuple("E510")
+E511_DUPLICATE_REQUEST = error_tuple("E511")
+E512_IDEMPOTENCY_CONFLICT = error_tuple("E512")

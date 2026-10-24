@@ -1,11 +1,18 @@
-"""JSON-RPC 客户端。一个 ChainAdapter 持有一个实例，不共享连接池配置。"""
+"""JSON-RPC 客户端。一个 ChainAdapter 持有一个实例，不共享连接池配置。
+
+这里只校验信封：必须是 JSON-RPC 对象、id 对得上、error 与 result 有且只有一个。
+「result 为 null」和「没有 result」是两件事：前者是合法返回值（未上链的交易查回执
+就是这样），后者是上游协议错误，必须失败。把它们合并成同一个 None，余额查询就会
+把坏响应报成 0。
+"""
 
 from __future__ import annotations
 
 import httpx
 
 from web3_agent.common.exceptions import RpcUnavailable
-from web3_agent.web3.metering import record_rpc_call
+from web3_agent.common.metering import Resource, reserve
+from web3_agent.web3.net import MAX_ATTEMPTS, is_transient
 
 
 class RpcClient:
@@ -14,20 +21,47 @@ class RpcClient:
         self._client = httpx.AsyncClient(timeout=timeout)
         self._id = 0
 
-    async def call(self, method: str, params: list) -> object:
-        self._id += 1
-        record_rpc_call()
-        payload = {"jsonrpc": "2.0", "id": self._id, "method": method, "params": params}
-        try:
-            resp = await self._client.post(self._url, json=payload)
-            resp.raise_for_status()
-            body = resp.json()
-        except httpx.HTTPError as exc:
-            raise RpcUnavailable(f"{method} -> {exc}") from exc
+    async def _send(self, method: str, params: list) -> tuple[int, httpx.Response]:
+        """发一次请求，传输层失败重试一次。返回 (请求 id, 响应)。"""
+        last: RpcUnavailable | None = None
+        for _ in range(MAX_ATTEMPTS):
+            # 预算扣减在发请求之前：并发工具同时打到这条链上时，事后记账一定会超。
+            # 用完不是链上故障，但工具层只需要「这次没拿到数据」，按 RpcUnavailable 降级。
+            # 重试同样是一次真实请求，占一次预算。
+            if not reserve(Resource.RPC):
+                raise RpcUnavailable(f"{method} -> 本轮 RPC 调用预算已用完")
+            self._id += 1
+            request_id = self._id
+            payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+            try:
+                resp = await self._client.post(self._url, json=payload)
+                resp.raise_for_status()
+            except httpx.HTTPError as exc:
+                last = RpcUnavailable(f"{method} -> {exc}")
+                if not is_transient(exc):
+                    raise last from exc
+                continue
+            return request_id, resp
+        raise last
 
-        if "error" in body:
+    async def call(self, method: str, params: list) -> object:
+        request_id, resp = await self._send(method, params)
+        try:
+            body = resp.json()
+        except ValueError as exc:  # 网关返回 HTML 错误页时会走到这里
+            raise RpcUnavailable(f"{method} -> 响应不是合法 JSON") from exc
+
+        if not isinstance(body, dict):
+            raise RpcUnavailable(f"{method} -> 响应不是 JSON-RPC 对象")
+        if body.get("error") is not None:
             raise RpcUnavailable(f"{method} -> {body['error']}")
-        return body.get("result")
+        # 比对用 _send 返回的那个 id：同一个客户端会被并发调用，self._id 早已被
+        # 别的协程推进，拿它比会把正常响应误判成 id 不一致。
+        if str(body.get("id")) != str(request_id):
+            raise RpcUnavailable(f"{method} -> 响应 id 与请求不一致")
+        if "result" not in body:
+            raise RpcUnavailable(f"{method} -> 响应缺少 result 字段")
+        return body["result"]
 
     async def aclose(self) -> None:
         await self._client.aclose()

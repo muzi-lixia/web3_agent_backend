@@ -10,7 +10,7 @@ import pytest
 from web3_agent.config.settings import get_settings
 from web3_agent.domain.memory.profile import ProfilePatch
 from web3_agent.persistence.pg import base as pg
-from web3_agent.persistence.pg.repositories import conversation_repo, profile_repo, summary_repo
+from web3_agent.persistence.pg.repositories import conversation_repo, profile_repo
 
 
 def _pg_ready() -> bool:
@@ -174,7 +174,6 @@ def test_clear_keeps_profile() -> None:
             )
         async with pg.session_scope() as db:
             await conversation_repo.clear_user_messages(db, uid)
-            await summary_repo.delete(db, uid)
         async with pg.session_scope() as db:
             row = await profile_repo.get(db, uid)
             left = await conversation_repo.list_page(db, uid, 10)

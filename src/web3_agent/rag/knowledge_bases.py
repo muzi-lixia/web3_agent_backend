@@ -20,10 +20,10 @@ class KnowledgeBaseRepository:
 
     async def check_schema(self):
         from sqlalchemy.exc import SQLAlchemyError
-        from web3_agent.persistence.pg.orm_models import RagDocument, RagChunk, RagIngestionJob
+        from web3_agent.persistence.pg.orm_models import RagDocument, RagChunk, RagIngestionJob, RagIndexVersion
         try:
             async with session_scope() as db:
-                for model in (KB,RagDocument,RagChunk,RagIngestionJob):
+                for model in (KB,RagDocument,RagChunk,RagIngestionJob,RagIndexVersion):
                     await db.execute(select(model).limit(0))
         except SQLAlchemyError as exc:
             raise RuntimeError("RAG 表结构尚未就绪，请先审阅并执行 docs/sql/rag-knowledge-base-upgrade.sql；create_all 不会升级已有表") from exc

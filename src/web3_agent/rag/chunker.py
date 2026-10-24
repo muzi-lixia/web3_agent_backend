@@ -2,6 +2,9 @@
 from dataclasses import dataclass, field
 import re
 
+# 切块逻辑变了就改这个版本号：它进内容指纹，决定已发布文档是否需要重建索引。
+CHUNKER_VERSION = "heading_overlap_v1"
+
 
 @dataclass(frozen=True)
 class Chunk:

@@ -50,27 +50,6 @@ class _Audit:
         self.events.append((event, payload))
 
 
-class _Conversation:
-    async def load(self, db, *, siwe_user_id: str) -> list[tuple[str, str]]:
-        return []
-
-    async def save(self, db, **kwargs: Any) -> None:
-        pass
-
-
-class _HistoryConversation(_Conversation):
-    def __init__(self, history: list[tuple[str, str]]) -> None:
-        self._history = history
-
-    async def load(self, db, *, siwe_user_id: str) -> list[tuple[str, str]]:
-        return self._history
-
-
-class _Embedder:
-    async def embed(self, text: str) -> list[float]:
-        return [0.0]
-
-
 class _Graph:
     """按给定内容返回一次回答，不执行任何工具。"""
 
@@ -97,11 +76,9 @@ def _loop(graph: _Graph, intent: Intent) -> AgentLoop:
         Settings(),
         llm=_Llm(intent),
         guard=JsonGuard(),
-        conversation=_Conversation(),
         audit=_Audit(),
         model_with_tools=None,
         runner=None,
-        embedder=_Embedder(),
     )
     loop._graph = graph  # 只替换图，其余编排逻辑保持真实
     return loop
@@ -111,13 +88,44 @@ async def _empty(*args: Any, **kwargs: Any) -> str:
     return ""
 
 
-def _without_db(loop: AgentLoop, monkeypatch) -> AgentLoop:
+class _NullScope:
+    """agent 自己开事务，测试里不需要真的连接。"""
+
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *exc_info: Any) -> bool:
+        return False
+
+
+def _without_db(
+    loop: AgentLoop,
+    monkeypatch,
+    history: list[tuple[str, str]] | None = None,
+) -> AgentLoop:
     async def _no_rows(*args: Any, **kwargs: Any) -> list:
         return []
+
+    async def _generation(*args: Any, **kwargs: Any) -> int:
+        return 0
+
+    async def _fresh(*args: Any, **kwargs: Any) -> bool:
+        return True
+
+    async def _history(*args: Any, **kwargs: Any) -> list[tuple[str, str]]:
+        return list(history or [])
+
+    async def _append(*args: Any, **kwargs: Any) -> int:
+        return 0
 
     loop._load_summary = _empty
     loop._sync_profile = _empty
     monkeypatch.setattr(agent_loop_module.memory_repo, "active_items", _no_rows)
+    monkeypatch.setattr(agent_loop_module.conversation_repo, "lock_generation", _generation)
+    monkeypatch.setattr(agent_loop_module.conversation_repo, "assert_generation", _fresh)
+    monkeypatch.setattr(agent_loop_module.conversation_repo, "load_history", _history)
+    monkeypatch.setattr(agent_loop_module.conversation_repo, "append_message", _append)
+    monkeypatch.setattr(agent_loop_module, "session_scope", lambda: _NullScope())
     return loop
 
 
@@ -126,7 +134,6 @@ def test_fabricated_answer_without_any_tool_call_is_replaced(monkeypatch) -> Non
 
     outcome = asyncio.run(
         loop.handle(
-            None,
             siwe_user_id="u-1",
             wallet_address="0x63a9f8df422e1983d42565234557d46d18dbece9",
             chain_id=80094,
@@ -145,7 +152,6 @@ def test_answer_is_kept_when_a_tool_call_succeeded(monkeypatch) -> None:
 
     outcome = asyncio.run(
         loop.handle(
-            None,
             siwe_user_id="u-1",
             wallet_address="0x63a9f8df422e1983d42565234557d46d18dbece9",
             chain_id=80094,
@@ -164,7 +170,6 @@ def test_all_tool_calls_failed_is_treated_as_no_evidence(monkeypatch) -> None:
 
     outcome = asyncio.run(
         loop.handle(
-            None,
             siwe_user_id="u-1",
             wallet_address="0x63a9f8df422e1983d42565234557d46d18dbece9",
             chain_id=80094,
@@ -178,14 +183,14 @@ def test_all_tool_calls_failed_is_treated_as_no_evidence(monkeypatch) -> None:
 
 def test_chitchat_answers_from_history_without_the_graph(monkeypatch) -> None:
     graph = _Graph("不该出现的工具回答")
-    loop = _without_db(_loop(graph, Intent.CHITCHAT), monkeypatch)
-    loop._conversation = _HistoryConversation(
-        [("user", "查一下我的交易记录"), ("assistant", "最近 3 笔交易……")]
+    loop = _without_db(
+        _loop(graph, Intent.CHITCHAT),
+        monkeypatch,
+        history=[("user", "查一下我的交易记录"), ("assistant", "最近 3 笔交易……")],
     )
 
     outcome = asyncio.run(
         loop.handle(
-            None,
             siwe_user_id="u-1",
             wallet_address="0x63a9f8df422e1983d42565234557d46d18dbece9",
             chain_id=80094,
@@ -222,7 +227,6 @@ def test_missing_tool_call_triggers_one_retry(monkeypatch) -> None:
 
     outcome = asyncio.run(
         loop.handle(
-            None,
             siwe_user_id="u-1",
             wallet_address="0x63a9f8df422e1983d42565234557d46d18dbece9",
             chain_id=80094,
@@ -250,7 +254,6 @@ def test_chitchat_carries_the_profile(monkeypatch) -> None:
 
     asyncio.run(
         loop.handle(
-            None,
             siwe_user_id="u-1",
             wallet_address="0x63a9f8df422e1983d42565234557d46d18dbece9",
             chain_id=80094,

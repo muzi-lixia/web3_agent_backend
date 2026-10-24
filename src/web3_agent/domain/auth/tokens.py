@@ -80,9 +80,14 @@ def decode(*, secret: str, algorithm: str, token: str) -> SiweClaims:
     user_id = payload.get("siwe_user_id") or payload.get("sub") or ""
     if not address or not user_id:
         raise AppError(*E503_UNAUTHENTICATED)
+    normalized = normalize_address(str(address))
+    # 签发时 id 由地址推导，解码时重新推导一次：密钥泄漏后攻击者能签任意 claims，
+    # 但把 id 和地址解耦不了，被冒用的仍然只能是那个地址自己的身份。
+    if normalized is None or user_id != user_id_for(normalized):
+        raise AppError(*E503_UNAUTHENTICATED)
     return SiweClaims(
         user_id=user_id,
-        address=str(address),
+        address=normalized,
         chain_id=int(payload.get("chain_id") or 0),
         expires_at=datetime.fromtimestamp(int(payload.get("exp") or 0), tz=timezone.utc),
     )

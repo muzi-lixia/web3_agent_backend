@@ -51,3 +51,30 @@ def test_records_from_every_round_are_kept() -> None:
     assert state["messages"][-1].content == "查完了"
     assert [r["name"] for r in state["tool_calls"]] == ["tool_a", "tool_b"]
     assert [r["ok"] for r in state["tool_calls"]] == [True, False]
+
+
+def test_every_call_in_one_message_runs() -> None:
+    """一条模型消息带多个调用时逐个执行；次数约束由意图白名单与步数上限负责。"""
+    calls = [
+        {"name": name, "args": {}, "id": f"c{index}"}
+        for index, name in enumerate(("tool_a", "tool_b", "tool_c"))
+    ]
+
+    class _Burst:
+        def __init__(self) -> None:
+            self._rounds = [AIMessage(content="", tool_calls=calls), AIMessage(content="查完了")]
+
+        async def ainvoke(self, messages):
+            return self._rounds.pop(0)
+
+    runner = _Runner()
+    graph = build_read_graph(_Burst(), runner=runner, max_steps=5)
+    state = asyncio.run(graph.ainvoke(initial_state([], "查一下", WALLET)))
+
+    assert runner.seen == ["tool_a", "tool_b", "tool_c"]
+    assert [(r["name"], r["ok"]) for r in state["tool_calls"]] == [
+        ("tool_a", True),
+        ("tool_b", False),
+        ("tool_c", False),
+    ]
+    assert state["messages"][-1].content == "查完了"

@@ -42,3 +42,27 @@ def test_run_id_is_independent_from_trace_id() -> None:
     assert get_trace_id() == "t-1"
     assert get_run_id() == "r-1"
     set_run_id("")
+
+
+def test_incoming_trace_id_is_sanitized_before_it_reaches_the_logs() -> None:
+    """透传的 id 会进日志和响应头，超长或带控制字符的一律换成新生成的。"""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from web3_agent.middlewares.trace_middleware import TraceMiddleware
+
+    app = FastAPI()
+    app.add_middleware(TraceMiddleware)
+
+    @app.get("/ping")
+    def ping() -> dict:
+        return {}
+
+    with TestClient(app) as client:
+        kept = client.get("/ping", headers={"X-Trace-Id": "abc-123_XY"}).headers["X-Trace-Id"]
+        replaced = client.get("/ping", headers={"X-Trace-Id": "x" * 200}).headers["X-Trace-Id"]
+        injected = client.get("/ping", headers={"X-Trace-Id": "bad value\nrm -rf"}).headers["X-Trace-Id"]
+
+    assert kept == "abc-123_XY"
+    assert replaced != "x" * 200 and len(replaced) == 32
+    assert injected != "bad value\nrm -rf" and len(injected) == 32

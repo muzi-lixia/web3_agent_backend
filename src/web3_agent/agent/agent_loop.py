@@ -6,6 +6,7 @@ V1a 不生成任何 TxIntent。
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -13,15 +14,19 @@ from langsmith import traceable
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from web3_agent.agent import langsmith_tracer, secret_detector
-from web3_agent.agent.graph.read_graph import build_read_graph, initial_state
+from web3_agent.agent.graph.read_graph import build_read_graph, evidence_tools, initial_state
 from web3_agent.agent.intent_router import route_intent
 from web3_agent.agent.json_guard import JsonGuard
 from web3_agent.agent.llm_adapter import LlmAdapter
 from web3_agent.agent.prompts import CHAT_SYSTEM
-from web3_agent.rag.answer import render_answer
 from web3_agent.rag.retriever import NO_DOCUMENTS, UNAVAILABLE
 from web3_agent.agent.sanitize import sanitize_free_text
-from web3_agent.common.exceptions import E507_MODEL_UNAVAILABLE, AppError, ModelUnavailable
+from web3_agent.common.exceptions import (
+    E507_MODEL_UNAVAILABLE,
+    AppError,
+    ModelUnavailable,
+    error_message,
+)
 from web3_agent.common.tracing import get_trace_id, set_run_id
 from web3_agent.common.types import ChatOutcome, ToolCallRecord
 from web3_agent.config.constants import (
@@ -37,14 +42,17 @@ from web3_agent.config.constants import (
 )
 from web3_agent.config.settings import Settings
 from web3_agent.domain.memory import memory, profile, schema
-from web3_agent.domain.memory.embedder import Embedder
-from web3_agent.persistence.conversation_context import ConversationContext
-from web3_agent.persistence.pg.repositories import memory_repo, profile_repo, summary_repo
+from web3_agent.persistence.pg.base import session_scope
+from web3_agent.persistence.pg.repositories import (
+    conversation_repo,
+    memory_repo,
+    profile_repo,
+)
 from web3_agent.persistence.pg.repositories.audit_repo import AuditLogger
 
 
 def _turn_inputs(params: dict[str, Any]) -> dict[str, Any]:
-    """self 与 db 不进 trace：一个是整对象，一个是连接，序列化没有意义。"""
+    """self 不进 trace：整对象序列化没有意义。"""
     return {
         "user_message": params.get("user_message"),
         "siwe_user_id": params.get("siwe_user_id"),
@@ -62,17 +70,30 @@ def _turn_outputs(outcome: ChatOutcome) -> dict[str, Any]:
     }
 
 
-# 这三个意图的答案必须是链上数据，不是模型自己写出来的话。
-# chitchat 也走 read 路由，但它不需要数据，所以不在其中。
-_DATA_INTENTS = frozenset({Intent.QUERY_ASSET, Intent.QUERY_TX, Intent.QUERY_STAKE})
-
-
 def _lacks_evidence(intent: Intent, records: list[ToolCallRecord]) -> bool:
-    """需要数据的意图，一条成功的工具调用都没有 —— 这时模型在无据作答。"""
-    if intent is Intent.QUERY_KNOWLEDGE:
-        return not any(r.ok and r.name == "rag_general_knowledge" for r in records)
-    # 文档检索成功不能当作查到了实时链上数据。
-    return intent in _DATA_INTENTS and not any(r.ok and r.name != "rag_general_knowledge" for r in records)
+    """需要数据的意图，没有一条「该意图对应的」工具成功调用 —— 这时模型在无据作答。
+
+    只认数据工具：问余额却调了知识检索（且成功），同样算没查到余额。
+    """
+    tools = evidence_tools(intent)
+    if not tools:
+        return False
+    return not any(r.ok and r.name in tools for r in records)
+
+
+def _failure_notice(records: list[ToolCallRecord]) -> str:
+    """全部工具都失败且错误码一致时，用错误码自己的文案。
+
+    「稍后再试」对 E202（该合约暂不支持）这类错误是错的 —— 重试不会变好。
+    错误码不一致（多源部分失败）时退回通用兜底。
+    """
+    codes = {r.error for r in records if not r.ok}
+    if records and len(codes) == 1 and all(not r.ok for r in records):
+        try:
+            return error_message(codes.pop())
+        except KeyError:
+            return MSG_NO_DATA
+    return MSG_NO_DATA
 
 
 # 重跑图时替换掉模型那句空转回答：它没有数据，留着只会被抄一遍。
@@ -82,24 +103,34 @@ _RETRY_HINT = (
 )
 
 
+# 工具参数里只留够复盘的分量：问题原文在消息 content 里已经存过一份。
+_PERSIST_QUERY_CHARS = 200
+
+
+def _trim_args(args: dict[str, Any]) -> dict[str, Any]:
+    """去掉派生参数，截断与消息重复的长文本。"""
+    kept = dict(args or {})
+    kept.pop("conversation_context", None)
+    query = kept.get("query_str")
+    if isinstance(query, str) and len(query) > _PERSIST_QUERY_CHARS:
+        kept["query_str"] = query[:_PERSIST_QUERY_CHARS]
+    return kept
+
+
 class AgentLoop:
     def __init__(
         self,
         settings: Settings,
         llm: LlmAdapter,
         guard: JsonGuard,
-        conversation: ConversationContext,
         audit: AuditLogger,
         model_with_tools,
         runner,
-        embedder: Embedder,
     ) -> None:
         self._settings = settings
         self._llm = llm
         self._guard = guard
-        self._conversation = conversation
         self._audit = audit
-        self._embedder = embedder
         self._graph = build_read_graph(
             model_with_tools,
             runner=runner,
@@ -109,7 +140,6 @@ class AgentLoop:
 
     async def handle(
         self,
-        db: AsyncSession,
         *,
         siwe_user_id: str,
         wallet_address: str | None,
@@ -139,7 +169,6 @@ class AgentLoop:
         if extra:
             set_run_id(extra["run_id"])
         return await self._turn(
-            db,
             siwe_user_id=siwe_user_id,
             user_message=sanitized.text,
             knowledge_base_id=knowledge_base_id,
@@ -156,7 +185,6 @@ class AgentLoop:
     )
     async def _turn(
         self,
-        db: AsyncSession,
         *,
         siwe_user_id: str,
         wallet_address: str | None,
@@ -164,20 +192,42 @@ class AgentLoop:
         user_message: str,
         knowledge_base_id: str = "default",
     ) -> ChatOutcome:
-        # 2. Perception：短期历史 + 中期摘要 + 长期档案与背景
-        history = await self._conversation.load(
-            db, siwe_user_id=siwe_user_id
-        )
-        summary_text = await self._load_summary(db, siwe_user_id)
-        profile_text = await self._sync_profile(db, siwe_user_id, user_message, chain_id)
-        # constraint 直接注入；软记忆要向量召回（一次 embed 2s 以上），
-        # 留到意图确认之后 —— 闲聊轮用不上它。
-        memory_rows = await memory_repo.active_items(db, siwe_user_id)
+        # 2. Perception：短期历史 + 中期摘要 + 长期档案与背景。
+        # 这一段全是短查询加一条写入，事务在模型调用之前就关掉 ——
+        # 一轮对话要十几秒，连接不能跟着一起挂到回答生成完。
+        # 同一个 turn_id 写在 user 和 assistant 两条消息上：并发轮次的 id 会交错，
+        # 加载历史时靠它重建「问题在前、回答在后」。
+        turn_id = uuid.uuid4().hex
+        async with session_scope() as db:
+            # 读生命周期版本，并在本事务内锁住它：清空接口要拿排他锁，
+            # 两边因此串行 —— 不会出现「读到旧历史、清空、再把答案写回空会话」。
+            generation = await conversation_repo.lock_generation(db, siwe_user_id)
+            history = await conversation_repo.load_history(
+                db,
+                siwe_user_id,
+                self._settings.conversation_max_messages,
+                self._settings.conversation_max_chars,
+            )
+            summary_text = await self._load_summary(db, siwe_user_id)
+            profile_text = await self._sync_profile(db, siwe_user_id, user_message, chain_id)
+            memory_rows = await memory_repo.active_items(db, siwe_user_id)
+            await conversation_repo.append_message(
+                db,
+                siwe_user_id=siwe_user_id,
+                role="user",
+                content=user_message,
+                turn_id=turn_id,
+            )
+        # 意图抽取只吃硬约束：它决定「什么不能做」，软背景对判断意图没有帮助，
+        # 留到执行轮再注入。
         memory_items = _constraints_of(memory_rows, self._settings.memory_constraint_max)
         memory_text = self._render_memories(memory_items)
-        await self._conversation.save(
-            db, siwe_user_id=siwe_user_id, role="user", content=user_message
-        )
+
+        async def finish(outcome: ChatOutcome) -> ChatOutcome:
+            """本轮出口。每一条返回路径都要落库，收成一个口子就不会有人漏写。"""
+            return await self._finish(
+                siwe_user_id, outcome, generation=generation, turn_id=turn_id
+            )
 
         # 3. Thought：结构化意图，带熔断
         try:
@@ -203,8 +253,8 @@ class AgentLoop:
             await self._audit.log(
                 "llm_json_degraded", siwe_user_id=siwe_user_id, attempts=guarded.attempts
             )
-            return await self._finish(
-                db, siwe_user_id, ChatOutcome(kind="answer", content=MSG_JSON_DEGRADED, degraded=True)
+            return await finish(
+                ChatOutcome(kind="answer", content=MSG_JSON_DEGRADED, degraded=True)
             )
 
         # 4. IntentRouter：唯一路由决策点
@@ -225,31 +275,34 @@ class AgentLoop:
             if guarded.output.intent is Intent.QUERY_KNOWLEDGE:
                 if not self._settings.rag_enabled:
                     kind, content = "answer", UNAVAILABLE
-            return await self._finish(db, siwe_user_id, ChatOutcome(kind=kind, content=content))
+            return await finish(ChatOutcome(kind=kind, content=content))
         if decision.route is Route.REJECT:
-            return await self._finish(
-                db, siwe_user_id, ChatOutcome(kind="reject", content=MSG_OUT_OF_SCOPE)
-            )
+            return await finish(ChatOutcome(kind="reject", content=MSG_OUT_OF_SCOPE))
         if decision.route is Route.WRITE:
-            return await self._finish(
-                db, siwe_user_id, ChatOutcome(kind="answer", content=MSG_WRITE_NOT_ENABLED)
-            )
+            return await finish(ChatOutcome(kind="answer", content=MSG_WRITE_NOT_ENABLED))
 
         if guarded.output.intent is Intent.QUERY_KNOWLEDGE and not self._settings.rag_enabled:
-            return await self._finish(db, siwe_user_id, ChatOutcome(kind="answer", content=UNAVAILABLE, degraded=True))
+            return await finish(ChatOutcome(kind="answer", content=UNAVAILABLE, degraded=True))
         # 闲聊不进工具图：不带工具就不可能在闲聊里查一遍链，也省掉一次工具往返。
         if guarded.output.intent is Intent.CHITCHAT:
-            return await self._finish(
-                db,
-                siwe_user_id,
-                await self._chitchat(history, user_message, siwe_user_id, profile_text),
+            return await finish(
+                await self._chitchat(
+                    history,
+                    user_message,
+                    siwe_user_id,
+                    profile_text=profile_text,
+                    memory_text=memory_text,
+                    summary_text=summary_text,
+                )
             )
 
-        # 要查数据的轮次才值得为软记忆做一次向量召回。
-        memory_items = [
-            *memory_items,
-            *await self._recall(db, siwe_user_id, user_message, memory_rows),
-        ]
+        # 软记忆留到意图确认之后注入：闲聊轮用不上它，而补充背景只对执行轮有意义。
+        # 知识问答那轮同样不需要 —— 它只读本轮检索到的材料。
+        if guarded.output.intent is not Intent.QUERY_KNOWLEDGE:
+            memory_items = [
+                *memory_items,
+                *_soft_memories(memory_rows, self._settings.memory_recall_limit),
+            ]
         memory_text = self._render_memories(memory_items)
 
         # 5. Action：只读 ReAct
@@ -266,9 +319,6 @@ class AgentLoop:
                     profile=profile_text,
                     memories=memory_text,
                     intent=guarded.output.intent,
-                    slots=guarded.output.slots,
-                    chain_id=chain_id,
-                    rag_enabled=self._settings.rag_enabled,
                     kb_id=knowledge_base_id,
                 ),
                 config=graph_config,
@@ -316,7 +366,7 @@ class AgentLoop:
             )
         if no_data:
             # 整段替换而不是追加：模型写的是带哈希和金额的一整段，追加等于把假数据留在里面。
-            answer = MSG_NO_DATA
+            answer = _failure_notice(records)
             await self._audit.log(
                 "answer_without_evidence",
                 siwe_user_id=siwe_user_id,
@@ -326,10 +376,9 @@ class AgentLoop:
                 retried=retried,
             )
 
-        citations = []
-        kind = "answer"
+        # 检索与数据工具平行：任何一轮都可能顺带查了文档，查到就把引用一起给出去。
+        citations = list(state.get("rag_citations", []))
         if guarded.output.intent is Intent.QUERY_KNOWLEDGE:
-            citations = state.get("rag_citations", [])
             if no_data or not citations:
                 status = state.get("rag_status", "")
                 if not status:
@@ -341,16 +390,19 @@ class AgentLoop:
                 no_data = True
                 citations = []
             else:
-                answer = render_answer(str(answer), citations)
+                answer = str(answer).strip()
+        if no_data:
+            # 结论已经换成「查不到」，再挂着引用会让人以为那是依据。
+            citations = []
         outcome = ChatOutcome(
-            kind=kind,
+            kind="answer",
             content=answer if isinstance(answer, str) else str(answer),
             tool_calls=records,
             steps=steps,
             degraded=no_data,
             citations=citations,
         )
-        return await self._finish(db, siwe_user_id, outcome)
+        return await finish(outcome)
 
     async def _chitchat(
         self,
@@ -358,11 +410,24 @@ class AgentLoop:
         user_message: str,
         siwe_user_id: str,
         profile_text: str = "",
+        memory_text: str = "",
+        summary_text: str = "",
     ) -> ChatOutcome:
-        """不带工具的一次性回答。历史原样给，用户问的就是历史本身。"""
+        """不带工具的一次性回答。
+
+        摘要和长期约束要一起给：用户可能问的是已经滚出近期窗口的事，
+        只给 recent history，模型就只能说不知道 —— 而意图识别那边是看得到摘要的。
+        """
         messages = [SystemMessage(content=CHAT_SYSTEM)]
         if profile_text:
             messages.append(SystemMessage(content=profile_text))
+        if summary_text:
+            messages.append(SystemMessage(content=summary_text))
+        if memory_text:
+            # 与只读链路同一形态：用户背景单独成块、带标签，不混进规则。
+            messages.append(
+                SystemMessage(content=f"<user_background>\n{memory_text}\n</user_background>")
+            )
         for role, content in history:
             messages.append(
                 AIMessage(content=content) if role == "assistant" else HumanMessage(content=content)
@@ -384,14 +449,14 @@ class AgentLoop:
         return ChatOutcome(kind="answer", content=reply.content)
 
     async def _load_summary(self, db: AsyncSession, siwe_user_id: str) -> str:
-        """摘要注入文本。status=failed 时也注入上一次成功的那份 —— 它仍然有效。"""
-        row = await summary_repo.get(db, siwe_user_id)
+        """摘要注入文本。摘要行由后台任务维护，加载时只读最新一条。"""
+        row = await conversation_repo.latest_summary(db, siwe_user_id)
         if row is None or not row.content:
             return ""
         return schema.render(
             schema.loads(row.content),
             max_chars=self._settings.summary_render_chars,
-            updated_at=row.updated_at,
+            updated_at=row.created_at,
         )
 
     async def _sync_profile(
@@ -424,37 +489,19 @@ class AgentLoop:
     def _render_memories(self, items: list[memory.MemoryItem]) -> str:
         return memory.render(items, max_chars=self._settings.memory_render_chars)
 
-    async def _recall(
-        self, db: AsyncSession, siwe_user_id: str, query: str, rows: list
-    ) -> list[memory.MemoryItem]:
-        """软记忆的向量召回。没有软记忆时连 embed 都不做。
-
-        向量化是新增的失败点，坏了只降级到 constraint —— 记忆是增强项，
-        不能因为它把整轮对话拖垮。
-        """
-        if not query.strip() or not any(r.memory_type != "constraint" for r in rows):
-            return []
-        try:
-            vector = await self._embedder.embed(query)
-            recalled = await memory_repo.recall(
-                db,
-                siwe_user_id,
-                embedding=vector,
-                limit=self._settings.memory_recall_limit,
-                max_distance=self._settings.memory_recall_max_distance,
-            )
-        except ModelUnavailable as exc:
-            await self._audit.log(
-                "memory_recall_degraded", siwe_user_id=siwe_user_id, error=str(exc)[:200]
-            )
-            return []
-        return [_as_item(r) for r in recalled]
-
     async def _finish(
-        self, db: AsyncSession, siwe_user_id: str, outcome: ChatOutcome
+        self,
+        siwe_user_id: str,
+        outcome: ChatOutcome,
+        *,
+        generation: int,
+        turn_id: str,
     ) -> ChatOutcome:
         # 工具轨迹随消息落库：历史记录要能复原「这条回答查了什么」。
         # 没有调工具时留 NULL，不要写空数组 —— 绝大多数轮次都是这种。
+        # 收一遍参数，落库和响应都用这个形态，不各留一份全文。
+        for call in outcome.tool_calls:
+            call.args = _trim_args(call.args)
         calls = [call.model_dump() for call in outcome.tool_calls]
         # Keep citation snapshots with the existing JSON tool metadata, without DDL.
         # This preserves references after the frontend reloads conversation history.
@@ -462,13 +509,35 @@ class AgentLoop:
             if call["name"] == "rag_general_knowledge" and call["ok"] and outcome.citations:
                 call["citations"] = outcome.citations
                 break
-        await self._conversation.save(
-            db,
-            siwe_user_id=siwe_user_id,
-            role="assistant",
-            content=outcome.content,
-            tool_calls=calls or None,
-        )
+        async with session_scope() as db:
+            # 版本校验与写入必须同事务：这一轮读了旧历史来生成答案，
+            # 期间用户可能已经清空对话。此时答案是「基于已删除内容」的，
+            # 写回去等于把刚删的会话复活成一条无头回答。
+            if not await conversation_repo.assert_generation(db, siwe_user_id, generation):
+                await self._audit.log(
+                    "turn_discarded_stale",
+                    siwe_user_id=siwe_user_id,
+                    turn_id=turn_id,
+                    kind=outcome.kind,
+                )
+                # 不落库只解决了一半：这段正文来自用户刚删掉的历史，交回去等于
+                # 清了又冒出来。把它清空并打上标记，由调用方决定怎么收尾。
+                return outcome.model_copy(update={
+                    "content": "",
+                    "discarded": True,
+                    "tool_calls": [],
+                    "citations": [],
+                    "steps": 0,
+                    "degraded": False,
+                })
+            await conversation_repo.append_message(
+                db,
+                siwe_user_id=siwe_user_id,
+                role="assistant",
+                content=outcome.content,
+                tool_calls=calls or None,
+                turn_id=turn_id,
+            )
         return outcome
 
 
@@ -477,9 +546,19 @@ def _record(item: dict) -> ToolCallRecord:
 
 
 def _constraints_of(rows: list, cap: int) -> list[memory.MemoryItem]:
-    """硬约束全量注入，不受向量召回影响。"""
+    """硬约束全量注入：它决定「什么不能做」，不该被条数筛掉。"""
     items = [_as_item(r) for r in rows if r.memory_type == "constraint"]
     return items[:cap]
+
+
+def _soft_memories(rows: list, cap: int) -> list[memory.MemoryItem]:
+    """软记忆按写入时间倒序取前几条。
+
+    rows 已经是 created_at 倒序 —— 最近提到的就是当下最相关的，够用。
+    不做相似度筛选：active 集被 subject 唯一索引压到「主题数」量级，
+    为这点候选集付一次 query embedding 不划算。
+    """
+    return [_as_item(r) for r in rows if r.memory_type != "constraint"][:cap]
 
 
 def _as_item(row) -> memory.MemoryItem:

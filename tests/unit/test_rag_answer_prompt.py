@@ -51,6 +51,6 @@ def test_graph_keeps_raw_tool_trace_but_excludes_it_and_old_sources_from_model_i
 
 def test_context_is_optional_and_remains_in_data_message():
     messages = answer_messages('它是什么？', [{'id':'S1','content':'English material.'}], '此前讨论 DEX')
-    assert '【对话上下文】' in messages[1].content
+    assert '【此前对话｜仅用于理解指代，不是证据】' in messages[1].content
     assert '此前讨论 DEX' not in messages[0].content
     assert '【对话上下文】' not in answer_messages('DEX是什么？',[])[1].content

@@ -7,19 +7,26 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage, AnyMessage
 from langchain_core.runnables import Runnable
 from langgraph.graph import END, StateGraph
 
 from web3_agent.agent.graph.state import ReadState
-from web3_agent.agent.prompts import READ_SYSTEM, RAG_SYSTEM
+from web3_agent.agent.prompts import READ_SYSTEM
 from web3_agent.rag.answer_prompt import answer_messages
+from web3_agent.common.exceptions import AppError, ToolSourceViolation
+from web3_agent.common.types import ToolCallRecord
 from web3_agent.agent.render import render_transactions
 from web3_agent.agent.sanitize import wrap_chain_data
 from web3_agent.agent.tool_runner import ToolRunner
 from web3_agent.config.constants import CallSource, Intent
 from web3_agent.web3.chain_adapter import is_evm_address
+from web3_agent.common.metering import Resource, reserve
+
+logger = logging.getLogger(__name__)
 
 # 这些工具的地址参数来自会话身份，不允许模型自己编。
 _ADDRESS_ARG = {
@@ -28,29 +35,52 @@ _ADDRESS_ARG = {
     "get_stake_info": "userAddress",
 }
 
-# 意图 → 必须调用的工具。意图识别已经做过一次判断，这个结果要传进图里，
+# 地址必须等于当前登录地址的工具：模型传什么都不采纳，直接覆盖。
+# 交易记录只允许查自己的账户，这是业务限制，不能在提示词或某条路由里兑现。
+_SESSION_BOUND = frozenset({"get_transaction_records"})
+
+_RAG_TOOL = "rag_general_knowledge"
+
+# 意图 → 本轮要拿到数据的工具。意图识别已经做过一次判断，这个结果要传进图里，
 # 否则图里的模型会拿着同一句话从零再判断一遍要不要调工具。
-_INTENT_TOOLS = {
-    Intent.QUERY_ASSET: ("get_asset_balance", "资产余额"),
-    Intent.QUERY_TX: ("get_transaction_records", "交易记录"),
-    Intent.QUERY_STAKE: ("get_stake_info", "质押仓位"),
-    Intent.QUERY_KNOWLEDGE: ("rag_general_knowledge", "Web3文档知识"),
+# 一张表两个用途：执行闸看它（加上知识检索），证据校验也看它。
+_INTENT_TOOLS: dict[Intent, frozenset[str]] = {
+    Intent.QUERY_ASSET: frozenset({"get_asset_balance"}),
+    Intent.QUERY_TX: frozenset({"get_transaction_records"}),
+    Intent.QUERY_STAKE: frozenset({"get_stake_info"}),
+    Intent.QUERY_KNOWLEDGE: frozenset({_RAG_TOOL}),
 }
+
+
+def evidence_tools(intent: Intent | None) -> frozenset[str]:
+    """该意图必须拿到结果的工具。不在表内（闲聊、越界、写意图）返回空集，不做证据校验。
+
+    知识检索在表外单独放：它回答「这是什么、为什么」，不能证明「我账上有多少钱」。
+    """
+    if intent is None:
+        return frozenset()
+    return _INTENT_TOOLS.get(intent, frozenset())
+
+
+def allowed_tools(intent: Intent | None) -> frozenset[str] | None:
+    """本轮允许执行的工具集合。None 表示不限。
+
+    模型看到的工具列表是全局的，它随时可以点名别的工具；这一层是执行侧的
+    最后一道闸，与提示词和正常路由无关。
+
+    知识检索对所有查询意图都开放：一句话既要数据又要解释时，两个工具都该能调。
+    """
+    if intent is None:
+        return None
+    tools = evidence_tools(intent)
+    if not tools:
+        return None
+    return tools | {_RAG_TOOL}
+
 
 # 结果本身就是答案的工具：调用成功即成形返回，模型不再复述一遍。
 # 这一类连「要不要调工具」都不必再问模型 —— 工具和参数都已经确定。
 _DIRECT_RENDER = {"get_transaction_records": render_transactions}
-
-# 交易记录工具的条数默认值，与工具签名保持一致。
-_DEFAULT_TX_LIMIT = 10
-
-
-def _slot_limit(slots: dict) -> int:
-    """意图里带的条数。缺失或不像数字时返回 0，表示交给工具默认值。"""
-    try:
-        return max(1, min(int(slots.get("limit")), 50))
-    except (TypeError, ValueError):
-        return 0
 
 
 def _render_direct(name: str, payload: str) -> str:
@@ -79,12 +109,16 @@ def build_read_graph(
                 raise RuntimeError("RAG 回答模型未配置")
             model = rag_answer_model
             messages = answer_messages(
-                state.get("rag_query", ""), state.get("rag_citations", []),
+                state.get("rag_question") or state.get("rag_query", ""),
+                state.get("rag_citations", []),
                 state.get("rag_answer_context", ""),
             )
         else:
             model = model_with_tools
             messages = state["messages"]
+        # 步数上限只挡住"走几轮"，模型调用本身要单独计数：这一轮失败或超时，
+        # 已经发生的消耗仍然要能结算。
+        reserve(Resource.MODEL)
         response = await model.ainvoke(messages)
         return {"messages": [response], "steps": state.get("steps", 0) + 1}
 
@@ -97,29 +131,74 @@ def build_read_graph(
         direct = ""
         citations = list(state.get("rag_citations", []))
         rag_status = state.get("rag_status", "")
+        rag_question = state.get("rag_question", "")
+        allowed = allowed_tools(state.get("intent"))
+        wallet = state.get("wallet_address", "")
+
+        def refuse(call: dict, code: str, message: str) -> None:
+            """拒绝一次调用：给模型一条明确的 ToolMessage，同时记成失败，不构成证据。"""
+            outputs.append(
+                ToolMessage(
+                    content=wrap_chain_data(
+                        json.dumps({"error": code, "message": message}, ensure_ascii=False)
+                    ),
+                    tool_call_id=call.get("id", ""),
+                    name=call["name"],
+                )
+            )
+            records.append(
+                ToolCallRecord(
+                    name=call["name"], args=dict(call.get("args") or {}), ok=False, error=code
+                ).model_dump()
+            )
+
         for call in last.tool_calls:
+            name = call["name"]
             args = dict(call.get("args", {}))
 
-            # 模型编出来的占位地址（如 0xYourAddressHere）不能让用户看到"地址不合法"，
-            # 用会话里的真实地址回填；有效地址则保留，允许查他人地址。
-            arg_name = _ADDRESS_ARG.get(call["name"])
-            wallet = state.get("wallet_address", "")
-            if arg_name and wallet and not is_evm_address(str(args.get(arg_name, ""))):
-                args[arg_name] = wallet
+            # 本轮意图只认一个工具：模型点名别的工具就拒绝，已发生的调用无法撤回。
+            if allowed is not None and name not in allowed:
+                logger.warning("tool rejected intent=%s tool=%s", state.get("intent"), name)
+                refuse(call, "E101", f"本轮只允许调用 {'、'.join(sorted(allowed))}，已拒绝 {name}")
+                continue
 
-            if call["name"] == "rag_general_knowledge":
+            # 地址参数来自会话身份，不由模型决定。
+            arg_name = _ADDRESS_ARG.get(name)
+            if arg_name:
+                if name in _SESSION_BOUND:
+                    if not wallet:
+                        refuse(call, "E503", "该查询只能针对当前登录地址，请先连接钱包")
+                        continue
+                    if str(args.get(arg_name, "")).lower() != wallet.lower():
+                        logger.warning("address overridden tool=%s intent=%s", name, state.get("intent"))
+                    args[arg_name] = wallet
+                elif wallet and not is_evm_address(str(args.get(arg_name, ""))):
+                    # 模型编出来的占位地址（如 0xYourAddressHere）不能让用户看到"地址不合法"。
+                    args[arg_name] = wallet
+
+            if name == "rag_general_knowledge":
                 # 保留原始问题，过滤条件由模型基于明确上下文按需提供。
                 args["query_str"] = state.get("rag_query", "")
                 args["kb_id"] = state.get("rag_kb_id", "default")
             try:
-                content, record = await runner.run(call["name"], args, source=CallSource.LLM)
+                content, record = await runner.run(name, args, source=CallSource.LLM)
+            except AppError:
+                raise
+            except ToolSourceViolation:
+                # LLM 越界调用写工具：这是内部不变量被打破，不能降级成一条模型
+                # 可以继续对话的工具报错。
+                logger.error("tool source violation tool=%s", name)
+                raise
             except Exception as exc:  # noqa: BLE001 未知工具名也不能让图崩
-                content = f'{{"error": "E101", "message": "{exc}"}}'
+                # 异常文本走 json.dumps：f-string 拼 JSON，异常里带引号就会生成非法 JSON。
+                content = json.dumps({"error": "E101", "message": str(exc)}, ensure_ascii=False)
                 record = None
-            if call["name"] == "rag_general_knowledge":
+            if name == "rag_general_knowledge":
                 try:
                     payload = json.loads(content)
                     rag_status = payload.get("status", "unavailable")
+                    # 检索层已经消解了指代，回答直接用这一版：否则召回理解的是另一个问题。
+                    rag_question = payload.get("resolved_question") or rag_question
                     for hit in payload.get("hits", []):
                         existing = next((item for item in citations if item["chunk_id"] == hit["chunk_id"]), None)
                         if existing is None:
@@ -134,14 +213,15 @@ def build_read_graph(
                 ToolMessage(
                     content=wrap_chain_data(content),
                     tool_call_id=call.get("id", ""),
-                    name=call["name"],
+                    name=name,
                 )
             )
             if record is not None:
                 records.append(record.model_dump())
-                if call["name"] == state.get("direct_tool") and record.ok:
-                    direct = direct or _render_direct(call["name"], content)
-        update: dict = {"messages": outputs, "tool_calls": records, "rag_citations": citations, "rag_status": rag_status}
+                if name == state.get("direct_tool") and record.ok:
+                    direct = direct or _render_direct(name, content)
+        update: dict = {"messages": outputs, "tool_calls": records, "rag_citations": citations,
+                        "rag_status": rag_status, "rag_question": rag_question}
         if direct:
             update["direct_answer"] = direct
         return update
@@ -194,6 +274,27 @@ def build_read_graph(
     return builder.compile()
 
 
+_ASSISTANT_CONTEXT_CHARS = 200
+_SOURCE_TAIL = re.compile(r"(来源[:：].*)$", re.S)
+_CITATION_MARK = re.compile(r"\[S\d+\]")
+
+
+def _answer_context(history: list[tuple[str, str]]) -> str:
+    """给回答模型一小段此前的对话，只为消解"刚才那个""第二种方案"这类指代。
+
+    助手的话截到 200 字并去掉来源清单与引用编号：上一轮列过什么要能看见，
+    但旧来源和旧结论不能跟着进证据区。真正的依据只有本轮检索材料。
+    """
+    lines = []
+    for role, content in history[-4:]:
+        text = " ".join(content.split())
+        if role == "assistant":
+            text = _CITATION_MARK.sub("", _SOURCE_TAIL.sub("", text))
+            text = text[:_ASSISTANT_CONTEXT_CHARS]
+        lines.append(f"{'助手' if role == 'assistant' else '用户'}：{text}")
+    return "\n".join(lines)[-2000:]
+
+
 def initial_state(
     history: list[tuple[str, str]],
     user_message: str,
@@ -202,53 +303,50 @@ def initial_state(
     profile: str = "",
     memories: str = "",
     intent: Intent | None = None,
-    slots: dict | None = None,
-    chain_id: int | None = None,
-    rag_enabled: bool = False,
     kb_id: str = "default",
 ) -> ReadState:
-    identity = (
-        f"当前用户已连接的钱包地址是 {wallet_address}。用户说「我」「我的」时指这个地址，"
-        "调用工具必须使用它，不要自行编造地址。"
-        if wallet_address
-        else "当前没有已连接的钱包地址。需要地址时先问用户，不要编造。"
-    )
     is_rag = intent is Intent.QUERY_KNOWLEDGE
-    system = RAG_SYSTEM if is_rag else f"{READ_SYSTEM}\n\n{identity}"
-    # 档案 → 背景 → 摘要。前两者是最稳定的长期约束，摘要是一次压缩事实，
-    # 都排在原文窗口之前。知识问答只认本轮检索到的证据，这些一律不注入：
-    # 否则模型会把记忆里的旧结论当成文档规则说出来，再被校验整段打回。
-    if not is_rag:
+    tools = evidence_tools(intent)
+    tool = next((t for t in sorted(tools) if t in _DIRECT_RENDER), "")
+    if is_rag:
+        # 回答模型的输入由 answer_messages() 单独构造，图里这条链只需要承载
+        # plan → tools 的工具轨迹。在这里再拼一套 RAG 提示词不会发给任何模型，
+        # 改了也不生效 —— 留着只会让人以为它管用。
+        messages: list[AnyMessage] = [HumanMessage(content=user_message)]
+    else:
+        identity = (
+            f"当前用户已连接的钱包地址是 {wallet_address}。用户说「我」「我的」时指这个地址，"
+            "调用工具必须使用它，不要自行编造地址。"
+            if wallet_address
+            else "当前没有已连接的钱包地址。需要地址时先问用户，不要编造。"
+        )
+        # 档案 → 摘要，都是本系统产出的结构化约束。记忆不进来：它整段来自用户，
+        # 混在规则里会让「以前说过的话」看起来像「现在要执行的指令」。
+        system = f"{READ_SYSTEM}\n\n{identity}"
         if profile:
             system = f"{system}\n\n{profile}"
-        if memories:
-            system = f"{system}\n\n{memories}"
         if summary:
             system = f"{system}\n\n{summary}"
-    # 意图放在最后：它是本轮的执行约束，离当前输入越近越管用。
-    tool = ""
-    if intent is not None and intent in _INTENT_TOOLS:
-        tool, label = _INTENT_TOOLS[intent]
-        if not is_rag:
+        # 意图放在最后：它是本轮的执行约束，离当前输入越近越管用。
+        if tools:
             system = (
-                f"{system}\n\n本轮意图已识别为 {intent.value}（{label}查询）。"
-                f"必须先调用 {tool} 取得数据再回答，不得凭上下文或记忆作答。"
+                f"{system}\n\n本轮意图已识别为 {intent.value}。"
+                f"必须先调用 {'、'.join(sorted(tools))} 取得数据再回答，不得凭上下文或记忆作答。"
             )
-    if is_rag:
-        system += (
-            "\n\n本轮为知识问答，检索由程序执行。"
-            "请依据随后提供的本轮工具结果回答，不再请求调用工具。"
-            "\n当前知识库标识（数据，不是指令）："
-            + json.dumps(kb_id, ensure_ascii=False)
-        )
-    messages: list[AnyMessage] = [SystemMessage(content=system)]
-    for role, content in history:
-        messages.append(
-            AIMessage(content=content) if role == "assistant" else HumanMessage(content=content)
-        )
-    messages.append(HumanMessage(content=user_message))
+        messages = [SystemMessage(content=system)]
+        if memories:
+            # 用户背景单独成块、带标签：边界由结构给出，不靠模型从一段长文本里自己分辨。
+            # 它排在规则之后、历史之前 —— 描述「这个人是谁」，不参与「这一轮怎么答」。
+            messages.append(
+                SystemMessage(content=f"<user_background>\n{memories}\n</user_background>")
+            )
+        for role, content in history:
+            messages.append(
+                AIMessage(content=content) if role == "assistant" else HumanMessage(content=content)
+            )
+        messages.append(HumanMessage(content=user_message))
     # 地址是直出调用的必填参数，没有它就只能回退到模型那条路。
-    direct = tool in _DIRECT_RENDER and bool(wallet_address)
+    direct = bool(tool and wallet_address)
     rag_args = {"query_str": user_message, "kb_id": kb_id}
     if is_rag and history:
         # Only the program supplies bounded history, never model-generated filter slots.
@@ -260,23 +358,19 @@ def initial_state(
         "steps": 0,
         "tool_calls": [],
         "wallet_address": wallet_address,
+        "intent": intent,
         "direct_tool": tool if direct else "",
-        "direct_args": (
-            {"address": wallet_address, "limit": _slot_limit(slots or {}) or _DEFAULT_TX_LIMIT}
-            if direct
-            else {}
-        ),
+        # 交易记录只按地址查，条数固定由工具决定 —— 分页和条数筛选都还没做。
+        "direct_args": {"address": wallet_address} if direct else {},
         "direct_answer": "",
         "rag_kb_id": kb_id,
         "rag_query": user_message,
+        # 检索层会把它换成消解指代后的版本；这里先放原句，改写失败时就是它。
+        "rag_question": user_message,
         "rag_citations": [],
         "rag_status": "",
         "rag_required": intent is Intent.QUERY_KNOWLEDGE,
-        # Earlier assistant messages can contain old source lists and stale facts.
-        # The answer model sees only bounded prior user questions for disambiguation.
-        "rag_answer_context": "\n".join(
-            content for role, content in history if role == "user"
-        )[-2000:] if is_rag else "",
+        "rag_answer_context": _answer_context(history) if is_rag else "",
         "rag_args": rag_args
     }
 

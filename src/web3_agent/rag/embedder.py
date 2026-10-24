@@ -9,8 +9,9 @@ from __future__ import annotations
 import httpx
 from langchain_ollama import OllamaEmbeddings
 
-from web3_agent.common.exceptions import ModelUnavailable
+from web3_agent.common.exceptions import BudgetExhausted, ModelUnavailable
 from web3_agent.config.settings import Settings
+from web3_agent.common.metering import Resource, reserve
 
 
 class Embedder:
@@ -31,6 +32,8 @@ class Embedder:
     async def embed_many(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
+        if not reserve(Resource.EMBEDDING):
+            raise BudgetExhausted("本轮向量化次数已达上限")
         try:
             vectors = await self._model.aembed_documents(texts)
         except (httpx.HTTPError, ConnectionError, TimeoutError) as exc:

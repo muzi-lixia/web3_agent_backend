@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import delete, select
@@ -64,6 +65,24 @@ async def read(
     )
     value = (await db.execute(stmt)).scalar_one_or_none()
     return int(value or 0)
+
+
+async def read_many(
+    db: AsyncSession,
+    *,
+    user_key: str,
+    metrics: Sequence[QuotaMetric],
+    window_start: datetime | None = None,
+) -> dict[QuotaMetric, int]:
+    """一次取多个维度。请求入口要查两条、快照要查四条，逐个查就是白跑的往返。"""
+    window = window_start or bucket_start()
+    subjects = [_subject(user_key, metric) for metric in metrics]
+    stmt = select(QuotaCounter.subject, QuotaCounter.count).where(
+        QuotaCounter.subject.in_(subjects),
+        QuotaCounter.window_start == window,
+    )
+    found = {subject: int(count) for subject, count in (await db.execute(stmt)).all()}
+    return {metric: found.get(_subject(user_key, metric), 0) for metric in metrics}
 
 
 async def cleanup(db: AsyncSession, *, older_than_seconds: int = 3600) -> int:

@@ -1,4 +1,4 @@
-"""记忆仓储：active 唯一、supersede 留痕、向量召回、水位线。用构造向量，不起模型。"""
+"""记忆仓储：active 唯一、supersede 留痕、按时间倒序取用、水位线。"""
 
 from __future__ import annotations
 
@@ -13,8 +13,6 @@ from web3_agent.domain.memory.memory import MemoryItem
 from web3_agent.persistence.pg import base as pg
 from web3_agent.persistence.pg.orm_models import ConversationMessage, UserMemory, UserMemoryState
 from web3_agent.persistence.pg.repositories import conversation_repo, memory_repo
-
-DIM = 1024
 
 
 def _pg_ready() -> bool:
@@ -38,18 +36,28 @@ def _uid() -> str:
     return str(uuid.uuid4())
 
 
-def _vec(head: float) -> list[float]:
-    return [head] + [0.0] * (DIM - 1)
-
-
-def _second(index: int) -> list[float]:
-    vec = [0.0] * DIM
-    vec[index] = 1.0
-    return vec
-
-
 def _item(subject: str, text: str, kind: str = "profile") -> MemoryItem:
     return MemoryItem(text=text, memory_type=kind, subject=subject, confidence=0.9)
+
+
+async def _claim(db, uid: str, ttl: int = 60) -> str:
+    token = uuid.uuid4().hex
+    assert await memory_repo.claim(db, uid, token, ttl) is True
+    return token
+
+
+async def _commit(
+    db, uid: str, *, token: str, until: int, watermark: int = 0, items: list[MemoryItem] = ()
+) -> bool:
+    return await memory_repo.commit_extraction(
+        db,
+        uid,
+        until_id=until,
+        items=list(items),
+        expected_watermark=watermark,
+        expected_generation=0,
+        claim_token=token,
+    )
 
 
 def _run(coro):
@@ -62,6 +70,16 @@ def _run(coro):
             await pg.dispose_engine()
 
     return asyncio.run(wrapper())
+
+
+async def _all_rows(db, uid: str) -> list[UserMemory]:
+    from sqlalchemy import select
+
+    return list(
+        (await db.execute(select(UserMemory).where(UserMemory.siwe_user_id == uid)))
+        .scalars()
+        .all()
+    )
 
 
 async def _cleanup(uid: str) -> None:
@@ -78,10 +96,13 @@ def test_supersede_leaves_one_active_row() -> None:
 
     async def flow() -> tuple[int, int]:
         async with pg.session_scope() as db:
-            await memory_repo.insert_many(db, uid, [_item("gas", "用户关心 gas 成本")], [_vec(1.0)])
+            token = await _claim(db, uid)
+            await _commit(db, uid, token=token, until=1, items=[_item("gas", "用户关心 gas 成本")])
         async with pg.session_scope() as db:
-            await memory_repo.supersede(db, uid, ["gas"])
-            await memory_repo.insert_many(db, uid, [_item("gas", "用户已经在做套利")], [_vec(1.0)])
+            token = await _claim(db, uid)
+            assert await _commit(
+                db, uid, token=token, until=2, watermark=1, items=[_item("gas", "用户已经在做套利")]
+            )
         async with pg.session_scope() as db:
             active = await memory_repo.active_items(db, uid)
         async with pg.session_scope() as db:
@@ -96,26 +117,58 @@ def test_supersede_leaves_one_active_row() -> None:
         _run(lambda: _cleanup(uid))
 
 
-async def _all_rows(db, uid: str) -> list[UserMemory]:
-    from sqlalchemy import select
+def test_active_items_returns_newest_first() -> None:
+    """注入时按 created_at 倒序取前几条 —— 最近提到的就是当下最相关的。"""
+    uid = _uid()
 
-    return list(
-        (await db.execute(select(UserMemory).where(UserMemory.siwe_user_id == uid)))
-        .scalars()
-        .all()
-    )
+    async def flow() -> list[str]:
+        async with pg.session_scope() as db:
+            token = await _claim(db, uid)
+            await _commit(
+                db, uid, token=token, until=1,
+                items=[_item("earliest", "最早"), _item("middle", "中间")],
+            )
+        async with pg.session_scope() as db:
+            token = await _claim(db, uid)
+            await _commit(
+                db, uid, token=token, until=2, watermark=1,
+                items=[_item("latest", "最新")],
+            )
+        async with pg.session_scope() as db:
+            rows = await memory_repo.active_items(db, uid)
+        return [r.subject for r in rows]
+
+    try:
+        assert _run(flow)[0] == "latest"
+    finally:
+        _run(lambda: _cleanup(uid))
 
 
 def test_partial_unique_index_blocks_second_active() -> None:
-    """同 subject 两条 active 必须被库挡住 —— 这是去重的最后一道，不靠代码自觉。"""
+    """同 subject 两条 active 必须被库挡住 —— 这是去重的最后一道，不靠代码自觉。
+
+    直接走 ORM 插行，绕开 commit_extraction 的 supersede：这里验的是索引本身。
+    """
     uid = _uid()
 
     async def flow() -> bool:
         async with pg.session_scope() as db:
-            await memory_repo.insert_many(db, uid, [_item("gas", "第一句")], [_vec(1.0)])
+            db.add(
+                UserMemory(
+                    siwe_user_id=uid, text="第一句", memory_type="profile",
+                    subject="gas", confidence=0.9,
+                )
+            )
+            await db.flush()
         try:
             async with pg.session_scope() as db:
-                await memory_repo.insert_many(db, uid, [_item("gas", "第二句")], [_vec(1.0)])
+                db.add(
+                    UserMemory(
+                        siwe_user_id=uid, text="第二句", memory_type="profile",
+                        subject="gas", confidence=0.9,
+                    )
+                )
+                await db.flush()
         except IntegrityError:
             return True
         return False
@@ -126,48 +179,22 @@ def test_partial_unique_index_blocks_second_active() -> None:
         _run(lambda: _cleanup(uid))
 
 
-def test_recall_filters_by_distance_and_excludes_constraint() -> None:
-    uid = _uid()
-
-    async def flow() -> list[str]:
-        async with pg.session_scope() as db:
-            await memory_repo.insert_many(
-                db,
-                uid,
-                [
-                    _item("near", "方向几乎一样", "preference"),
-                    _item("far", "方向差 45 度", "preference"),
-                    _item("rule", "不允许转账", "constraint"),
-                ],
-                [[1.0] + [0.0] * (DIM - 1), [0.7071, 0.7071] + [0.0] * (DIM - 2), [1.0] + [0.0] * (DIM - 1)],
-            )
-        async with pg.session_scope() as db:
-            rows = await memory_repo.recall(
-                db, uid, embedding=[1.0] + [0.0] * (DIM - 1), limit=3, max_distance=0.1
-            )
-        return [r.subject for r in rows]
-
-    try:
-        subjects = _run(flow)
-        assert subjects == ["near"]  # 45 度那条被距离阈值挡住，constraint 不参与向量召回
-    finally:
-        _run(lambda: _cleanup(uid))
-
-
 def test_watermark_advances_and_failure_keeps_it() -> None:
     uid = _uid()
 
-    async def flow() -> tuple[int, int, int]:
+    async def flow() -> tuple[int, int]:
         async with pg.session_scope() as db:
-            await memory_repo.advance_watermark(db, uid, 42)
+            token = await _claim(db, uid)
+            assert await _commit(db, uid, token=token, until=42)
         async with pg.session_scope() as db:
-            await memory_repo.mark_failed(db, uid)
+            token = await _claim(db, uid)
+            await memory_repo.mark_failed(db, uid, claim_token=token, expected_generation=0)
         async with pg.session_scope() as db:
             state = await memory_repo.get_state(db, uid)
-        return state.last_extracted_message_id, state.fail_count, 0
+        return state.last_extracted_message_id, state.fail_count
 
     try:
-        watermark, fail_count, _ = _run(flow)
+        watermark, fail_count = _run(flow)
         assert watermark == 42  # 失败不改水位线，下一轮还会重抽这段
         assert fail_count == 1
     finally:
@@ -180,11 +207,13 @@ def test_purge_removes_superseded_rows_and_watermark() -> None:
 
     async def flow() -> tuple[int, int, object]:
         async with pg.session_scope() as db:
-            await memory_repo.insert_many(db, uid, [_item("gas", "第一句")], [_vec(1.0)])
+            token = await _claim(db, uid)
+            await _commit(db, uid, token=token, until=1, items=[_item("gas", "第一句")])
         async with pg.session_scope() as db:
-            await memory_repo.supersede(db, uid, ["gas"])
-            await memory_repo.insert_many(db, uid, [_item("gas", "第二句")], [_vec(1.0)])
-            await memory_repo.advance_watermark(db, uid, 7)
+            token = await _claim(db, uid)
+            assert await _commit(
+                db, uid, token=token, until=7, watermark=1, items=[_item("gas", "第二句")]
+            )
         async with pg.session_scope() as db:
             deleted = await memory_repo.purge(db, uid)
         async with pg.session_scope() as db:
@@ -225,5 +254,29 @@ def test_pending_for_memory_takes_earliest_batch() -> None:
         assert total == 20
         assert batch[0] == "m6"
         assert len(batch) == 10
+    finally:
+        _run(lambda: _cleanup(uid))
+
+
+def test_pending_for_memory_skips_summary_row() -> None:
+    """摘要行不是对话内容，抽取记忆时不能把它当一轮消息喂给模型。"""
+    uid = _uid()
+
+    async def flow() -> list[str]:
+        async with pg.session_scope() as db:
+            await conversation_repo.append_message(db, siwe_user_id=uid, role="user", content="m1")
+        async with pg.session_scope() as db:
+            await conversation_repo.write_summary(
+                db, uid, content='{"core_needs":["摘要"]}', expected_id=None, expected_generation=0
+            )
+        async with pg.session_scope() as db:
+            await conversation_repo.append_message(db, siwe_user_id=uid, role="user", content="m2")
+        async with pg.session_scope() as db:
+            total, batch = await conversation_repo.pending_for_memory(db, uid, since_id=0, cap=10)
+        assert total == 2  # 两条消息，摘要行不算
+        return [content for _, _, content in batch]
+
+    try:
+        assert _run(flow) == ["m1", "m2"]
     finally:
         _run(lambda: _cleanup(uid))

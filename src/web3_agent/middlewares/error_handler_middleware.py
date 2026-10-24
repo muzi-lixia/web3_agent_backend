@@ -14,7 +14,16 @@ from web3_agent.common.tracing import get_trace_id
 logger = logging.getLogger(__name__)
 
 
-def _error(code: str, msg: str, status: int, retryable: bool = False) -> JSONResponse:
+def _error(
+    code: str,
+    msg: str,
+    status: int,
+    retryable: bool = False,
+    retry_after: int | None = None,
+) -> JSONResponse:
+    headers = {"X-Trace-Id": get_trace_id()}
+    if retry_after is not None:
+        headers["Retry-After"] = str(retry_after)
     return JSONResponse(
         status_code=status,
         content={
@@ -23,14 +32,14 @@ def _error(code: str, msg: str, status: int, retryable: bool = False) -> JSONRes
             "retryable": retryable,
             "httpStatus": status,
         },
-        headers={"X-Trace-Id": get_trace_id()},
+        headers=headers,
     )
 
 
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def _app_error(_: Request, exc: AppError) -> JSONResponse:
-        return _error(exc.code, exc.message, exc.http_status, exc.retryable)
+        return _error(exc.code, exc.message, exc.http_status, exc.retryable, exc.retry_after)
 
     @app.exception_handler(RequestValidationError)
     async def _validation(_: Request, exc: RequestValidationError) -> JSONResponse:

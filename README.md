@@ -13,14 +13,16 @@ POST /api/v1/chat  →  限流（1 分钟分桶，落 PG）
                    →  JsonGuard 熔断
                    →  IntentRouter（唯一路由决策点）
                    →  route=read → LangGraph ReAct 子图（≤5 步）
-                   →  3 个只读工具（余额 / 交易记录 / 质押）
+                   →  只读工具（余额 / 交易记录 / 质押）+ 知识库检索
                    →  回答 + 步数/RPC 计数回写配额
 
 POST /api/v1/auth/nonce   →  一次性 nonce（5 分钟，绑定地址与 chainId）+ 完整 SIWE 消息
 POST /api/v1/auth/verify  →  校验 domain/uri/时效 → 验签反推地址 → 核销 nonce → 签 JWT
 ```
 
-- 对话历史落 PG `conversation_session` / `conversation_message`，按 `expires_at` 惰性过期；
+- 闲聊不进工具图；知识问答走独立检索与回答，不注入档案/记忆/摘要；
+- 对话历史落 PG `conversation_message`，按 `expires_at` 惰性过期；清空与删除靠
+  `conversation_generation` 版本号拦截在途写入，并同步清掉幂等缓存里的答案副本；
 - 审计落 PG `audit_log`，`trace_id` 贯穿整条链路；登录成功与 SIWE 拒绝各留一条；
 - 私钥/助记词命中时**不调用模型、不落库**，直接拒答；
 - LangSmith 上报收敛在 `agent/langsmith_tracer.py` 一处，默认关闭。
@@ -33,10 +35,10 @@ POST /api/v1/auth/verify  →  校验 domain/uri/时效 → 验签反推地址 �
 | 私钥粘贴 | 拒答、`steps=0`（未调模型）、PG 里查不到该会话（未落库） |
 | 写意图 | `帮我转 10 USDC 给 0x44…` → 意图识别为 transfer，路由到 write 后被拦为"尚未接入"，不生成 TxIntent |
 | 闲聊 / 越界 | 正常回答或说明能力边界，不误触发工具 |
-| 落库 | 会话 8 条消息、审计 5 条（4 条 intent_routed + 1 条 secret_leak_blocked） |
+| 落库 | 一轮 8 条消息、审计 5 条（4 条 intent_routed + 1 条 secret_leak_blocked） |
 | SIWE 登录 | nonce → 钱包签名 → verify 返回 token；同一签名重放被拒（401/E503）；用别的钱包签同一消息被拒 |
 | 限流 | 当前分钟匿名计数打满后 `/chat` 在进模型之前返回 429/E501，`retryable=true` |
-| 测试 | 72 条全绿（65 单测 + 7 集成，集成需本机 PG） |
+| 测试 | 416 通过 / 18 跳过（集成用例需本机 PG，连不上自动 skip） |
 
 > 地址注入：模型曾把 `address` 填成 `0xYourAddressHere`。现在会话地址写进 system prompt，
 > 且地址参数不是合法 EVM 地址时由后端回填——**不让"模型编地址"变成用户看到的"地址不合法"**。
@@ -90,8 +92,10 @@ curl -s localhost:8000/api/v1/auth/verify -H 'content-type: application/json' \
 - 1 分钟分桶，`quota_counter` 单语句 upsert 累加（`ON CONFLICT DO UPDATE ... RETURNING`），
   一次往返拿到最新值，不在热路径上先查后改；
 - 匿名按 IP、登录按 `siwe_user_id`；`/auth/*` 单独一档额度；
-- RPC 次数由 `web3/metering.py` 用 ContextVar 在请求内累加，请求结束时回写——
-  `ChainAdapter` 是进程级单例，按用户归属只能在请求上下文里做；
+- 单轮资源预算由 `web3/metering.py` 用 ContextVar 记账：模型调用 / 工具调用 / 下游请求 /
+  探索器四类分开限额，调用前预留、结束结算，取消与异常也走收尾。用 ContextVar 而不是逐层传参，
+  是因为 `ChainAdapter` 是进程级单例，按用户归属只能挂在请求上下文上；
+- 凭据无效时按匿名计入 IP 额度，再交给业务依赖返回 401 —— 否则带一个坏 token 就绕过了整个计数器；
 - 超限统一 429/E501。PRD 写的是"超限降级只读"，但降级需要有写链路可降，写链路上线后改判定即可。
 
 ## 与文档的差异（都是显式选择，不是遗漏）
@@ -104,7 +108,7 @@ curl -s localhost:8000/api/v1/auth/verify -H 'content-type: application/json' \
 
 - 真实质押合约地址 + ABI（当前 `STAKE_CONTRACTS` 为空）
 - IntentRouter 语义互斥表（`(intent × token × 目标)` 判定矩阵）
-- 前端不在本仓库：PRD 16 章的"用户故事全通过"需要改判为接口级验收
+- 前端在同级目录 `web3_agent_frontend`；本仓库只做接口级验收，PRD 16 章的用户故事要前后端一起看
 
 ## 通用 Web3 文档 RAG（可选 P0）
 

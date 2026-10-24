@@ -13,7 +13,6 @@ from __future__ import annotations
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from web3_agent.common.exceptions import E501_QUOTA_EXHAUSTED, AppError
-from web3_agent.common.types import BudgetSnapshot
 from web3_agent.config.constants import QuotaMetric
 from web3_agent.config.settings import Settings
 from web3_agent.persistence.pg.repositories import quota_repo
@@ -48,14 +47,6 @@ class QuotaController:
             return
         await quota_repo.incr(db, user_key=key, metric=metric, amount=amount)
 
-    async def snapshot(self, db: AsyncSession, *, key: str) -> BudgetSnapshot:
-        return BudgetSnapshot(
-            steps=await quota_repo.read(db, user_key=key, metric=QuotaMetric.STEPS),
-            tokens=await quota_repo.read(db, user_key=key, metric=QuotaMetric.TOKENS),
-            rpcCalls=await quota_repo.read(db, user_key=key, metric=QuotaMetric.RPC_CALLS),
-            txCount=await quota_repo.read(db, user_key=key, metric=QuotaMetric.TX_COUNT),
-        )
-
     async def check_request(
         self, db: AsyncSession, *, key: str, logged_in: bool, auth_endpoint: bool = False
     ) -> None:
@@ -68,10 +59,13 @@ class QuotaController:
             else self._settings.quota_anon_rpm
         )
         await self.hit(db, key=key, metric=QuotaMetric.QPS, limit=rpm)
-        for metric, limit in (
+        limits = (
             (QuotaMetric.RPC_CALLS, self._settings.quota_rpc_per_minute),
             (QuotaMetric.STEPS, self._settings.quota_steps_per_minute),
-        ):
-            used = await quota_repo.read(db, user_key=key, metric=metric)
-            if used >= limit:
+        )
+        counts = await quota_repo.read_many(
+            db, user_key=key, metrics=tuple(metric for metric, _ in limits)
+        )
+        for metric, limit in limits:
+            if counts[metric] >= limit:
                 raise AppError(*E501_QUOTA_EXHAUSTED, retryable=True)

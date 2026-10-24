@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import text, select
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from web3_agent.persistence.pg import base as pg
-from web3_agent.persistence.pg.orm_models import RagDocument as Document, RagChunk as Chunk, RagIngestionJob as Job, RagKnowledgeBase as KB
+from web3_agent.persistence.pg.orm_models import RagDocument as Document, RagChunk as Chunk, RagIngestionJob as Job, RagKnowledgeBase as KB, RagIndexVersion
 from web3_agent.rag.models import DocumentSpec
 from web3_agent.rag.chunker import Chunk as TextChunk
 from web3_agent.rag.vector_store import PgKnowledgeStore
@@ -33,6 +33,7 @@ def run_isolated(monkeypatch,flow):
                 await conn.run_sync(lambda sync: Document.__table__.create(sync,checkfirst=False))
                 await conn.run_sync(lambda sync: Chunk.__table__.create(sync,checkfirst=False))
                 await conn.run_sync(lambda sync: Job.__table__.create(sync,checkfirst=False))
+                await conn.run_sync(lambda sync: RagIndexVersion.__table__.create(sync,checkfirst=False))
             from web3_agent.rag.knowledge_bases import KnowledgeBaseRepository
             await KnowledgeBaseRepository().ensure_default()
             await flow(PgKnowledgeStore())
@@ -160,6 +161,76 @@ def test_vectors_and_job_success_commit_together_and_stale_claim_cannot_publish(
     run_isolated(monkeypatch,flow)
 
 
+def test_changed_index_signature_rebuilds_chunks_in_place(monkeypatch):
+    """内容没变、切块配置变了：切片必须换掉，而不是判成 unchanged 留着旧切片。"""
+    async def flow(store):
+        first = await publish(store, spec())
+        assert first["chunks"] == 1
+        # 同一份内容、同一版本，只有索引指纹变了。
+        second = await store.publish(spec(), [TextChunk("退出", "解锁期为7天"), TextChunk("补充", "罚金说明")],
+                                     [[1.0] + [0.0] * 1023, [0.0, 1.0] + [0.0] * 1022], "a", signature="new-signature")
+        assert second["document_id"] == first["document_id"]
+        assert second.get("rebuilt") and second["chunks"] == 2
+        async with pg.session_scope() as db:
+            chunks = (await db.execute(select(Chunk).where(Chunk.document_id == first["document_id"]))).scalars().all()
+            document = await db.get(Document, first["document_id"])
+        assert len(chunks) == 2
+        assert document.index_signature == "new-signature"
+    run_isolated(monkeypatch, flow)
+
+
+def test_plan_index_skips_reembedding_only_when_content_and_signature_match(monkeypatch):
+    async def flow(store):
+        assert await store.plan_index(spec(), "a", "sig-1") == (store._identity(spec())[2], False)
+        await publish(store, spec())
+        document_id, unchanged = await store.plan_index(spec(), "a", "")
+        assert document_id and unchanged
+        # 指纹不同 → 需要重建；内容不同 → 也要重新走一遍，由 publish 报版本错误。
+        assert not (await store.plan_index(spec(), "a", "sig-2"))[1]
+        assert not (await store.plan_index(spec(), "other", ""))[1]
+    run_isolated(monkeypatch, flow)
+
+
+def test_index_version_tracks_publish_and_disable(monkeypatch):
+    async def flow(store):
+        assert await store.index_state() == (0, None)
+        result = await publish(store, spec())
+        assert (await store.index_state())[0] == 1
+        # 同版本同内容重复发布是幂等的，不该让所有进程白重建一次索引。
+        assert (await publish(store, spec()))["unchanged"]
+        assert (await store.index_state())[0] == 1
+        assert await store.disable(result["document_id"])
+        assert (await store.index_state())[0] == 2
+        assert not await store.disable(result["document_id"])
+        assert (await store.index_state())[0] == 2
+        until = datetime.now(timezone.utc) + timedelta(days=1)
+        await publish(store, spec(pool="200", valid_until=until), body="到期文档")
+        revision, boundary = await store.index_state(chain_id=1, protocol_id="200")
+        assert revision == 3 and boundary == until
+        assert await store.index_state(chain_id=1, protocol_id="100") == (3, None)
+    run_isolated(monkeypatch, flow)
+
+
+def test_snapshot_sql_never_selects_embedding_columns(monkeypatch):
+    """BM25 一个向量数值都不用；把 1024 维列读出来只是白付传输与反序列化。"""
+    from sqlalchemy import event
+    async def flow(store):
+        await publish(store, spec())
+        statements = []
+        engine = pg._sessionmaker.kw["bind"].sync_engine
+        listener = lambda conn, cursor, statement, parameters, context, many: statements.append(statement)
+        event.listen(engine, "before_cursor_execute", listener)
+        try:
+            chunks = await store.keyword_snapshot()
+        finally:
+            event.remove(engine, "before_cursor_execute", listener)
+        assert [c.content for c in chunks] == ["解锁期为7天"]
+        selects = [s for s in statements if s.lstrip().upper().startswith("SELECT")]
+        # 只关心向量列本身；embedding_model / embedding_version 是文档过滤条件，必须出现。
+        assert selects and not any("rag_chunk.embedding" in s for s in selects)
+    run_isolated(monkeypatch, flow)
+
+
 def test_interrupted_job_recovery_and_bounded_retry(monkeypatch):
     from sqlalchemy import update
     from web3_agent.rag.jobs import JobRepository
@@ -228,3 +299,51 @@ def test_same_document_identity_is_unique_per_library_and_provenance_persisted(m
         assert len(hits)==1 and hits[0].page_number==2 and hits[0].page_end==3
         assert hits[0].metadata["risk_level"]=="high" and hits[0].token_count==5
     run_isolated(monkeypatch,flow)
+
+
+def test_expired_payload_is_erased_and_retry_is_refused(monkeypatch):
+    """原始文件留 3 天：到点抹掉正文，任务行留着；抹掉之后不许再重试。"""
+    from web3_agent.rag import jobs as jobs_module
+    from web3_agent.rag.jobs import PAYLOAD_RETENTION_DAYS, JobRepository
+    from web3_agent.common.exceptions import AppError
+
+    async def flow(store):
+        job_id = str(uuid.uuid4())
+        old = datetime.now(timezone.utc) - timedelta(days=PAYLOAD_RETENTION_DAYS + 1)
+        async with pg.session_scope() as db:
+            db.add(Job(id=job_id, kb_id="default", created_by="u1", fingerprint="f",
+                       filename="a.md", payload=b"raw bytes", document_metadata={},
+                       status="failed", stage="failed", error_code="INGESTION_FAILED",
+                       attempts=1, total_chunks=0, embedded_chunks=0,
+                       created_at=old, updated_at=old))
+        monkeypatch.setattr(jobs_module, "_last_purge", 0.0)
+        assert await JobRepository().claim(timeout_seconds=1, max_attempts=3) is None
+        async with pg.session_scope() as db:
+            assert (await db.execute(select(Job.payload).where(Job.id == job_id))).scalar_one() is None
+        with pytest.raises(AppError) as error:
+            await JobRepository().retry(job_id, 3)
+        assert error.value.code == "E609"
+
+    run_isolated(monkeypatch, flow)
+
+
+def test_payload_inside_retention_window_is_kept(monkeypatch):
+    """没到期的还能重试，不能顺手清掉。"""
+    from web3_agent.rag import jobs as jobs_module
+    from web3_agent.rag.jobs import JobRepository
+
+    async def flow(store):
+        job_id = str(uuid.uuid4())
+        recent = datetime.now(timezone.utc) - timedelta(days=1)
+        async with pg.session_scope() as db:
+            db.add(Job(id=job_id, kb_id="default", created_by="u1", fingerprint="f",
+                       filename="a.md", payload=b"raw bytes", document_metadata={},
+                       status="failed", stage="failed", error_code="INGESTION_FAILED",
+                       attempts=1, total_chunks=0, embedded_chunks=0,
+                       created_at=recent, updated_at=recent))
+        monkeypatch.setattr(jobs_module, "_last_purge", 0.0)
+        await JobRepository().claim(timeout_seconds=1, max_attempts=3)
+        async with pg.session_scope() as db:
+            assert (await db.execute(select(Job.payload).where(Job.id == job_id))).scalar_one() == b"raw bytes"
+
+    run_isolated(monkeypatch, flow)

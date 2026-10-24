@@ -1,7 +1,13 @@
 """长期记忆第二段：自由文本抽取（V2）。
 
-与摘要同构的两段式：事务取数 → 事务外调模型与 embedding → 事务写回。
-水位线保证同一段消息只抽一次；积压时分批吃完，水位线单调推进。
+与摘要同构的两段式：事务取数 → 事务外调模型 → 事务写回。
+
+并发由两件东西共同保证：
+- 租约（`user_memory_state.claim_token`）：同一用户同一时刻只允许一个任务在跑，
+  两个后台任务不会对着同一段消息各抽一遍；
+- 写回时比对读取时的水位线与版本：租约过期被接手、或用户中途清空了对话，
+  迟到的任务看到条件不成立就整份丢弃，不回退水位线，也不用自己的旧结论
+  把新结论顶成 superseded。
 
 和摘要的关键差别：**抽不出东西是正常结果**，不是失败 —— 大多数对话没有值得
 长期记住的背景，这种情况水位线照常推进，否则每轮都会重抽同一段。
@@ -10,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass
 
 from web3_agent.agent import langsmith_tracer
@@ -18,13 +25,12 @@ from web3_agent.common.tracing import get_trace_id, set_run_id
 from web3_agent.config.constants import QuotaMetric
 from web3_agent.config.settings import Settings
 from web3_agent.domain.memory import memory
-from web3_agent.domain.memory.embedder import Embedder
 from web3_agent.domain.memory.summarizer import INTERNAL_QUOTA_KEY
 from web3_agent.domain.quotas import QuotaController
 from web3_agent.persistence.pg.base import session_scope
 from web3_agent.persistence.pg.repositories import conversation_repo, memory_repo
 from web3_agent.persistence.pg.repositories.audit_repo import AuditLogger
-from web3_agent.web3.metering import take_rpc_calls
+from web3_agent.common.metering import start_metering
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +40,12 @@ class _Job:
     until_id: int
     messages: list[tuple[str, str]]
     existing_texts: list[str]
+    # 取数时的会话生命周期版本。写回时若已被清空推进，记忆与水印都不写。
+    generation: int
+    # 取数时的水位线。写回时要求它没变 —— 变了说明这段已经被别人抽过。
+    watermark: int
+    # 本次抽取的租约。写回和失败计数都要求它还在自己手里。
+    claim_token: str
 
 
 class MemoryExtractor:
@@ -41,13 +53,11 @@ class MemoryExtractor:
         self,
         settings: Settings,
         llm: LlmAdapter,
-        embedder: Embedder,
         audit: AuditLogger,
         quota: QuotaController,
     ) -> None:
         self._settings = settings
         self._llm = llm
-        self._embedder = embedder
         self._audit = audit
         self._quota = quota
 
@@ -57,7 +67,7 @@ class MemoryExtractor:
         return fail_count < self._settings.memory_fail_max
 
     async def run(self, *, siwe_user_id: str, job: _Job | None = None) -> None:
-        take_rpc_calls()
+        start_metering(scope="background")  # 后台任务用自己的计费表，不串进任何一轮对话
         try:
             job = job or await self.collect(siwe_user_id)
             if job is None:
@@ -67,8 +77,21 @@ class MemoryExtractor:
             logger.exception("memory extract crashed: user=%s", siwe_user_id)
 
     async def collect(self, siwe_user_id: str) -> _Job | None:
-        """探水位线并取出待抽取区间。返回 None 表示这轮没活干。"""
+        """探水位线并取出待抽取区间。返回 None 表示这轮没活干，或已有任务在跑。
+
+        先抢租约再读水位线，顺序不能反：反过来的话，两个任务会读到同一个水位线，
+        抢到租约的后一个拿着过期的 `since` 去抽一段已经被抽过的消息，
+        写回时才发现水位线变了 —— 模型调用已经白花了。
+        """
+        token = uuid.uuid4().hex
         async with session_scope() as db:
+            if not await memory_repo.claim(
+                db, siwe_user_id, token, self._settings.memory_claim_ttl_seconds
+            ):
+                return None
+            # 版本先于数据读取，理由同 summarizer.collect：读消息之后才取版本，
+            # 中间提交的清空会把旧消息标成新版本，写回校验拦不住。
+            generation = await conversation_repo.current_generation(db, siwe_user_id)
             state = await memory_repo.get_state(db, siwe_user_id)
             since = state.last_extracted_message_id if state else 0
             fail_count = state.fail_count if state else 0
@@ -80,6 +103,8 @@ class MemoryExtractor:
                 cap=self._settings.memory_batch_cap,
             )
             if not rows or not self.should_run(pending=pending, fail_count=fail_count):
+                # 没活干必须把租约还回去：留着会让这个用户的抽取等到过期才恢复。
+                await memory_repo.release_claim(db, siwe_user_id, token)
                 return None
 
             existing = await memory_repo.active_items(db, siwe_user_id)
@@ -87,6 +112,9 @@ class MemoryExtractor:
                 until_id=rows[-1][0],
                 messages=[(role, content) for _, role, content in rows],
                 existing_texts=[row.text for row in existing],
+                generation=generation,
+                watermark=since,
+                claim_token=token,
             )
 
     async def _extract(self, siwe_user_id: str, job: _Job) -> None:
@@ -110,31 +138,42 @@ class MemoryExtractor:
         items = _dedupe(raw.items, existing=job.existing_texts)
         await self._charge()
 
-        if items:
-            try:
-                embeddings = await self._embedder.embed_many([item.text for item in items])
-            except Exception as exc:  # noqa: BLE001 向量化失败时消息留存完整，下一轮重抽
-                await self._on_failure(siwe_user_id, exc, job)
-                return
-            async with session_scope() as db:
-                await memory_repo.supersede(db, siwe_user_id, [item.subject for item in items])
-                await memory_repo.insert_many(db, siwe_user_id, items, embeddings)
-                await memory_repo.advance_watermark(db, siwe_user_id, job.until_id)
+        # 抽到东西和没抽到东西走同一条写回路径：没抽到也要推进水位线，
+        # 否则这段对话会被反复重抽。两种情况都受同一组条件约束。
+        async with session_scope() as db:
+            written = await memory_repo.commit_extraction(
+                db,
+                siwe_user_id,
+                until_id=job.until_id,
+                items=items,
+                expected_watermark=job.watermark,
+                expected_generation=job.generation,
+                claim_token=job.claim_token,
+            )
+        if not written:
+            # 这段区间已经被别的任务抽过，或者用户中途清空了对话。
+            # 两种情况都是正常竞态：整份结果丢掉，不补写、不报错。
             await self._audit.log(
-                "memory_written",
+                "memory_discarded_stale",
                 siwe_user_id=siwe_user_id,
                 until_id=job.until_id,
-                subjects=[item.subject for item in items],
+                watermark=job.watermark,
             )
             return
-
-        # 没抽到东西也要推进：否则这段对话会被反复重抽
-        async with session_scope() as db:
-            await memory_repo.advance_watermark(db, siwe_user_id, job.until_id)
+        if not items:
+            return
+        await self._audit.log(
+            "memory_written",
+            siwe_user_id=siwe_user_id,
+            until_id=job.until_id,
+            subjects=[item.subject for item in items],
+        )
 
     async def _on_failure(self, siwe_user_id: str, exc: Exception, job: _Job) -> None:
         async with session_scope() as db:
-            await memory_repo.mark_failed(db, siwe_user_id)
+            await memory_repo.mark_failed(
+                db, siwe_user_id, claim_token=job.claim_token, expected_generation=job.generation
+            )
         logger.warning("memory extract failed: user=%s until=%s err=%s", siwe_user_id, job.until_id, exc)
         await self._audit.log("memory_failed", siwe_user_id=siwe_user_id, error=str(exc)[:200])
 
