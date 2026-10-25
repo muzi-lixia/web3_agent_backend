@@ -207,7 +207,11 @@ class LlmAdapter:
             messages.append(SystemMessage(content=memories))
         if summary:
             messages.append(SystemMessage(content=summary))
-        for role, content in history:
+        # 意图判断只消解「刚才那个」「它」这类指代，不需要全部历史：只看最近一小段，
+        # 否则历史 + 系统提示会把 num_ctx 挤爆，被静默截断丢掉硬约束。
+        for role, content in _tail_history(
+            history, self._settings.intent_history_max_chars
+        ):
             messages.append(_as_message(role, content))
         messages.append(_as_message("user", user_message))
         # 模型调用发出前计数，失败或超时仍属于已经发生的资源消耗。
@@ -312,3 +316,28 @@ def _as_message(role: str, content: str) -> BaseMessage:
     if role == "assistant":
         return AIMessage(content=content)
     return HumanMessage(content=content)
+
+
+def _tail_history(
+    history: list[tuple[str, str]], max_chars: int
+) -> list[tuple[str, str]]:
+    """取历史末尾不超过 max_chars 字符的一段，供意图抽取消解指代。
+
+    max_chars 为 0 时原样返回全部历史。最新一条始终保留，其余从旧到新丢弃。
+
+    Args:
+        history: 按时间排列的 (角色, 正文) 消息列表。
+        max_chars: 该段历史允许的最大字符预算。
+    """
+    if max_chars <= 0:
+        return history
+    kept: list[tuple[str, str]] = []
+    used = 0
+    for role, content in reversed(history):
+        size = len(content or "")
+        if kept and used + size > max_chars:
+            break
+        kept.append((role, content))
+        used += size
+    kept.reverse()
+    return kept

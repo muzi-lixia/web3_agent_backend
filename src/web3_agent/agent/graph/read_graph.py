@@ -23,8 +23,9 @@ from web3_agent.agent.render import render_transactions
 from web3_agent.agent.sanitize import wrap_chain_data
 from web3_agent.agent.tool_runner import ToolRunner
 from web3_agent.config.constants import CallSource, Intent
-from web3_agent.web3.chain_adapter import is_evm_address
+from web3_agent.common.evm_address import is_evm_address
 from web3_agent.common.metering import Resource, reserve
+from web3_agent.common.context_budget import estimate_tokens, trim_history
 
 logger = logging.getLogger(__name__)
 
@@ -371,6 +372,7 @@ def initial_state(
     memories: str = "",
     intent: Intent | None = None,
     kb_id: str = "default",
+    context_budget_tokens: int = 0,
 ) -> ReadState:
     # 返回值：包含消息、执行限制、钱包和知识检索参数的 ReadState。
     """初始化图消息、身份、意图及 RAG 状态，并构造可确定的工具参数。
@@ -384,6 +386,7 @@ def initial_state(
         memories: 已渲染的用户长期背景文本。
         intent: 已由后端确认的本轮业务意图。
         kb_id: 目标知识库标识，默认 default。
+        context_budget_tokens: 本轮输入 token 总预算；大于 0 时历史按余量裁剪。
     """
     is_rag = intent is Intent.QUERY_KNOWLEDGE
     tools = evidence_tools(intent)
@@ -420,6 +423,16 @@ def initial_state(
             messages.append(
                 SystemMessage(content=f"<user_background>\n{memories}\n</user_background>")
             )
+        # 系统约束与记忆不可裁，历史可裁：先算固定项占用，剩下的 token 给历史。
+        messages = [SystemMessage(content=system)]
+        if memories:
+            messages.append(
+                SystemMessage(content=f"<user_background>\n{memories}\n</user_background>")
+            )
+        budget = context_budget_tokens
+        if budget > 0:
+            fixed_tokens = estimate_tokens(system) + estimate_tokens(memories or "")
+            history = trim_history(history, max(0, budget - fixed_tokens))
         for role, content in history:
             messages.append(
                 AIMessage(content=content) if role == "assistant" else HumanMessage(content=content)

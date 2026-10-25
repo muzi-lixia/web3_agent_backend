@@ -74,6 +74,14 @@ class Settings(BaseSettings):
     # 两三轮下来会把 num_ctx 挤满，而 Ollama 超限是静默截断。
     # conversation_max_chars：近期历史的字符预算；最新一条消息按加载器规则保留。
     conversation_max_chars: int = 6000
+    # --- 上下文总预算（token）---
+    # 上面那些 *_chars 只各自约束一段，没有合计上限：历史、摘要、档案、记忆、
+    # 系统提示、工具输出加起来仍可能把 num_ctx 挤爆，而 Ollama 超限是静默截断。
+    # context_budget_tokens：一次模型调用的输入 token 总预算，注入项在此收敛。
+    context_budget_tokens: int = 0  # 0 表示取 ollama_num_ctx 的 80%
+    # intent_history_max_chars：意图抽取只看最近一小段历史，用于消解指代即可；
+    # 判断「这句话要干什么」不需要全部对话。0 表示沿用 conversation_max_chars。
+    intent_history_max_chars: int = 1600
 
     # --- 摘要（中期记忆）：窗口挤出多少条才开始压、一次最多压多少 ---
     # summary_trigger_min：移出近期窗口且尚未压缩的消息达到此数量时触发摘要。
@@ -178,8 +186,11 @@ class Settings(BaseSettings):
     rag_cache_max_entries: int = Field(default=128, ge=1, le=10000)
 
     # --- 写链路风控（PRD 12 章：单笔等值金额上限）---
-    # write_max_amount_usd：写操作预留的单笔美元等值限额，当前只读链路不据此执行交易。
+    # write_max_amount_usd：单笔写操作的美元等值上限，0 表示不限制。
     write_max_amount_usd: float = DEFAULT_MAX_AMOUNT_USD
+    # write_usd_prices：资产符号到单价的映射，用于把转账金额折成美元等值。
+    # 由运维维护的估值，不是实时报价：没有配置单价的资产会被限额直接拦下。
+    write_usd_prices: dict[str, float] = Field(default_factory=dict)
     # workflow_ttl_seconds：一笔写操作从回显到确认、广播、回执核对的总有效秒数。
     # 到期前会强制核对一次回执，因此不能短于「用户看一眼再签个名」的实际耗时。
     workflow_ttl_seconds: int = Field(default=180, ge=60, le=86400)

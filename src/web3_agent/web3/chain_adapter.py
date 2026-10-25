@@ -13,13 +13,22 @@ import time
 from collections import OrderedDict
 from typing import Any
 
-from web3_agent.common.evm_address import is_evm_address
+from web3_agent.common.evm_address import is_evm_address  # noqa: F401  re-export 给工具模块
 from web3_agent.common.exceptions import RpcUnavailable
 from web3_agent.config.settings import Settings
 from web3_agent.web3.clients import RpcClient
 
 # _BALANCE_OF_SELECTOR：ERC20 balanceOf(address) 方法的 4 字节选择器。
 _BALANCE_OF_SELECTOR = "0x70a08231"
+# _SIMULATION_FAILURES：eth_call 报错里代表「这笔交易确定会失败」的标记，按匹配顺序排列。
+# 其余失败（超时、断连、预算耗尽）都可能是暂时的，不能据此拦下一笔正常的转账。
+# 值是给上层的归类，不把节点原文透给用户。
+_SIMULATION_FAILURES: tuple[tuple[str, str], ...] = (
+    ("insufficient funds", "insufficient_funds"),
+    ("revert", "reverted"),
+    ("invalid opcode", "reverted"),
+    ("out of gas", "reverted"),
+)
 # 读缓存上限。键是 chain:method:params，参数一变就是新键，不设界会随运行时间无限涨。
 # _READ_CACHE_MAX_ENTRIES：进程内链读取缓存容量上限。
 _READ_CACHE_MAX_ENTRIES = 512
@@ -205,6 +214,39 @@ class ChainAdapter:
                 f"eth_getTransactionByHash -> 结果不是交易对象: {type(raw).__name__}"
             )
         return raw
+
+    async def simulate(self, chain_id: int, tx: dict) -> str | None:
+        """在最新状态上预演一笔待签交易，返回会失败的原因。
+
+        只看两类确定的结论：合约拒绝、余额不够付手续费加金额。查不出来（超时、
+        断连、预算耗尽）返回空 —— 预演不是权威，签名后的链上结论才是。
+
+        绕过缓存：预演看的是此刻的状态，十分钟前的余额不能作为依据。
+
+        Args:
+            chain_id: 目标或过滤用的 EVM 网络编号，None 表示未限定。
+            tx: 待签交易，含 from / to / value（十进制字符串）/ data。
+        """
+        try:
+            await self._require(chain_id, allow_cached=False).call(
+                "eth_call",
+                [
+                    {
+                        "from": tx["from"],
+                        "to": tx["to"],
+                        "value": hex(int(tx["value"])),
+                        "data": tx.get("data") or "0x",
+                    },
+                    "latest",
+                ],
+            )
+        except RpcUnavailable as exc:
+            text = str(exc).lower()
+            return next(
+                (reason for marker, reason in _SIMULATION_FAILURES if marker in text),
+                None,
+            )
+        return None
 
     async def aclose(self) -> None:
         # 两组客户端键完全相同，但各自持有独立的连接池。合并成 dict 再遍历，

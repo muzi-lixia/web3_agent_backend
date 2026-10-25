@@ -202,6 +202,11 @@ class AgentLoop:
         self._plan_graph = (
             build_plan_graph(runner, checkpointer) if checkpointer is not None else None
         )
+        # _context_budget：本轮输入 token 总预算；未显式配置时取上下文窗口的 80%，
+        # 给回答和工具输出留余量，避免把 num_ctx 顶满触发静默截断。
+        self._context_budget = settings.context_budget_tokens or int(
+            settings.ollama_num_ctx * 0.8
+        )
 
     async def handle(
         self,
@@ -450,6 +455,7 @@ class AgentLoop:
                     memories=memory_text,
                     intent=guarded.output.intent,
                     kb_id=knowledge_base_id,
+                    context_budget_tokens=self._context_budget,
                 ),
                 config=graph_config,
             )

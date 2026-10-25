@@ -89,10 +89,11 @@ def _install(monkeypatch, *rows: SimpleNamespace) -> dict[str, SimpleNamespace]:
 
     async def fake_set_tx_hash(db, task_id, tx_hash):
         row = store.get(task_id)
-        if row is None or row.tx_hash is not None:
+        if row is None:
             return False
+        first = row.tx_hash is None
         row.tx_hash = tx_hash
-        return True
+        return first
 
     monkeypatch.setattr(service, "session_scope", lambda: _Session())
     monkeypatch.setattr(workflow_repo, "get", fake_get)
@@ -478,9 +479,11 @@ def test_report_records_hash_without_touching_state(monkeypatch):
     assert [c for c in memory["calls"] if c[0] == "transition"] == []
 
 
-def test_report_second_hash_is_ignored(monkeypatch):
+def test_report_replaces_hash_when_wallet_speeds_up(monkeypatch):
+    """加速/取消会换一笔新哈希，链上只会有新的那一笔，旧哈希永远等不到回执。"""
+    new_hash = "0x" + "b" * 64
     memory = _install(
-        monkeypatch, _row(state=WorkflowState.PREVIEW.value, tx_hash=_HASH)
+        monkeypatch, _row(state=WorkflowState.SUBMITTED.value, tx_hash=_HASH)
     )
 
     async def _call():
@@ -488,11 +491,11 @@ def test_report_second_hash_is_ignored(monkeypatch):
             siwe_user_id=_USER,
             siwe_address=_ADDRESS,
             task_id=_TASK,
-            tx_hash="0x" + "b" * 64,
+            tx_hash=new_hash,
         )
 
     assert asyncio.run(_call()) is False
-    assert memory["store"][_TASK].tx_hash == _HASH
+    assert memory["store"][_TASK].tx_hash == new_hash
 
 
 def test_report_on_expired_task_records_late_hash(monkeypatch):

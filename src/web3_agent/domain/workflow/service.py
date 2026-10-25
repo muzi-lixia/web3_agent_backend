@@ -345,6 +345,8 @@ async def report(
     只写哈希，不推进状态：状态改由 `read_status` 核对回执产生。已结案且不可能
     再广播的任务（已结算、已回滚、已拒绝）不再收哈希；过期的不一样 —— 用户很可能
     就是在过期之后才签的名，补登哈希后由下一次回执核对把状态纠正回来。
+    已经报过哈希的任务仍接收新哈希：钱包加速或取消会换上链的那一笔，按住第一笔不放
+    会一直核对一个永远不会上链的哈希。内容对不对由回执核对负责。
 
     Args:
         siwe_user_id: 当前登录用户的稳定标识。
@@ -361,7 +363,7 @@ async def report(
         state = WorkflowState(row.state)
         if state in TERMINAL_STATES and state not in _CHECKABLE_STATES:
             raise AppError(*E609_STATE_CONFLICT)
-        if row.tx_hash is not None:
+        if row.tx_hash == tx_hash:
             return False
         return await workflow_repo.set_tx_hash(db, task_id, tx_hash)
 

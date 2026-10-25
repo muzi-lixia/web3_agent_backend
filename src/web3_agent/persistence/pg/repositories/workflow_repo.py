@@ -131,19 +131,18 @@ async def list_pending(
 
 
 async def set_tx_hash(db, task_id: str, tx_hash: str) -> bool:
-    """记录广播哈希，只认第一笔。
+    """记录最近一次上报的广播哈希，返回本次是否为首笔。
 
-    返回是否写入成功。被钱包加速替换后前端会上报新哈希，但任务仍按第一笔核对，
-    改写会让已经核对过的回执失去对应关系。
+    钱包的「加速」「取消」会用同一个 nonce 再发一笔替换交易，链上最终生效的是新
+    哈希，只认第一笔就会永远等一个不会上链的哈希。哈希只是查询入口，内容是否属于
+    本任务由回执核对，所以这里允许覆盖。
 
     Args:
         db: 调用方提供的异步数据库会话；事务提交由外层负责。
         task_id: 对外暴露的任务标识。
         tx_hash: 前端上报的广播交易哈希。
     """
-    result = await db.execute(
-        update(Row)
-        .where(Row.task_id == task_id, Row.tx_hash.is_(None))
-        .values(tx_hash=tx_hash)
-    )
-    return bool(result.rowcount)
+    current = await db.execute(select(Row.tx_hash).where(Row.task_id == task_id))
+    first = current.scalar_one_or_none() is None
+    await db.execute(update(Row).where(Row.task_id == task_id).values(tx_hash=tx_hash))
+    return first

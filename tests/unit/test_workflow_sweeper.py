@@ -96,6 +96,7 @@ def test_open_states_and_batch_are_passed_through(monkeypatch):
         WorkflowState.INTENT_CONFIRM.value,
         WorkflowState.PREVIEW.value,
         WorkflowState.SUBMITTED.value,
+        WorkflowState.EXPIRED_UNVERIFIED.value,
     )
     assert memory["listed"]["limit"] == 7
 
@@ -113,6 +114,22 @@ def test_expired_task_drops_its_plan_checkpoint(monkeypatch):
         monkeypatch,
         [_row("t1", state=WorkflowState.INTENT_CONFIRM, plan_thread="th-1")],
         expired={"t1"},
+    )
+    dropped: list[str] = []
+
+    async def _drop(thread: str) -> None:
+        dropped.append(thread)
+
+    assert _sweep(drop=_drop) == 1
+    assert dropped == ["th-1"]
+
+
+def test_expired_but_broadcast_task_can_still_settle(monkeypatch):
+    # 过期之后才签名的交易：没人再轮询时，兜底扫描是唯一能把它纠正回来的地方。
+    _install(
+        monkeypatch,
+        [_row("t1", state=WorkflowState.EXPIRED_UNVERIFIED, plan_thread="th-1")],
+        moved={"t1"},
     )
     dropped: list[str] = []
 

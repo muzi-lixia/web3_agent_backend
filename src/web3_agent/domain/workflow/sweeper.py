@@ -23,10 +23,12 @@ from web3_agent.web3.chain_adapter import ChainAdapter
 logger = logging.getLogger(__name__)
 
 # _OPEN_STATES：还没到终态、需要兜底推进的状态。等确认的也可能一直没人点。
+# 已过期但报过哈希的也在内：链上结论可能晚于 TTL，没人再轮询就永远停在「未核对」。
 _OPEN_STATES = (
     WorkflowState.INTENT_CONFIRM.value,
     WorkflowState.PREVIEW.value,
     WorkflowState.SUBMITTED.value,
+    WorkflowState.EXPIRED_UNVERIFIED.value,
 )
 
 # _CLOSED_STATES：到了就不会再有人推动的状态；它背后挂起的图也不再有恢复的时机。

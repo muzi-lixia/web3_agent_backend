@@ -197,5 +197,5 @@ PRICE_FEED_SYMBOLS: frozenset[str] = frozenset(
     {"ETH", "BNB", "POL", "BERA", "WETH", "WBTC", "USDT", "USDC", "DAI"}
 )
 # 单笔写操作等值金额上限（PRD 12 章）。运行期可用同名 settings 覆盖，这里是默认值。
-# DEFAULT_MAX_AMOUNT_USD：预留写链路的默认单笔美元等值金额上限。
+# DEFAULT_MAX_AMOUNT_USD：单笔写操作的默认美元等值上限。
 DEFAULT_MAX_AMOUNT_USD = 5000

@@ -120,7 +120,11 @@ def build_container(settings: Settings, checkpointer=None) -> Container:
         mutating=False,
     )
     registry.register(
-        build_post_transfer(adapter),
+        build_post_transfer(
+            adapter,
+            max_amount_usd=settings.write_max_amount_usd,
+            usd_prices=settings.write_usd_prices,
+        ),
         ToolGroup.STATEMACHINE_ONLY,
         mutating=True,
     )

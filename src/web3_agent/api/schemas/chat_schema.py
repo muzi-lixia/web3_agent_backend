@@ -41,7 +41,7 @@ class ChatRequest(BaseModel):
     )
 
 
-# 数据职责：预留的用户确认视图，展示动作、代币、金额和目标。
+# 数据职责：预留的用户确认视图，展示动作、代币、金额、付款方、网络、目标与判断依据。
 class IntentPreview(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -53,6 +53,12 @@ class IntentPreview(BaseModel):
     human_amount: str = Field(alias="humanAmount")
     # target：待操作的目标地址或合约标识。
     target: str
+    # from_address：付款钱包地址，来自会话身份，签名前可供用户核对。
+    from_address: str = Field(default="", alias="fromAddress")
+    # chain_id：交易所在网络编号；为空时前端不展示网络。
+    chain_id: int | None = Field(default=None, alias="chainId")
+    # evidence：多步计划里条件成立的判断依据（余额、门槛），供用户确认前核对。
+    evidence: list[dict] = Field(default_factory=list)
 
 
 # 数据职责：聊天统一响应；通过别名向前端输出驼峰字段。

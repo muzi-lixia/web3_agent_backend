@@ -223,3 +223,64 @@ def test_receipt_object_is_returned_as_is():
     receipt = {"transactionHash": "0xdead", "status": "0x1", "blockNumber": "0x10"}
     adapter = _adapter(_echo(receipt))
     assert asyncio.run(adapter.get_receipt(1, "0xdead")) == receipt
+
+
+# --- 出卡片前的预演（chain_adapter.simulate）----------------------------------
+
+
+def _sim_tx() -> dict:
+    return {"from": "0x" + "1" * 40, "to": "0x" + "2" * 40, "value": str(10**17), "data": "0x"}
+
+
+def test_simulate_passes_without_finding_a_reason():
+    adapter = _adapter(_echo("0x"))
+    assert asyncio.run(adapter.simulate(1, _sim_tx())) is None
+
+
+def test_simulate_sends_value_as_hex_quantity():
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content)["params"][0])
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": "0x"})
+
+    adapter = _adapter(handler)
+    asyncio.run(adapter.simulate(1, _sim_tx()))
+
+    assert seen[0]["value"] == hex(10**17)
+    assert seen[0]["data"] == "0x"
+
+
+def test_simulate_reports_contract_revert():
+    adapter = _adapter(
+        _echo(error={"code": 3, "message": "execution reverted: ERC20: blacklisted"})
+    )
+    assert asyncio.run(adapter.simulate(1, _sim_tx())) == "reverted"
+
+
+def test_simulate_reports_gas_shortage_separately():
+    adapter = _adapter(
+        _echo(error={"code": -32000, "message": "insufficient funds for gas * price + value"})
+    )
+    assert asyncio.run(adapter.simulate(1, _sim_tx())) == "insufficient_funds"
+
+
+def test_simulate_treats_unknown_errors_as_no_verdict():
+    """节点抖动、方法不支持都不是「这笔交易会失败」的证据，不能据此拦下转账。"""
+    adapter = _adapter(_echo(error={"code": -32000, "message": "header not found"}))
+    assert asyncio.run(adapter.simulate(1, _sim_tx())) is None
+
+
+def test_simulate_reads_latest_state_not_cache():
+    """预演两次必须打两次 RPC：缓存里十分钟前的余额不能作为能不能转的依据。"""
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(len(calls))
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": len(calls), "result": "0x"})
+
+    adapter = _adapter(handler)
+    asyncio.run(adapter.simulate(1, _sim_tx()))
+    asyncio.run(adapter.simulate(1, _sim_tx()))
+
+    assert len(calls) == 2

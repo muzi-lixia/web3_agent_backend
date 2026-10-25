@@ -345,6 +345,7 @@ def build_plan_graph(runner: ToolRunner, checkpointer: Any):
                 chain_id=state["chain_id"],
                 ttl_seconds=state["ttl_seconds"],
                 plan_thread_id=state.get("thread_id") or None,
+                evidence=state.get("verdicts") or [],
             )
         except (json.JSONDecodeError, KeyError, TypeError):
             # 工具返回的不是可用的待签交易：当作没有数据，不能让异常穿到外层。

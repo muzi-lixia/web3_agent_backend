@@ -53,10 +53,11 @@ async def _fake_create(**kwargs) -> str:
 
 
 class _Adapter:
-    """只回答支持哪些网络与原生币余额，其余能力转账工具用不到。"""
+    """只回答支持哪些网络、原生币余额与预演结论，其余能力转账工具用不到。"""
 
-    def __init__(self, balance: int = 10**18) -> None:
+    def __init__(self, balance: int = 10**18, rejection: str | None = None) -> None:
         self.balance = balance
+        self.rejection = rejection
 
     def available_chains(self) -> list[int]:
         return [_CHAIN]
@@ -69,6 +70,22 @@ class _Adapter:
             address: 待查询的付款地址。
         """
         return self.balance
+
+    async def simulate(self, chain_id: int, tx: dict) -> str | None:
+        """替身预演：默认通过，用例可以指定一个失败原因。
+
+        Args:
+            chain_id: 交易所在网络编号。
+            tx: 待签交易参数。
+        """
+        return self.rejection
+
+
+def _transfer_tool(adapter: _Adapter, **kwargs):
+    """构造转账工具；默认关闭金额上限，风控单独在守卫用例里测。"""
+    kwargs.setdefault("max_amount_usd", 0)
+    kwargs.setdefault("usd_prices", {})
+    return build_post_transfer(adapter, **kwargs)
 
 
 class _SlotLlm(_Llm):
@@ -87,7 +104,7 @@ def _loop_with_transfer(monkeypatch, intent: Intent, slots: dict, *, balance: in
     loop._llm = _SlotLlm(intent, slots)
     registry = ToolRegistry()
     registry.register(
-        build_post_transfer(_Adapter(balance)), ToolGroup.STATEMACHINE_ONLY, mutating=True
+        _transfer_tool(_Adapter(balance)), ToolGroup.STATEMACHINE_ONLY, mutating=True
     )
     loop._runner = ToolRunner(registry)
     monkeypatch.setattr(workflow_service, "create_transfer", _fake_create)
@@ -127,6 +144,9 @@ def test_complete_transfer_returns_confirm_preview(monkeypatch):
         "tokenSymbol": "BERA",
         "humanAmount": "0.1",
         "target": _TO,
+        "fromAddress": _FROM,
+        "chainId": _CHAIN,
+        "evidence": [],
     }
     assert "0.1 BERA" in outcome.content and _TO in outcome.content
     # 参数校验走的是状态机来源，轨迹要能说明「这一步真的跑过工具」。
@@ -261,7 +281,7 @@ def test_task_creation_failure_returns_no_confirm_card(monkeypatch):
 def test_model_call_source_cannot_reach_transfer_tool(monkeypatch):
     registry = ToolRegistry()
     registry.register(
-        build_post_transfer(_Adapter()), ToolGroup.STATEMACHINE_ONLY, mutating=True
+        _transfer_tool(_Adapter()), ToolGroup.STATEMACHINE_ONLY, mutating=True
     )
     runner = ToolRunner(registry)
 
@@ -318,6 +338,8 @@ def test_router_renders_confirm_preview_in_camel_case(monkeypatch):
     )
 
     assert dumped["type"] == "intent_confirm"
-    assert dumped["intentPreview"] == outcome.intent_preview
+    assert dumped["intentPreview"]["humanAmount"] == "0.1"
+    assert dumped["intentPreview"]["fromAddress"] == ""
+    assert dumped["intentPreview"]["evidence"] == []
     assert dumped["taskId"] == _TASK
     assert dumped["txIntent"] is None

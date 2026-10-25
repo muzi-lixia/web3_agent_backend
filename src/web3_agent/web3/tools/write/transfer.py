@@ -71,6 +71,49 @@ def _short(raw: int, decimals: int) -> str:
     return text.rstrip("0").rstrip(".") if "." in text else text
 
 
+def _over_limit(
+    *, symbol: str, human: str, limit_usd: float, prices: dict[str, float]
+) -> dict | None:
+    """单笔金额是否超过美元等值上限；折算不出来时同样拦下。
+
+    限额是资金侧最后一道闸，宁可不出卡片也不能按「没有单价就不算超额」放行。
+    单价来自配置（write_usd_prices），不是实时行情，只用于这道粗粒度的风控。
+
+    Args:
+        symbol: 转账资产符号。
+        human: 人类可读的转账数量。
+        limit_usd: 单笔美元等值上限，0 表示不限制。
+        prices: 资产符号到单价的映射。
+    """
+    if limit_usd <= 0:
+        return None
+    price = next(
+        (value for key, value in prices.items() if key.upper() == symbol.upper()), None
+    )
+    if price is None:
+        return {
+            "error": "E502",
+            "status": "failed",
+            "message": f"没有配置 {symbol} 的单价，无法校验单笔限额，这笔转账被拦下",
+        }
+    amount_usd = Decimal(human) * Decimal(str(price))
+    if amount_usd <= Decimal(str(limit_usd)):
+        return None
+    return {
+        "error": "E502",
+        "status": "failed",
+        "message": (
+            f"单笔金额超出限额：{human} {symbol} 约 {amount_usd:.2f} 美元，"
+            f"上限 {limit_usd:g} 美元"
+        ),
+    }
+
+
+# _SIMULATION_TEXT：预演失败原因对应的用户文案。
+_SIMULATION_TEXT = {
+    "reverted": "预演时这笔交易被合约拒绝，换一个收款地址或资产再试",
+    "insufficient_funds": "余额不足以支付转账金额与手续费",
+}
 async def _insufficient(
     adapter: ChainAdapter,
     *,
@@ -116,11 +159,18 @@ async def _insufficient(
     }
 
 
-def build_post_transfer(adapter: ChainAdapter) -> StructuredTool:
+def build_post_transfer(
+    adapter: ChainAdapter,
+    *,
+    max_amount_usd: float,
+    usd_prices: dict[str, float],
+) -> StructuredTool:
     """把链适配器绑定为转账交易构造工具。
 
     Args:
         adapter: 按网络管理 RPC 客户端与只读缓存的链适配器。
+        max_amount_usd: 单笔美元等值上限，0 表示不限制。
+        usd_prices: 资产符号到单价的映射，用于折算美元等值。
     """
 
     async def post_transfer(
@@ -133,7 +183,7 @@ def build_post_transfer(adapter: ChainAdapter) -> StructuredTool:
         # 返回字段 status 为 ready 表示可以交给钱包签名，failed 表示参数不可执行。
         # tx 是待签名交易：to 为收款方（原生币）或代币合约（ERC20），value 为 wei 十进制字符串，
         # data 为 ERC20 调用数据、原生币为空。
-        """校验地址、金额、资产归属与余额，拼出待签名交易参数。
+        """校验地址、金额、资产归属、限额、余额与可执行性，拼出待签名交易参数。
 
         Args:
             from_address: 付款钱包地址，由会话身份注入。
@@ -149,92 +199,93 @@ def build_post_transfer(adapter: ChainAdapter) -> StructuredTool:
         if chain_id not in adapter.available_chains():
             return {"error": "E102", "status": "failed", "message": "该网络未配置 RPC"}
 
-        symbol = (token_symbol or "").strip()
+        wanted = (token_symbol or "").strip()
         native_symbol, native_decimals = NATIVE_META.get(chain_id, NATIVE_FALLBACK)
 
         # 原生币没有合约地址，也不依赖代币注册表；白名单里查不到它，必须先判。
-        if symbol.upper() == native_symbol.upper():
+        token = None
+        if wanted.upper() != native_symbol.upper():
             try:
-                value = _to_raw(human_amount, native_decimals)
-            except ValueError as exc:
-                return {"error": "E104", "status": "failed", "message": str(exc)}
-            short = await _insufficient(
-                adapter,
-                chain_id=chain_id,
-                holder=from_address,
-                need=value,
-                decimals=native_decimals,
-                symbol=native_symbol,
-                token=None,
+                async with session_scope() as db:
+                    tokens = await token_registry_repo.list_whitelisted(db, chain_id)
+            except Exception:  # noqa: BLE001 注册表不可用时不猜代币地址
+                return {
+                    "error": "E301",
+                    "status": "failed",
+                    "message": "代币注册表不可用，无法确定代币合约地址",
+                }
+            token = next(
+                (item for item in tokens if item.symbol.upper() == wanted.upper()), None
             )
-            if short is not None:
-                return short
-            return {
-                "status": "ready",
-                "chainId": chain_id,
-                "from": from_address,
-                "tx": {"to": to_address, "value": str(value), "data": "0x"},
-                "asset": {
-                    "symbol": native_symbol,
-                    "isNative": True,
-                    "decimals": native_decimals,
-                    "human": human_amount,
-                },
-                "recipient": to_address,
-            }
+            if token is None:
+                return {
+                    "error": "E202",
+                    "status": "failed",
+                    "message": f"{wanted} 不在该网络的白名单内",
+                }
 
+        symbol = native_symbol if token is None else token.symbol
+        decimals = native_decimals if token is None else token.decimals
         try:
-            async with session_scope() as db:
-                tokens = await token_registry_repo.list_whitelisted(db, chain_id)
-        except Exception:  # noqa: BLE001 注册表不可用时不猜代币地址
-            return {
-                "error": "E301",
-                "status": "failed",
-                "message": "代币注册表不可用，无法确定代币合约地址",
-            }
-
-        token = next((item for item in tokens if item.symbol.upper() == symbol.upper()), None)
-        if token is None:
-            return {
-                "error": "E202",
-                "status": "failed",
-                "message": f"{symbol} 不在该网络的白名单内",
-            }
-
-        try:
-            raw = _to_raw(human_amount, token.decimals)
+            raw = _to_raw(human_amount, decimals)
         except ValueError as exc:
             return {"error": "E104", "status": "failed", "message": str(exc)}
+
+        over = _over_limit(
+            symbol=symbol,
+            human=human_amount,
+            limit_usd=max_amount_usd,
+            prices=usd_prices,
+        )
+        if over is not None:
+            return over
 
         short = await _insufficient(
             adapter,
             chain_id=chain_id,
             holder=from_address,
             need=raw,
-            decimals=token.decimals,
-            symbol=token.symbol,
-            token=token.token_address,
+            decimals=decimals,
+            symbol=symbol,
+            token=None if token is None else token.token_address,
         )
         if short is not None:
             return short
 
+        tx = (
+            {"to": to_address, "value": str(raw), "data": "0x"}
+            if token is None
+            else {
+                "to": token.token_address,
+                "value": "0",
+                "data": _encode_transfer(to_address, raw),
+            }
+        )
+        # 余额够也不代表能转：黑名单、税率、授权不足、手续费不够都只在执行时才暴露。
+        # 预演一次能把这些挡在出卡片之前，而不是让用户签名后白烧 gas。
+        rejected = await adapter.simulate(chain_id, {"from": from_address, **tx})
+        if rejected is not None:
+            return {
+                "error": "E401",
+                "status": "failed",
+                "message": _SIMULATION_TEXT.get(rejected, "预演未通过，这笔交易无法执行"),
+            }
+
+        asset = {
+            "symbol": symbol,
+            "isNative": token is None,
+            "decimals": decimals,
+            "human": human_amount,
+        }
+        if token is not None:
+            asset["address"] = token.token_address
+            asset["raw"] = str(raw)
         return {
             "status": "ready",
             "chainId": chain_id,
             "from": from_address,
-            "tx": {
-                "to": token.token_address,
-                "value": "0",
-                "data": _encode_transfer(to_address, raw),
-            },
-            "asset": {
-                "symbol": token.symbol,
-                "isNative": False,
-                "address": token.token_address,
-                "decimals": token.decimals,
-                "human": human_amount,
-                "raw": str(raw),
-            },
+            "tx": tx,
+            "asset": asset,
             "recipient": to_address,
         }
 
