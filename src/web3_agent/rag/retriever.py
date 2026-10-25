@@ -162,7 +162,9 @@ class KnowledgeRetriever:
         deadline = monotonic() + self.settings.rag_timeout_seconds
         try:
             # 外层只做最后一道兜底：各阶段自带截止时间，正常不会走到这里。
-            async with asyncio.timeout_at(deadline):
+            # deadline 使用 monotonic；uvloop 的 loop.time() 可能有不同的时钟起点。
+            # timeout_at 要求 loop.time() 的绝对时间，因此这里传相对剩余预算。
+            async with asyncio.timeout(_remaining(deadline)):
                 if not await self.store.has_documents(**filters):
                     return {"error": "E602", "status": "empty", "message": NO_DOCUMENTS, "hits": []}
                 if self.settings.rag_hybrid_enabled:

@@ -16,6 +16,40 @@ import pytest
 from web3_agent.config.settings import Settings
 from web3_agent.rag.models import Citation
 from web3_agent.rag.retriever import KnowledgeRetriever, _settle
+import web3_agent.rag.retriever as retriever_module
+
+
+@pytest.mark.parametrize("slow", [False, True])
+@pytest.mark.parametrize("loop_kind", ["asyncio", "uvloop"])
+def test_retrieval_budget_with_different_clock_origins(monkeypatch, slow, loop_kind):
+    # 模拟 monotonic 与 loop.time 起点不同；旧 timeout_at 写法会立即超时。
+    monkeypatch.setattr(retriever_module, "monotonic", lambda: monotonic() - 10000)
+
+    async def run():
+        completed = False
+
+        async def has_documents(**kwargs):
+            nonlocal completed
+            await asyncio.sleep(1 if slow else 0.01)
+            completed = True
+            return False
+
+        retriever = KnowledgeRetriever(
+            Settings(_env_file=None, rag_enabled=True, rag_timeout_seconds=0.1),
+            SimpleNamespace(), SimpleNamespace(has_documents=has_documents),
+        )
+        started = monotonic()
+        result = await retriever.search("DEX")
+        elapsed = monotonic() - started
+        assert result["status"] == ("unavailable" if slow else "empty")
+        assert completed is (not slow)
+        if slow:
+            assert 0.08 <= elapsed < 0.8
+
+    if loop_kind == "uvloop":
+        pytest.importorskip("uvloop").run(run())
+    else:
+        asyncio.run(run())
 
 
 def _chunk(key: str, text: str) -> Citation:
