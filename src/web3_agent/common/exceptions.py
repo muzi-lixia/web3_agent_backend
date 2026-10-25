@@ -157,3 +157,11 @@ E510_TURN_BUDGET = error_tuple("E510")
 E511_DUPLICATE_REQUEST = error_tuple("E511")
 # E512_IDEMPOTENCY_CONFLICT：该业务错误对应的 (错误码, 固定文案, HTTP 状态码) 三元组。
 E512_IDEMPOTENCY_CONFLICT = error_tuple("E512")
+# E504_TASK_NOT_FOUND：该业务错误对应的 (错误码, 固定文案, HTTP 状态码) 三元组。
+E504_TASK_NOT_FOUND = error_tuple("E504")
+# E505_TASK_FORBIDDEN：该业务错误对应的 (错误码, 固定文案, HTTP 状态码) 三元组。
+E505_TASK_FORBIDDEN = error_tuple("E505")
+# E506_TASK_EXPIRED：该业务错误对应的 (错误码, 固定文案, HTTP 状态码) 三元组。
+E506_TASK_EXPIRED = error_tuple("E506")
+# E609_STATE_CONFLICT：该业务错误对应的 (错误码, 固定文案, HTTP 状态码) 三元组。
+E609_STATE_CONFLICT = error_tuple("E609")

@@ -270,7 +270,9 @@ def test_rag_toggle_preserves_three_original_tools(monkeypatch, enabled):
     monkeypatch.setattr(main,"ToolRegistry",Registry)
     container=main.build_container(Settings(_env_file=None,rag_enabled=enabled,model_check_on_startup=False))
     assert registered[:3]==["get_asset_balance","get_transaction_records","get_stake_info"]
-    assert registered[3:]==(["rag_general_knowledge"] if enabled else [])
+    # post_transfer 只进状态机组，不随 rag 开关变化。
+    assert registered[3]=="post_transfer"
+    assert registered[4:]==(["rag_general_knowledge"] if enabled else [])
     asyncio.run(container.adapter.aclose())
 
 

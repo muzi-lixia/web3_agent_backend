@@ -52,3 +52,12 @@ def normalize_address(value: str) -> str | None:
     if to_checksum_address(value) != value:
         return None
     return value.lower()
+
+
+def short_address(value: str) -> str:
+    """脱敏为 `0x` 加前 6 位、省略号、后 4 位，用于对外响应和日志。
+
+    Args:
+        value: 待脱敏的钱包地址。
+    """
+    return f"{value[:8]}…{value[-4:]}"
