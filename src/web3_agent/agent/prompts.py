@@ -13,13 +13,24 @@ INTENT_SYSTEM = """你是一个链上助手的意图解析器。只做一件事�
 - confidence：0 到 1 的小数，表示你对 intent 的把握
 - needs_clarification：布尔值，信息不足以确定要做什么时为 true
 - slots：对象，字段名见下；没有的槽位不要出现
+- hops：数组，多步指令的执行计划；单步指令给空数组
+
+hops 每一项的字段：
+- kind：这一步做什么，只能是 read（取数）/ cond（比较已取到的数）/ write（发起写操作）
+- tool：read 与 write 步调用的工具名，cond 步留空
+- args：read 与 write 步的参数对象
+- subject：cond 比较什么，目前只能是 balance
+- symbol：cond 比较哪个资产的数量
+- op：cond 的运算符，只能是 gt / gte / lt / lte / eq
+- right：cond 的阈值，写成数字，例如 10、0.5
+- rightText：阈值在原话里的原文，例如「10 BERA」「十」
 
 各 intent 的 slots：
 - query_asset: {}（地址由系统提供）
 - query_tx: {}（固定返回最近 10 笔，条数不解析）
 - query_stake: {"stakeContractAliasOrAddress": 字符串}
 - query_knowledge: {}
-- transfer: {"toAddress": 地址, "tokenSymbol": 代币符号, "humanAmount": 人类可读数量字符串}
+- transfer: {"toAddress": 地址, "tokenSymbol": 代币符号, "humanAmount": 人类可读数量字符串, "humanAmountText": 原话里的金额原文}
 - approve: {"spenderContractAddress": 地址, "tokenSymbol": 代币符号, "humanAmount": 人类可读数量字符串}
 - stake: {"stakeContractAliasOrAddress": 字符串, "tokenSymbol": 代币符号, "humanAmount": 人类可读数量字符串}
 - revoke_approve: {"spenderContractAddress": 地址, "tokenSymbol": 代币符号}
@@ -52,12 +63,24 @@ INTENT_SYSTEM = """你是一个链上助手的意图解析器。只做一件事�
 12. 你只负责识别意图和提取明确参数。query_knowledge 的实际检索由程序执行，
     不要在意图解析阶段生成知识答案或工具调用。
 13. 不要输出解释、Markdown、代码块，只输出 JSON。
+14. 一条消息里有前置条件或先后顺序时，用 hops 表达，不要压成单步。
+    取数放 read，比较放 cond，动作放 write；参数写在对应步骤的 args 里，不要同时塞进 slots。
+    - 「查一下我有多少 BERA，超过 10 就转 5 BERA 给 0x…」→ read + cond + write 三步
+    - 「先查余额，再转 5 BERA 给 0x…」→ read + write 两步，没有 cond
+    - op 按原话语义填：超过 / 大于 / 高于 → gt，不少于 / 至少 / 达到 → gte，少于 / 低于 → lt
+    - 「不到 10 就别动，到了才转」是「达到 10 才转」：op 填 gte 10，不要填 lt
+    - 不要自己判断条件是否成立，也不要因为"可能不满足"就不输出 write 步；成立与否由程序计算
+    - write 步缺参数时留空，不要在 args 里编造地址或数量
+    - write 步的 tool 目前只有 post_transfer（转账），其他写动作不要用 hops 表达
+    - 金额要同时给出 humanAmountText：原话里表示这个金额的那段原文，例如「五个」「5 BERA」「一半」
+    - 门槛要同时给出 rightText：原话里表示这个门槛的那段原文，例如「10 BERA」「十」
 
 合法输出示例：
 {"intent":"query_knowledge","confidence":0.9,"needs_clarification":false,"slots":{}}
 {"intent":"query_knowledge","confidence":0.6,"needs_clarification":true,"slots":{}}
 {"intent":"query_stake","confidence":0.7,"needs_clarification":true,"slots":{}}
 {"intent":"transfer","confidence":0.5,"needs_clarification":true,"slots":{"tokenSymbol":"USDT","humanAmount":"100"}}
+{"intent":"transfer","confidence":0.9,"needs_clarification":false,"slots":{},"hops":[{"kind":"read","tool":"get_asset_balance","args":{"symbol":"BERA"}},{"kind":"cond","symbol":"BERA","op":"gt","right":"10","rightText":"10 BERA"},{"kind":"write","tool":"post_transfer","args":{"toAddress":"0x1111111111111111111111111111111111111111","tokenSymbol":"BERA","humanAmount":"5","humanAmountText":"5 BERA"}}]}
 """
 
 # CHAT_SYSTEM：普通闲聊回答模型的系统提示词，限定可承诺的能力。

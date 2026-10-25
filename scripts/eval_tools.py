@@ -24,6 +24,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from web3_agent.agent import multi_hop  # noqa: E402
 from web3_agent.agent.graph.read_graph import initial_state  # noqa: E402
 from web3_agent.agent.intent_router import route_intent  # noqa: E402
 from web3_agent.agent.json_guard import JsonGuard  # noqa: E402
@@ -60,6 +61,8 @@ class CaseResult:
     needs_clarification: bool | None = None
     # tools：模型本次选择的工具名称列表。
     tools: list[str] | None = None
+    # hops：模型给出的多步计划，只取每步的 kind。
+    hops: list[str] | None = None
     # degraded：是否使用降级结果，例如缺少数据证据或结构化输出失败。
     degraded: bool = False
     # intent_ok：实际识别意图是否符合用例预期。
@@ -68,6 +71,8 @@ class CaseResult:
     route_ok: bool = False
     # tools_ok：实际工具集合是否与用例期望一致。
     tools_ok: bool = False
+    # hops_ok：实际多步计划的步骤序列是否与用例期望一致。
+    hops_ok: bool = True
     # slot_ok：必需槽位是否存在且值与预期一致。
     slot_ok: bool = True
     # missing_slots：评估用例要求、但模型未返回的槽位名列表。
@@ -97,8 +102,8 @@ class CaseResult:
 
     @property
     def passed(self) -> bool:
-        """判断该评估用例的意图、路由、工具及槽位是否全部通过。"""
-        return self.intent_ok and self.route_ok and self.tools_ok and self.slot_ok
+        """判断该评估用例的意图、路由、工具、槽位与多步计划是否全部通过。"""
+        return self.intent_ok and self.route_ok and self.tools_ok and self.slot_ok and self.hops_ok
 
 
 def _norm(key: str, value: Any) -> Any:
@@ -199,17 +204,35 @@ async def _evaluate(cases: list[dict], settings: Settings) -> list[CaseResult]:
         result.intent = guarded.output.intent.value
         result.confidence = guarded.output.confidence
         result.needs_clarification = guarded.output.needs_clarification
+        result.hops = [hop.kind for hop in guarded.output.hops]
+        if "hops" in case:
+            result.hops_ok = result.hops == case["hops"]
         # 以确定性后端规则选择路径，不让模型输出直接决定执行权限。
         decision = route_intent(guarded.output, user_message=message)
         result.route = decision.route.value
         result.intent_ok = _intent_ok(case.get("intent"), result.intent)
-        result.route_ok = result.route == case["route"]
+        # 多步输入被澄清拦下就等于整份计划被丢掉；这条判据不依赖模型给的 intent。
+        blocked = (
+            multi_hop.needs_plan(guarded.output.hops)
+            and decision.route is Route.CLARIFY
+        )
+        if blocked:
+            result.route_ok = False
+        # hops_only：只考察多步计划本身，路由与执行留到接线阶段再判。
+        elif case.get("hops_only"):
+            result.route_ok = True
+        else:
+            result.route_ok = result.route == case["route"]
         result.slot_ok, result.missing_slots, result.wrong_slots = _score_slots(
             case.get("slots", {}), guarded.output.slots
         )
 
         # route_only：只考察「路由该不该放行」，不进入选工具阶段（知识类用例没有注册检索工具）。
-        if decision.route is Route.READ and not case.get("route_only"):
+        if (
+            decision.route is Route.READ
+            and not case.get("route_only")
+            and not case.get("hops_only")
+        ):
             state = initial_state(
                 history, message, wallet_address=WALLET, intent=guarded.output.intent
             )
@@ -270,6 +293,8 @@ def _print_group(title: str, results: list[CaseResult]) -> None:
     tools_hit = sum(1 for r in results if r.tools_ok)
     slots_total = sum(1 for r in results if r.case.get("slots"))
     slots_hit = sum(1 for r in results if r.case.get("slots") and r.slot_ok)
+    hops_total = sum(1 for r in results if "hops" in r.case)
+    hops_hit = sum(1 for r in results if "hops" in r.case and r.hops_ok)
     redundant = sum(r.redundant for r in results)
 
     print(f"\n{title}（{total} 条）")
@@ -277,6 +302,7 @@ def _print_group(title: str, results: list[CaseResult]) -> None:
     print(f"  {'路由':<8}{_rate(route_hit, total):>8}  {_pct(route_hit, total):>7}")
     print(f"  {'工具集合':<6}{_rate(tools_hit, total):>8}  {_pct(tools_hit, total):>7}")
     print(f"  {'槽位':<8}{_rate(slots_hit, slots_total):>8}  {_pct(slots_hit, slots_total):>7}")
+    print(f"  {'多步计划':<6}{_rate(hops_hit, hops_total):>8}  {_pct(hops_hit, hops_total):>7}")
     confs = [r.confidence for r in results if r.confidence is not None]
     if confs:
         print(
@@ -304,7 +330,8 @@ def _print_failures(results: list[CaseResult]) -> None:
                 f"意图{'✓' if r.intent_ok else '✗'} ",
                 f"路由{'✓' if r.route_ok else '✗'} ",
                 f"工具{'✓' if r.tools_ok else '✗'} ",
-                f"槽位{'✓' if r.slot_ok else '✗'}",
+                f"槽位{'✓' if r.slot_ok else '✗'} ",
+                f"多步{'✓' if r.hops_ok else '✗'}",
             ]
         )
         print(f"  {r.case['id']:<8} {marks}")
@@ -328,6 +355,8 @@ def _print_failures(results: list[CaseResult]) -> None:
                 print(f"           缺槽位 {r.missing_slots}")
             for key, (want, got) in r.wrong_slots.items():
                 print(f"           槽位 {key}：期望 {want} 实际 {got}")
+        if not r.hops_ok:
+            print(f"           多步：期望 {r.case['hops']} 实际 {r.hops}")
         if r.error:
             print(f"           异常：{r.error}")
 
@@ -364,7 +393,7 @@ async def main() -> None:
     gaps = [r for r in results if r.known_gap]
 
     _print_group("计分组", scored)
-    _print_group("known_gap 组（写链路未接，只看意图与槽位）", gaps)
+    _print_group("known_gap 组（已知缺口，单独计数）", gaps)
     _print_failures(results)
     print(f"\n耗时 {elapsed:.1f}s")
 
@@ -379,8 +408,8 @@ async def main() -> None:
                         "message": r.case["message"],
                         "known_gap": r.known_gap,
                         "expected": {
-                            "intent": r.case["intent"],
-                            "route": r.case["route"],
+                            "intent": r.case.get("intent"),
+                            "route": r.case.get("route"),
                             "tools": r.case.get("tools", []),
                             "slots": r.case.get("slots", {}),
                         },
@@ -390,6 +419,7 @@ async def main() -> None:
                             "confidence": r.confidence,
                             "needs_clarification": r.needs_clarification,
                             "tools": r.tools,
+                            "hops": r.hops,
                             "degraded": r.degraded,
                             "error": r.error,
                         },
@@ -398,6 +428,7 @@ async def main() -> None:
                             "route": r.route_ok,
                             "tools": r.tools_ok,
                             "slots": r.slot_ok,
+                            "hops": r.hops_ok,
                         },
                         "redundant": r.redundant,
                         "missing_slots": r.missing_slots,

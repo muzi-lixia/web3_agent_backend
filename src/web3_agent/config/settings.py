@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     db_pool_size: int = 10
     # auto_create_tables：启动时是否调用 create_all 创建缺失表；不会升级已有表结构。
     auto_create_tables: bool = True
+    # checkpoint_pool_size：多步计划检查点的连接池上限；写路径不高频，不需要和业务池同规格。
+    checkpoint_pool_size: int = 4
 
     # --- 链 ---
     # allowed_chain_ids：系统允许访问的 EVM 网络编号列表。

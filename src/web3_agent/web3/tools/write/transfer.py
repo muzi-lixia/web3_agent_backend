@@ -60,6 +60,62 @@ def _to_raw(human_amount: str, decimals: int) -> int:
     return int(scaled)
 
 
+def _short(raw: int, decimals: int) -> str:
+    """把最小单位数量写成人类可读文本，去掉无意义的尾随零。
+
+    Args:
+        raw: 最小单位的整数数量。
+        decimals: 该资产的精度位数。
+    """
+    text = format(Decimal(raw).scaleb(-decimals).normalize(), "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+async def _insufficient(
+    adapter: ChainAdapter,
+    *,
+    chain_id: int,
+    holder: str,
+    need: int,
+    decimals: int,
+    symbol: str,
+    token: str | None,
+) -> dict | None:
+    """余额不够时返回失败响应，够或查不到都返回 None。
+
+    这里是两条写路径共用的最后一关：拼不出可执行的交易就不出卡片，
+    免得用户签名后因余额不足在链上回滚、白烧 gas。查不到余额不拦，
+    签名后的链上结论才是最终的。
+
+    Args:
+        adapter: 按网络管理 RPC 客户端与只读缓存的链适配器。
+        chain_id: 交易所在网络编号。
+        holder: 付款地址。
+        need: 本次要转出的最小单位整数。
+        decimals: 该资产精度。
+        symbol: 资产符号，用于文案。
+        token: ERC20 合约地址；原生币为空。
+    """
+    try:
+        held = (
+            await adapter.get_native_balance(chain_id, holder)
+            if token is None
+            else await adapter.get_erc20_balance(chain_id, token, holder)
+        )
+    except Exception:  # noqa: BLE001 余额查不到不阻断构造，链上会给结论
+        return None
+    if held >= need:
+        return None
+    return {
+        "error": "E405",
+        "status": "failed",
+        "message": (
+            f"余额不足：当前 {_short(held, decimals)} {symbol}，"
+            f"需要 {_short(need, decimals)} {symbol}"
+        ),
+    }
+
+
 def build_post_transfer(adapter: ChainAdapter) -> StructuredTool:
     """把链适配器绑定为转账交易构造工具。
 
@@ -77,7 +133,7 @@ def build_post_transfer(adapter: ChainAdapter) -> StructuredTool:
         # 返回字段 status 为 ready 表示可以交给钱包签名，failed 表示参数不可执行。
         # tx 是待签名交易：to 为收款方（原生币）或代币合约（ERC20），value 为 wei 十进制字符串，
         # data 为 ERC20 调用数据、原生币为空。
-        """校验地址、金额与资产归属，拼出待签名交易参数。
+        """校验地址、金额、资产归属与余额，拼出待签名交易参数。
 
         Args:
             from_address: 付款钱包地址，由会话身份注入。
@@ -102,6 +158,17 @@ def build_post_transfer(adapter: ChainAdapter) -> StructuredTool:
                 value = _to_raw(human_amount, native_decimals)
             except ValueError as exc:
                 return {"error": "E104", "status": "failed", "message": str(exc)}
+            short = await _insufficient(
+                adapter,
+                chain_id=chain_id,
+                holder=from_address,
+                need=value,
+                decimals=native_decimals,
+                symbol=native_symbol,
+                token=None,
+            )
+            if short is not None:
+                return short
             return {
                 "status": "ready",
                 "chainId": chain_id,
@@ -138,6 +205,18 @@ def build_post_transfer(adapter: ChainAdapter) -> StructuredTool:
             raw = _to_raw(human_amount, token.decimals)
         except ValueError as exc:
             return {"error": "E104", "status": "failed", "message": str(exc)}
+
+        short = await _insufficient(
+            adapter,
+            chain_id=chain_id,
+            holder=from_address,
+            need=raw,
+            decimals=token.decimals,
+            symbol=token.symbol,
+            token=token.token_address,
+        )
+        if short is not None:
+            return short
 
         return {
             "status": "ready",

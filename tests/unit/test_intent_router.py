@@ -119,3 +119,72 @@ def test_substantive_query_still_reads() -> None:
 def test_short_chitchat_is_not_vague() -> None:
     # 闲聊的短句本身是完整表达，不能套用查询意图的"有没有对象"判据。
     assert _route(Intent.CHITCHAT, 0.9, "嗯").route is Route.READ
+
+
+def test_plan_with_write_step_skips_missing_slots():
+    # 多步计划把参数放在写步里，slots 为空不代表信息不足。
+    decision = route_intent(
+        LlmOutput(
+            intent=Intent.TRANSFER,
+            hops=[
+                {"kind": "read", "tool": "get_asset_balance", "args": {"symbol": "BERA"}},
+                {"kind": "cond", "symbol": "BERA", "op": "gte", "right": "10"},
+                {
+                    "kind": "write",
+                    "tool": "post_transfer",
+                    "args": {
+                        "toAddress": "0x" + "1" * 40,
+                        "tokenSymbol": "BERA",
+                        "humanAmount": "5",
+                    },
+                },
+            ],
+        ),
+        user_message="余额超过 10 BERA 就转 5 BERA",
+    )
+
+    assert decision.route is Route.WRITE
+    assert decision.missing_slots == []
+
+
+def test_single_step_write_without_slots_still_clarifies():
+    decision = _route(Intent.TRANSFER, 0.9, "把一些 USDC 转给他")
+    assert decision.route is Route.CLARIFY
+    assert decision.reason == "missing_slots"
+
+
+def test_complete_plan_is_not_blocked_by_clarification_flag():
+    # 计划已经把「查什么、比什么、做什么」写全，模型的自我怀疑不能把它拦成追问。
+    decision = route_intent(
+        LlmOutput(
+            intent=Intent.TRANSFER,
+            needs_clarification=True,
+            hops=[
+                {"kind": "read", "tool": "get_asset_balance"},
+                {"kind": "cond", "symbol": "BERA", "op": "gte", "right": "10"},
+                {"kind": "write", "tool": "post_transfer", "args": {"humanAmount": "5"}},
+            ],
+        ),
+        user_message="余额够 10 就转 5 BERA",
+    )
+
+    assert decision.route is Route.WRITE
+    assert decision.reason == "plan"
+
+
+def test_plan_with_two_writes_still_clarifies():
+    # 形状不完整的计划不豁免：追问的是真正缺的信息。
+    decision = route_intent(
+        LlmOutput(
+            intent=Intent.TRANSFER,
+            needs_clarification=True,
+            hops=[
+                {"kind": "read", "tool": "get_asset_balance"},
+                {"kind": "write", "tool": "post_transfer", "args": {"humanAmount": "5"}},
+                {"kind": "write", "tool": "post_transfer", "args": {"humanAmount": "5"}},
+            ],
+        ),
+        user_message="转 5 给 A，再转 5 给 B",
+    )
+
+    assert decision.route is Route.CLARIFY

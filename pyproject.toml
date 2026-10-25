@@ -22,10 +22,16 @@ dependencies = [
     "pgvector>=0.5.1",
     "python-multipart>=0.0.32",
     "pypdf>=6.21.2",
+    "langgraph-checkpoint-postgres>=3.2.0",
+    "psycopg[binary]>=3.3.6",
+    "psycopg-pool>=3.3.3",
 ]
 
 [dependency-groups]
-dev = ["pytest"]
+dev = [
+    "pytest",
+    "ruff>=0.17.2",
+]
 
 [build-system]
 requires = ["hatchling"]

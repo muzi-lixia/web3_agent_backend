@@ -2,11 +2,32 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 from web3_agent.config.constants import NATIVE_FALLBACK, NATIVE_META, Intent, Route
+
+
+class Hop(BaseModel):
+    """多步指令里的一步。kind 决定哪些字段有意义，其余留空。"""
+
+    # kind：这一步做什么：read 取数、cond 比较已取到的数、write 发起写操作。
+    kind: Literal["read", "cond", "write"]
+    # tool：read 与 write 步要调用的工具名；cond 步为空。
+    tool: str = ""
+    # args：read 与 write 步的调用参数；cond 步为空。
+    args: dict[str, Any] = Field(default_factory=dict)
+    # subject：cond 比较的对象，当前只支持资产数量。
+    subject: Literal["balance"] = "balance"
+    # symbol：cond 比较哪个资产的数量。
+    symbol: str = ""
+    # op：cond 的运算符；缺省为空表示模型没给出可用的比较方式。
+    op: Literal["gt", "gte", "lt", "lte", "eq"] | None = None
+    # right：cond 的阈值，人类可读数量字符串。
+    right: str = ""
+    # rightText：阈值在原话里的原文，如「十」「10 BERA」；用于核对门槛是不是这一轮说的。
+    rightText: str = ""
 
 
 class LlmOutput(BaseModel):
@@ -20,6 +41,8 @@ class LlmOutput(BaseModel):
     needs_clarification: bool = False
     # slots：模型抽取的业务参数字典，例如 tokenSymbol、humanAmount、toAddress。
     slots: dict[str, Any] = Field(default_factory=dict)
+    # hops：多步指令的执行计划；为空表示单步，参数全在 slots 里。
+    hops: list[Hop] = Field(default_factory=list)
 
 
 # 数据职责：后端路由决策结果，包含处理路径、原因及需补充的参数。

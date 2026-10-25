@@ -1,0 +1,152 @@
+{
+  "_legend": {
+    "用途": "多步计划基线集。只测模型能否把「条件 + 动作」表达成 hops 结构，不测执行。",
+    "hops": "期望的步骤类型序列，只比 kind。空数组表示单步，参数应在 slots 里。",
+    "hops_only": "true 表示只判 hops，路由与执行留到接线阶段，不参与打分。",
+    "intent": "多步指令最终落到哪个写意图。",
+    "rationale": "该期望的理由。标注「正则词表外的说法」的用例，是用来证明判据不依赖固定短语。",
+    "known_gap": "当前代码尚不具备该行为，跑分时单独计数，不计入可用准确率。"
+  },
+  "version": 1,
+  "updated": "2026-10-25",
+  "cases": [
+    {
+      "id": "mh-01",
+      "group": "conditional",
+      "tags": [
+        "balance-threshold",
+        "user-original"
+      ],
+      "message": "查一下我有多少bera，如果超过10BERA，就转给0x1111111111111111111111111111111111111111这个地址5BERA",
+      "intent": "transfer",
+      "hops": [
+        "read",
+        "cond",
+        "write"
+      ],
+      "hops_only": true,
+      "rationale": "原始需求句：先查、再比 10、再转 5，三步缺一不可"
+    },
+    {
+      "id": "mh-02",
+      "group": "conditional",
+      "tags": [
+        "balance-threshold",
+        "colloquial"
+      ],
+      "message": "我 BERA 余额要是够 10 个，就转 5 个给 0x1111111111111111111111111111111111111111",
+      "intent": "transfer",
+      "hops": [
+        "read",
+        "cond",
+        "write"
+      ],
+      "hops_only": true,
+      "rationale": "正则词表外的说法：用「够」表达门槛，不含「超过/大于/至少」任何一个词"
+    },
+    {
+      "id": "mh-03",
+      "group": "conditional",
+      "tags": [
+        "balance-threshold",
+        "colloquial"
+      ],
+      "message": "账户里有 10 BERA 以上就把 5 BERA 打给 0x1111111111111111111111111111111111111111",
+      "intent": "transfer",
+      "hops": [
+        "read",
+        "cond",
+        "write"
+      ],
+      "hops_only": true,
+      "rationale": "正则词表外的说法：门槛词「以上」出现在数字之后，顺序与词表相反"
+    },
+    {
+      "id": "mh-04",
+      "group": "sequential",
+      "tags": [
+        "no-threshold"
+      ],
+      "message": "先看下我 USDC 有多少，然后转 20 个给 0x1111111111111111111111111111111111111111",
+      "intent": "transfer",
+      "hops": [
+        "read",
+        "write"
+      ],
+      "hops_only": true,
+      "rationale": "有先后顺序但没有门槛：两跳，不该凭空生成 cond"
+    },
+    {
+      "id": "mh-05",
+      "group": "single",
+      "tags": [
+        "no-condition"
+      ],
+      "message": "转 5 BERA 给 0x1111111111111111111111111111111111111111",
+      "intent": "transfer",
+      "hops": [],
+      "hops_only": true,
+      "rationale": "单跳对照：参数齐全就一句转账，hops 必须为空，否则单跳链路被误改道"
+    },
+    {
+      "id": "mh-06",
+      "group": "single",
+      "tags": [
+        "knowledge"
+      ],
+      "message": "如果转账失败怎么办",
+      "intent": "query_knowledge",
+      "hops": [],
+      "hops_only": true,
+      "rationale": "含「如果」但问的是规则，不是条件执行；这是拿掉「知识问句正则」后最可能误判的一条"
+    },
+    {
+      "id": "mh-07",
+      "group": "conditional",
+      "tags": [
+        "balance-threshold",
+        "approve"
+      ],
+      "message": "查一下 USDC 余额，超过 100 就授权给 0x2222222222222222222222222222222222222222",
+      "intent": "approve",
+      "hops": [
+        "read",
+        "cond",
+        "write"
+      ],
+      "hops_only": true,
+      "rationale": "同一结构换资产和写动作：计划不该绑死在转账上",
+      "known_gap": "权限类写动作被模型归成 transfer，属于写意图分类的既有缺口；本条的 hops 三步是对的，缺口不在多步判据上"
+    },
+    {
+      "id": "mh-08",
+      "group": "single",
+      "tags": [
+        "read-only"
+      ],
+      "message": "帮我查一下 BERA 余额再告诉我",
+      "intent": "query_asset",
+      "hops": [
+        "read"
+      ],
+      "hops_only": true,
+      "rationale": "纯读计划：给 read 步是对的。只有 read 没有 cond / write 时等同单步查询，所以接线时的判据必须是「含 cond 或 write」，不能是「hops 非空」"
+    },
+    {
+      "id": "mh-09",
+      "group": "conditional",
+      "tags": [
+        "reverse-condition"
+      ],
+      "message": "余额不到 10 个 BERA 就别动，到了就转 5 个给 0x1111111111111111111111111111111111111111",
+      "intent": "transfer",
+      "hops": [
+        "read",
+        "cond",
+        "write"
+      ],
+      "hops_only": true,
+      "rationale": "反向表述：门槛仍是「是否达到 10」，不该因为出现「不到」就丢掉 cond"
+    }
+  ]
+}

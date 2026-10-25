@@ -18,7 +18,12 @@ _ADDRESS = "0x" + "1" * 40
 _HASH = "0x" + "a" * 64
 
 
-def _row(task_id: str, *, state: WorkflowState = WorkflowState.SUBMITTED):
+def _row(
+    task_id: str,
+    *,
+    state: WorkflowState = WorkflowState.SUBMITTED,
+    plan_thread: str | None = None,
+):
     """构造一条待核对的任务行。"""
     return SimpleNamespace(
         task_id=task_id,
@@ -26,13 +31,15 @@ def _row(task_id: str, *, state: WorkflowState = WorkflowState.SUBMITTED):
         siwe_address=_ADDRESS,
         state=state.value,
         tx_hash=_HASH,
+        params={"plan_thread_id": plan_thread} if plan_thread else None,
     )
 
 
-def _install(monkeypatch, rows, *, failing=(), moved=()):
+def _install(monkeypatch, rows, *, failing=(), moved=(), expired=()):
     """把仓储与状态读取换成替身，并记录被扫到的任务。"""
     asked: list[str] = []
     listed: dict = {}
+    current = {row.task_id: row.state for row in rows}
 
     async def fake_list(db, *, states, stale_before, limit):
         listed.update(states=states, stale_before=stale_before, limit=limit)
@@ -42,8 +49,13 @@ def _install(monkeypatch, rows, *, failing=(), moved=()):
         asked.append(task_id)
         if task_id in failing:
             raise RuntimeError("rpc down")
-        state = WorkflowState.SETTLED if task_id in moved else WorkflowState.SUBMITTED
-        return {"state": state.value}
+        if task_id in expired:
+            state = WorkflowState.EXPIRED_UNSIGNED.value
+        elif task_id in moved:
+            state = WorkflowState.SETTLED.value
+        else:
+            state = current[task_id]
+        return {"state": state}
 
     monkeypatch.setattr(sweeper, "session_scope", lambda: _Session())
     monkeypatch.setattr(workflow_repo, "list_pending", fake_list)
@@ -51,8 +63,10 @@ def _install(monkeypatch, rows, *, failing=(), moved=()):
     return {"asked": asked, "listed": listed}
 
 
-def _sweep(batch: int = 50, stale: int = 60) -> int:
-    return asyncio.run(sweeper.sweep_once(object(), batch=batch, stale_seconds=stale))
+def _sweep(batch: int = 50, stale: int = 60, drop=None) -> int:
+    return asyncio.run(
+        sweeper.sweep_once(object(), batch=batch, stale_seconds=stale, drop_plan=drop)
+    )
 
 
 def test_sweep_counts_only_tasks_that_moved(monkeypatch):
@@ -91,3 +105,47 @@ def test_no_rows_means_no_receipt_calls(monkeypatch):
 
     assert _sweep() == 0
     assert memory["asked"] == []
+
+
+def test_expired_task_drops_its_plan_checkpoint(monkeypatch):
+    # 一直没人确认的任务由扫描判过期，挂起的图再也不会被唤醒。
+    _install(
+        monkeypatch,
+        [_row("t1", state=WorkflowState.INTENT_CONFIRM, plan_thread="th-1")],
+        expired={"t1"},
+    )
+    dropped: list[str] = []
+
+    async def _drop(thread: str) -> None:
+        dropped.append(thread)
+
+    assert _sweep(drop=_drop) == 1
+    assert dropped == ["th-1"]
+
+
+def test_task_without_a_plan_leaves_checkpoints_alone(monkeypatch):
+    _install(
+        monkeypatch, [_row("t1", state=WorkflowState.INTENT_CONFIRM)], expired={"t1"}
+    )
+    dropped: list[str] = []
+
+    async def _drop(thread: str) -> None:
+        dropped.append(thread)
+
+    assert _sweep(drop=_drop) == 1
+    assert dropped == []
+
+
+def test_unfinished_task_keeps_its_checkpoint(monkeypatch):
+    # 状态没动就还在等确认，挂起的图随时可能被恢复，不能清。
+    _install(
+        monkeypatch,
+        [_row("t1", state=WorkflowState.INTENT_CONFIRM, plan_thread="th-1")],
+    )
+    dropped: list[str] = []
+
+    async def _drop(thread: str) -> None:
+        dropped.append(thread)
+
+    assert _sweep(drop=_drop) == 0
+    assert dropped == []

@@ -156,6 +156,8 @@ MSG_WRITE_TASK_FAILED = "写操作任务创建失败，请稍后重试。"
 MSG_AMOUNT_MISSING = "请给出具体的转账金额，比如 10 或 0.5。"
 # MSG_CLARIFY：当前场景使用的固定用户提示，不交给模型生成或改写。
 MSG_CLARIFY = "我需要再确认一点信息才能继续，能补充一下吗？"
+# MSG_PLAN_UNAVAILABLE：多步计划没有检查点可存，硬走单步会把条件丢掉。
+MSG_PLAN_UNAVAILABLE = "这一步需要按条件分步执行，当前环境暂时无法保存执行进度，请稍后再试。"
 # MSG_OUT_OF_SCOPE：当前场景使用的固定用户提示，不交给模型生成或改写。
 MSG_OUT_OF_SCOPE = "这个问题超出我的能力范围，我只能处理链上资产、交易记录与质押相关的问题。"
 # MSG_STEP_LIMIT：当前场景使用的固定用户提示，不交给模型生成或改写。

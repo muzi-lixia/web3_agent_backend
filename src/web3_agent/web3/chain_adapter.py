@@ -187,6 +187,25 @@ class ChainAdapter:
             )
         return raw
 
+    async def get_transaction(self, chain_id: int, tx_hash: str) -> dict | None:
+        """写路径专用：绕过缓存。
+
+        回执里没有转账金额与调用数据，核对「这笔哈希是不是本任务的交易」只能看交易本身。
+        未上链时返回 None，与回执同口径。
+
+        Args:
+            chain_id: 目标或过滤用的 EVM 网络编号，None 表示未限定。
+            tx_hash: 待查询的交易哈希。
+        """
+        raw = await self._require(chain_id, allow_cached=False).call(
+            "eth_getTransactionByHash", [tx_hash]
+        )
+        if raw is not None and not isinstance(raw, dict):
+            raise RpcUnavailable(
+                f"eth_getTransactionByHash -> 结果不是交易对象: {type(raw).__name__}"
+            )
+        return raw
+
     async def aclose(self) -> None:
         # 两组客户端键完全相同，但各自持有独立的连接池。合并成 dict 再遍历，
         # 后者会把前者按同键覆盖掉 —— 被覆盖的那组永远不会关闭。

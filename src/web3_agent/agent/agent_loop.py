@@ -8,16 +8,20 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import uuid
-from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langgraph.types import Command
 from langsmith import traceable
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from web3_agent.agent import langsmith_tracer, secret_detector
+from web3_agent.agent import langsmith_tracer, multi_hop, secret_detector, transfer_task
+from web3_agent.agent.graph.plan_graph import (
+    build_plan_graph,
+    initial as plan_initial,
+    opening as plan_opening,
+)
 from web3_agent.agent.graph.read_graph import build_read_graph, evidence_tools, initial_state
 from web3_agent.agent.intent_router import route_intent
 from web3_agent.agent.json_guard import JsonGuard
@@ -40,12 +44,14 @@ from web3_agent.config.constants import (
     MSG_JSON_DEGRADED,
     MSG_NO_DATA,
     MSG_OUT_OF_SCOPE,
+    MSG_PLAN_UNAVAILABLE,
     MSG_SECRET_REFUSED,
     MSG_STEP_LIMIT,
     MSG_TRANSFER_CONFIRM,
     MSG_WALLET_REQUIRED,
     MSG_WRITE_NOT_ENABLED,
     MSG_WRITE_TASK_FAILED,
+    REQUIRED_SLOTS,
     TOOL_POST_TRANSFER,
     CallSource,
     Intent,
@@ -53,7 +59,6 @@ from web3_agent.config.constants import (
 )
 from web3_agent.config.settings import Settings
 from web3_agent.domain.memory import memory, profile, schema
-from web3_agent.domain.workflow import service as workflow_service
 from web3_agent.persistence.pg.base import session_scope
 from web3_agent.persistence.pg.repositories import (
     conversation_repo,
@@ -163,6 +168,7 @@ class AgentLoop:
         audit: AuditLogger,
         model_with_tools,
         runner,
+        checkpointer=None,
     ) -> None:
         """初始化 AgentLoop 所需的依赖和运行状态。
 
@@ -173,6 +179,7 @@ class AgentLoop:
             audit: 审计日志写入服务。
             model_with_tools: 已绑定只读工具的回答模型。
             runner: 工具统一执行器，负责来源检查和调用轨迹。
+            checkpointer: 多步计划的检查点存储；不可用时多步输入降级为追问。
         """
         self._settings = settings
         self._llm = llm
@@ -186,6 +193,10 @@ class AgentLoop:
             runner=runner,
             max_steps=settings.read_max_react_steps,
             rag_answer_model=llm.answer_model
+        )
+        # _plan_graph：多步计划图。检查点不可用时为空，多步输入转追问而不是硬走单步。
+        self._plan_graph = (
+            build_plan_graph(runner, checkpointer) if checkpointer is not None else None
         )
 
     async def handle(
@@ -350,6 +361,18 @@ class AgentLoop:
             return await finish(ChatOutcome(kind="ask", content=MSG_CLARIFY))
         if decision.route is Route.REJECT:
             return await finish(ChatOutcome(kind="reject", content=MSG_OUT_OF_SCOPE))
+        # 多步计划先于路由分派：这类输入里既有查询又有写操作，模型给的 intent 可能
+        # 只落在其中一半上，按单步路由执行会把另一半静默丢掉。
+        if multi_hop.needs_plan(guarded.output.hops):
+            return await finish(
+                await self._plan_outcome(
+                    guarded.output.hops,
+                    siwe_user_id=siwe_user_id,
+                    wallet_address=wallet_address,
+                    chain_id=chain_id,
+                    user_message=user_message,
+                )
+            )
         if decision.route is Route.WRITE:
             return await finish(
                 await self._write_outcome(
@@ -487,6 +510,163 @@ class AgentLoop:
         )
         return await finish(outcome)
 
+    async def _plan_outcome(
+        self,
+        hops,
+        *,
+        siwe_user_id: str,
+        wallet_address: str | None,
+        chain_id: int | None,
+        user_message: str,
+    ) -> ChatOutcome:
+        """执行多步计划，走到写操作就挂起等确认。
+
+        Args:
+            hops: 模型给出的执行计划。
+            siwe_user_id: 服务端确认的登录用户标识，作为任务归属。
+            wallet_address: 服务端确认的当前钱包地址。
+            chain_id: 交易所在网络编号，由会话注入。
+            user_message: 用户本轮原始输入，用于核对金额是否出自原话。
+        """
+        graph = self._plan_graph
+        if graph is None:
+            # 没有检查点就存不下挂起位置；带条件的计划丢掉条件等于改指令。
+            if multi_hop.has_condition(hops):
+                return ChatOutcome(kind="ask", content=MSG_PLAN_UNAVAILABLE)
+            # 降级同样要守住执行器的能力边界：多笔写不能只办第一笔。
+            shape = multi_hop.plan_shape_error(hops)
+            if shape:
+                return ChatOutcome(kind="ask", content=shape)
+            write = next(hop for hop in hops if hop.kind == "write")
+            if write.tool != TOOL_POST_TRANSFER:
+                return ChatOutcome(kind="answer", content=MSG_WRITE_NOT_ENABLED)
+            # 先查后转没有条件可丢，退回单步：少回答一句，不会动错钱。
+            return await self._write_outcome(
+                Intent.TRANSFER,
+                dict(write.args),
+                siwe_user_id=siwe_user_id,
+                wallet_address=wallet_address,
+                chain_id=chain_id,
+                user_message=user_message,
+            )
+        if not wallet_address:
+            return ChatOutcome(kind="ask", content=MSG_WALLET_REQUIRED)
+        if chain_id is None:
+            return ChatOutcome(kind="ask", content=MSG_CHAIN_REQUIRED)
+
+        thread_id = uuid.uuid4().hex
+        try:
+            state = await graph.ainvoke(
+                plan_initial(
+                    hops=hops,
+                    user_message=user_message,
+                    siwe_user_id=siwe_user_id,
+                    wallet_address=wallet_address,
+                    chain_id=chain_id,
+                    thread_id=thread_id,
+                    ttl_seconds=self._settings.workflow_ttl_seconds,
+                ),
+                config={"configurable": {"thread_id": thread_id}},
+            )
+        except Exception:  # noqa: BLE001 计划执行失败不能把整轮对话打成 500
+            logger.exception("plan graph failed thread=%s", thread_id)
+            await self._audit.log(
+                "plan_failed", siwe_user_id=siwe_user_id, thread_id=thread_id
+            )
+            return ChatOutcome(kind="answer", content=MSG_NO_DATA, degraded=True)
+        calls = [_record(item) for item in state.get("tool_calls", [])]
+        if state.get("kind"):
+            return ChatOutcome(
+                kind=state["kind"], content=state.get("content", ""), tool_calls=calls
+            )
+
+        preview = state.get("preview") or {}
+        return ChatOutcome(
+            kind="intent_confirm",
+            content=plan_opening(
+                state.get("verdicts", []),
+                MSG_TRANSFER_CONFIRM.format(
+                    amount=preview.get("humanAmount", ""),
+                    symbol=preview.get("tokenSymbol", ""),
+                    target=preview.get("target", ""),
+                ),
+            ),
+            intent_preview=preview,
+            task_id=state.get("task_id") or None,
+            tool_calls=calls,
+        )
+
+    async def resume_plan(self, thread_id: str) -> list[dict] | None:
+        """让挂起的计划走到终点，并清掉它的检查点。
+
+        调用方是确认接口：它已经推进过状态机，图只负责从挂起处收尾，不再碰状态。
+        已经走完的计划不重复恢复 —— 重复点击确认是常态。
+
+        Args:
+            thread_id: 计划的检查点标识。
+
+        Returns:
+            挂起时算出的判断依据（持有多少、比的是哪个门槛）；已经恢复过或没有计划时为空。
+        """
+        graph = self._plan_graph
+        if graph is None or not thread_id:
+            return None
+        config = {"configurable": {"thread_id": thread_id}}
+        try:
+            snapshot = await graph.aget_state(config)
+        except Exception:  # noqa: BLE001 读不到就当作没有挂起
+            await self._audit.log("plan_resume_failed", thread_id=thread_id)
+            logger.exception("plan resume failed thread=%s", thread_id)
+            return None
+        if snapshot is None or not snapshot.next:
+            return None
+        values = snapshot.values or {}
+        try:
+            # 恢复值只是「挂起已结束」的标记，用户的选择已经落在状态机里。
+            await graph.ainvoke(Command(resume=True), config=config)
+        except Exception:  # noqa: BLE001 图恢复失败不能影响已经落地的确认结果
+            await self._audit.log(
+                "plan_resume_failed",
+                siwe_user_id=values.get("siwe_user_id"),
+                siwe_address=values.get("wallet_address"),
+                task_id=values.get("task_id"),
+                thread_id=thread_id,
+            )
+            logger.exception("plan resume failed thread=%s", thread_id)
+            return None
+        await self._drop_thread(graph, thread_id)
+        return values.get("verdicts") or None
+
+    async def drop_plan_thread(self, thread_id: str) -> None:
+        """删除一个不会再被恢复的计划检查点。
+
+        用户始终没有确认时，任务由兜底扫描判过期，挂起的图没人再唤醒；
+        由扫描方调用这里清掉，否则检查点表只增不减。
+
+        Args:
+            thread_id: 计划的检查点标识。
+        """
+        graph = self._plan_graph
+        if graph is None or not thread_id:
+            return
+        await self._drop_thread(graph, thread_id)
+
+    @staticmethod
+    async def _drop_thread(graph, thread_id: str) -> None:
+        """删除计划的检查点，避免挂起记录随对话无限累积。
+
+        Args:
+            graph: 已编译的计划图。
+            thread_id: 要清理的检查点标识。
+        """
+        saver = getattr(graph, "checkpointer", None)
+        if saver is None:
+            return
+        try:
+            await saver.adelete_thread(thread_id)
+        except Exception:  # noqa: BLE001 清理失败只留下一条记录，不影响本次确认
+            logger.warning("plan checkpoint cleanup failed thread=%s", thread_id)
+
     async def _write_outcome(
         self,
         intent: Intent,
@@ -514,9 +694,17 @@ class AgentLoop:
             return ChatOutcome(kind="ask", content=MSG_WALLET_REQUIRED)
         if chain_id is None:
             return ChatOutcome(kind="ask", content=MSG_CHAIN_REQUIRED)
+        # 多步计划降级到单步时参数来自写步，不一定齐全；缺了就不能往下取下标。
+        if any(
+            not str(slots.get(key, "")).strip()
+            for key in REQUIRED_SLOTS[Intent.TRANSFER]
+        ):
+            return ChatOutcome(kind="ask", content=MSG_CLARIFY)
         # 模型会把「转点」「一半」这类说法补成一个具体数字，那张卡片上的金额
         # 用户从没说过。核对不上就追问，不拿推测值去构造交易。
-        if not _amount_quoted(str(slots["humanAmount"]), user_message):
+        if not _amount_quoted(
+            str(slots["humanAmount"]), user_message, str(slots.get("humanAmountText") or "")
+        ):
             return ChatOutcome(kind="ask", content=MSG_AMOUNT_MISSING)
 
         # 参数校验交给构造工具：地址格式、金额精度、代币归属都在那里判定，
@@ -540,28 +728,12 @@ class AgentLoop:
                 tool_calls=[record],
             )
 
-        asset = payload["asset"]
-        preview = {
-            "action": intent.value,
-            "tokenSymbol": asset["symbol"],
-            "humanAmount": asset["human"],
-            "target": payload["recipient"],
-        }
         try:
-            task_id = await workflow_service.create_transfer(
+            task_id, preview = await transfer_task.create(
+                payload,
                 siwe_user_id=siwe_user_id,
-                siwe_address=wallet_address,
+                wallet_address=wallet_address,
                 chain_id=chain_id,
-                to_address=payload["recipient"],
-                token_symbol=asset["symbol"],
-                human_amount=asset["human"],
-                tx_intent={
-                    "from": payload["from"],
-                    "to": payload["tx"]["to"],
-                    "value": payload["tx"]["value"],
-                    "data": payload["tx"]["data"],
-                    "chainId": payload["chainId"],
-                },
                 ttl_seconds=self._settings.workflow_ttl_seconds,
             )
         except Exception:  # noqa: BLE001 建不出任务就不能给卡片：前端没有可确认的对象
@@ -761,25 +933,15 @@ class AgentLoop:
         return outcome
 
 
-# _ADDRESS_RE：整段剥掉地址，避免地址里的十六进制数字被当成金额。
-_ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
-# _NUMBER_RE：用户原话里的数字，兼容千分位写法。
-_NUMBER_RE = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?")
-
-
-def _amount_quoted(human_amount: str, message: str) -> bool:
+def _amount_quoted(human_amount: str, message: str, quote: str = "") -> bool:
     """判断待确认的金额是否出自用户原话。
 
     Args:
         human_amount: 模型抽取的转账数量。
         message: 用户本轮原始输入。
+        quote: 模型给出的、原话里表示该金额的片段。
     """
-    try:
-        wanted = Decimal(str(human_amount).strip().replace(",", ""))
-    except (InvalidOperation, AttributeError):
-        return False
-    spoken = _NUMBER_RE.findall(_ADDRESS_RE.sub(" ", message))
-    return any(Decimal(item.replace(",", "")) == wanted for item in spoken)
+    return multi_hop.amount_is_quoted(human_amount, message, quote=quote)
 
 
 def _record(item: dict) -> ToolCallRecord:

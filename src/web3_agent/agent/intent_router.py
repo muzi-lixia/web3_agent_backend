@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 
+from web3_agent.agent import multi_hop
 from web3_agent.common.types import LlmOutput, RouteDecision
 from web3_agent.config.constants import (
     READ_INTENTS,
@@ -57,20 +58,26 @@ def route_intent(
         user_message: 用户本轮原始输入，用于判断查询意图有没有可执行的对象。
         required_slots: 各业务意图必须具备的参数名集合。
     """
-    if output.needs_clarification:
-        return RouteDecision(route=Route.CLARIFY, reason="needs_clarification")
-
     if output.intent is Intent.OUT_OF_SCOPE:
         return RouteDecision(route=Route.REJECT, reason="out_of_scope")
+
+    # 计划已经把「查什么、比什么、做什么」写全了，模型的自我怀疑不能把它拦成追问；
+    # 形状不完整的计划不豁免，那是真的缺信息。
+    if multi_hop.needs_plan(output.hops) and not multi_hop.plan_shape_error(output.hops):
+        return RouteDecision(route=Route.WRITE, reason="plan")
+
+    if output.needs_clarification:
+        return RouteDecision(route=Route.CLARIFY, reason="needs_clarification")
 
     # 查询意图要能直接形成一个检索或查询动作；闲聊和越界不适用（"嗯""你好"是完整表达）。
     if output.intent in READ_INTENTS and not _has_substance(user_message):
         return RouteDecision(route=Route.CLARIFY, reason="vague_input")
 
-    # 缺参数就执行不了，追问比分派到下游更早。
+    # 缺参数就执行不了，追问比分派到下游更早。多步计划的写步自带参数，
+    # slots 为空不代表信息不足 —— 这时追问反而会把一个完整计划拦在门外。
     slots = required_slots or REQUIRED_SLOTS
     missing = [k for k in slots.get(output.intent, ()) if not output.slots.get(k)]
-    if missing:
+    if missing and not multi_hop.needs_plan(output.hops):
         return RouteDecision(
             route=Route.CLARIFY, reason="missing_slots", missing_slots=missing
         )

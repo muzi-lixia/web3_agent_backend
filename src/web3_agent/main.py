@@ -14,6 +14,7 @@ from fastapi import FastAPI
 
 from web3_agent.agent import langsmith_tracer
 from web3_agent.agent.agent_loop import AgentLoop
+from web3_agent.agent.checkpointer import init_checkpointer
 from web3_agent.agent.json_guard import JsonGuard
 from web3_agent.agent.llm_adapter import LlmAdapter
 from web3_agent.agent.tool_registry import ToolRegistry
@@ -96,11 +97,12 @@ class Container:
     rag_worker: IngestionWorker
 
 
-def build_container(settings: Settings) -> Container:
+def build_container(settings: Settings, checkpointer=None) -> Container:
     """在唯一组装点创建模型、链访问、工具、仓储和后台任务依赖。
 
     Args:
         settings: 运行配置对象，提供本模块所需开关、阈值和服务地址。
+        checkpointer: 多步计划的检查点存储；为空时多步输入降级为追问。
     """
     tracing_enabled = langsmith_tracer.configure(settings)
 
@@ -147,6 +149,7 @@ def build_container(settings: Settings) -> Container:
         audit=audit,
         model_with_tools=llm.bind_tools(registry.llm_tools()),
         runner=runner,
+        checkpointer=checkpointer,
     )
     summarizer = Summarizer(settings=settings, llm=llm, audit=audit, quota=quota)
     memory = MemoryExtractor(settings=settings, llm=llm, audit=audit, quota=quota)
@@ -172,12 +175,17 @@ async def lifespan(app: FastAPI):
         app: 当前 FastAPI 应用实例。
     """
     settings = get_settings()
-    container = build_container(settings)
-    app.state.container = container
 
     init_engine(settings)
     if settings.auto_create_tables:
         await create_all()
+
+    # 检查点要在组装之前就绪：多步计划图编译时就要拿到它。
+    ready = await init_checkpointer(settings)
+    checkpointer, pool = ready if ready else (None, None)
+
+    container = build_container(settings, checkpointer)
+    app.state.container = container
 
     if settings.rag_enabled or settings.rag_upload_enabled:
         await container.knowledge_bases.check_schema()
@@ -199,7 +207,7 @@ async def lifespan(app: FastAPI):
     if settings.workflow_sweep_seconds > 0:
         background.append(
             asyncio.create_task(
-                _workflow_sweep_loop(settings, container.adapter),
+                _workflow_sweep_loop(settings, container.adapter, container.agent),
                 name="workflow-sweep",
             )
         )
@@ -213,6 +221,8 @@ async def lifespan(app: FastAPI):
         for task in background:
             task.cancel()
         await asyncio.gather(*background, return_exceptions=True)
+        if pool is not None:
+            await pool.close()
         await container.adapter.aclose()
         await dispose_engine()
 
@@ -263,12 +273,15 @@ async def _quota_cleanup_loop() -> None:
         await asyncio.sleep(_QUOTA_CLEANUP_INTERVAL_SECONDS)
 
 
-async def _workflow_sweep_loop(settings: Settings, adapter: ChainAdapter) -> None:
+async def _workflow_sweep_loop(
+    settings: Settings, adapter: ChainAdapter, agent: AgentLoop
+) -> None:
     """按配置间隔兜底推进写操作任务，让关掉页面的任务也能走到终态。
 
     Args:
         settings: 运行配置对象，提供扫描间隔与单批上限。
         adapter: 按网络管理 RPC 客户端与只读缓存的链适配器。
+        agent: 对话主编排服务，提供清理计划检查点的入口。
     """
     while True:
         await asyncio.sleep(settings.workflow_sweep_seconds)
@@ -277,6 +290,7 @@ async def _workflow_sweep_loop(settings: Settings, adapter: ChainAdapter) -> Non
                 adapter,
                 batch=settings.workflow_sweep_batch,
                 stale_seconds=settings.workflow_sweep_seconds,
+                drop_plan=agent.drop_plan_thread,
             )
         except Exception:  # noqa: BLE001 扫描失败不能带崩进程
             logger.exception("workflow sweep failed")

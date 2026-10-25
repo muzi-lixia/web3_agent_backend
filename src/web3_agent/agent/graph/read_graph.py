@@ -29,8 +29,8 @@ from web3_agent.common.metering import Resource, reserve
 logger = logging.getLogger(__name__)
 
 # 这些工具的地址参数来自会话身份，不允许模型自己编。
-# _ADDRESS_ARG：不同链上工具需要注入的钱包参数名称映射。
-_ADDRESS_ARG = {
+# ADDRESS_ARG：不同链上工具需要注入的钱包参数名称映射。
+ADDRESS_ARG = {
     "get_asset_balance": "address",
     "get_transaction_records": "address",
     "get_stake_info": "userAddress",
@@ -38,8 +38,8 @@ _ADDRESS_ARG = {
 
 # 地址必须等于当前登录地址的工具：模型传什么都不采纳，直接覆盖。
 # 交易记录只允许查自己的账户，这是业务限制，不能在提示词或某条路由里兑现。
-# _SESSION_BOUND：必须绑定当前登录钱包、不允许模型选择其他地址的工具集合。
-_SESSION_BOUND = frozenset({"get_transaction_records"})
+# SESSION_BOUND：必须绑定当前登录钱包、不允许模型选择其他地址的工具集合。
+SESSION_BOUND = frozenset({"get_transaction_records"})
 
 # _RAG_TOOL：知识问答使用的检索工具稳定名称。
 _RAG_TOOL = "rag_general_knowledge"
@@ -206,9 +206,9 @@ def build_read_graph(
                 continue
 
             # 地址参数来自会话身份，不由模型决定。
-            arg_name = _ADDRESS_ARG.get(name)
+            arg_name = ADDRESS_ARG.get(name)
             if arg_name:
-                if name in _SESSION_BOUND:
+                if name in SESSION_BOUND:
                     if not wallet:
                         refuse(call, "E503", "该查询只能针对当前登录地址，请先连接钱包")
                         continue
@@ -465,4 +465,4 @@ if __name__ == "__main__":
     print(graph.get_graph().draw_mermaid())
 
     # 如需生成图片，取消下面这行注释；默认需要联网
-    # graph.get_graph().draw_mermaid_png(output_file_path="../../../../../read_graph.png")
+    graph.get_graph().draw_mermaid_png(output_file_path="../../../../../read_graph.png")

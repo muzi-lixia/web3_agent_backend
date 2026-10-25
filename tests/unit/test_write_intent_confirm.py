@@ -53,10 +53,22 @@ async def _fake_create(**kwargs) -> str:
 
 
 class _Adapter:
-    """只回答支持哪些网络，转账工具在原生币分支不会用到其它方法。"""
+    """只回答支持哪些网络与原生币余额，其余能力转账工具用不到。"""
+
+    def __init__(self, balance: int = 10**18) -> None:
+        self.balance = balance
 
     def available_chains(self) -> list[int]:
         return [_CHAIN]
+
+    async def get_native_balance(self, chain_id: int, address: str) -> int:
+        """返回替身余额，默认远大于用例里的 0.1 BERA。
+
+        Args:
+            chain_id: 交易所在网络编号。
+            address: 待查询的付款地址。
+        """
+        return self.balance
 
 
 class _SlotLlm(_Llm):
@@ -70,12 +82,12 @@ class _SlotLlm(_Llm):
         return LlmOutput(intent=self.intent, confidence=0.9, slots=self.slots)
 
 
-def _loop_with_transfer(monkeypatch, intent: Intent, slots: dict):
+def _loop_with_transfer(monkeypatch, intent: Intent, slots: dict, *, balance: int = 10**18):
     loop = _loop(_Graph("unused"), intent)
     loop._llm = _SlotLlm(intent, slots)
     registry = ToolRegistry()
     registry.register(
-        build_post_transfer(_Adapter()), ToolGroup.STATEMACHINE_ONLY, mutating=True
+        build_post_transfer(_Adapter(balance)), ToolGroup.STATEMACHINE_ONLY, mutating=True
     )
     loop._runner = ToolRunner(registry)
     monkeypatch.setattr(workflow_service, "create_transfer", _fake_create)
@@ -144,6 +156,19 @@ def test_unusable_parameters_ask_instead_of_confirm(monkeypatch, overrides, expe
     assert outcome.intent_preview is None
 
 
+def test_insufficient_balance_asks_instead_of_confirm(monkeypatch):
+    """余额不够就不出卡片：签名后链上必然回滚，gas 白烧。"""
+    loop = _loop_with_transfer(
+        monkeypatch, Intent.TRANSFER, _native_slots(), balance=10**16
+    )
+    outcome = _handle(loop)
+
+    assert outcome.kind == "ask"
+    assert "余额不足" in outcome.content
+    assert outcome.intent_preview is None
+    assert outcome.task_id is None
+
+
 @pytest.mark.parametrize(
     ("message", "amount", "quoted"),
     [
@@ -178,7 +203,7 @@ def test_invented_amount_asks_and_creates_no_task(monkeypatch):
 
 def test_thousands_separator_still_confirms(monkeypatch):
     loop = _loop_with_transfer(
-        monkeypatch, Intent.TRANSFER, _native_slots(humanAmount="1000")
+        monkeypatch, Intent.TRANSFER, _native_slots(humanAmount="1000"), balance=10**21
     )
     outcome = _handle(loop, message="转 1,000 BERA 给朋友")
 

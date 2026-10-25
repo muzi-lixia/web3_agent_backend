@@ -37,12 +37,15 @@ async def confirm_intent(
         identity: 经服务端验证的登录用户与钱包身份。
     """
     container = request.app.state.container
-    status = await service.confirm(
+    status, thread_id = await service.confirm(
         siwe_user_id=identity.user_id,
         siwe_address=identity.address,
         task_id=payload.task_id,
         accepted=payload.accepted,
     )
+    # 多步计划建出来的任务，确认后把决定送回挂起的图；单步任务没有这个标识。
+    evidence = await container.agent.resume_plan(thread_id) if thread_id else None
+    extra = {"evidence": evidence} if evidence else {}
     await container.audit.log(
         "intent_confirmed",
         siwe_user_id=identity.user_id,
@@ -50,6 +53,7 @@ async def confirm_intent(
         task_id=payload.task_id,
         accepted=payload.accepted,
         status=status,
+        **extra,
     )
     return IntentConfirmResp(task_id=payload.task_id, status=status)
 
