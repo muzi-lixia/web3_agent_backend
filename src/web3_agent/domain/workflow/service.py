@@ -43,6 +43,17 @@ _CHECKABLE_STATES = frozenset(
     }
 )
 
+# _OPEN_STATES：还没结案、可能被断线重试重复建卡的状态。按自然键去重只在这组
+# 状态里找：已结案的（含过期）不拦，用户真想再转一笔同样的应该放行。
+_OPEN_STATES = tuple(
+    s.value
+    for s in (
+        WorkflowState.INTENT_CONFIRM,
+        WorkflowState.PREVIEW,
+        WorkflowState.SUBMITTED,
+    )
+)
+
 
 def _now() -> datetime:
     """返回当前带 UTC 时区的时间，作为过期判断基准。"""
@@ -246,6 +257,20 @@ async def create_transfer(
         # 确认接口凭它找到挂起的计划：前端不需要知道有图这回事。
         params["plan_thread_id"] = plan_thread_id
     async with session_scope() as db:
+        # 断线重试会重跑整轮，同一句话可能再建一张待确认卡。先按交易自然键找一条
+        # 未结案的同款任务，命中就复用它的 task_id，不新建第二张卡。
+        existing = await workflow_repo.find_open_by_natural_key(
+            db,
+            siwe_user_id=siwe_user_id,
+            siwe_address=siwe_address,
+            chain_id=chain_id,
+            to_address=to_address,
+            token_symbol=token_symbol,
+            human_amount=human_amount,
+            open_states=_OPEN_STATES,
+        )
+        if existing is not None:
+            return existing.task_id
         await workflow_repo.create(
             db,
             task_id=task_id,

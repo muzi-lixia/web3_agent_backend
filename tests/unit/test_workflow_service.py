@@ -615,3 +615,54 @@ def test_confirm_skips_resume_for_single_step_tasks(monkeypatch):
 
     agent.resume_plan.assert_not_awaited()
     assert "evidence" not in container.audit.log.await_args.kwargs
+
+
+# --- create_transfer 的自然键去重：断线重试不能长出第二张待确认卡 ---
+
+
+def _create_transfer(monkeypatch, find_result) -> tuple[str, dict]:
+    """把 find_open_by_natural_key 换成受控结果，调用 create_transfer 并记录新建。"""
+    created: list[dict] = []
+
+    async def fake_find(db, **kwargs):
+        return find_result
+
+    async def fake_create(db, **kwargs):
+        created.append(kwargs)
+        return None
+
+    monkeypatch.setattr(service, "session_scope", lambda: _Session())
+    monkeypatch.setattr(workflow_repo, "find_open_by_natural_key", fake_find)
+    monkeypatch.setattr(workflow_repo, "create", fake_create)
+
+    async def _call():
+        return await service.create_transfer(
+            siwe_user_id=_USER,
+            siwe_address=_ADDRESS,
+            chain_id=80094,
+            to_address="0x" + "2" * 40,
+            token_symbol="BERA",
+            human_amount="0.1",
+            tx_intent=_TX,
+            ttl_seconds=180,
+        )
+
+    return asyncio.run(_call()), created
+
+
+def test_create_transfer_reuses_open_task_on_retry(monkeypatch):
+    """同一笔转账已有一条未结案任务时，重试复用它的 task_id，不新建。"""
+    existing = _row()
+    task_id, created = _create_transfer(monkeypatch, find_result=existing)
+
+    assert task_id == _TASK
+    assert created == []
+
+
+def test_create_transfer_creates_when_no_open_task(monkeypatch):
+    """没有同款未结案任务时正常新建。"""
+    task_id, created = _create_transfer(monkeypatch, find_result=None)
+
+    assert task_id != _TASK
+    assert len(created) == 1
+    assert created[0]["state"] == WorkflowState.INTENT_CONFIRM.value

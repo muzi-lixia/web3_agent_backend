@@ -69,6 +69,51 @@ async def get(db, task_id: str) -> Row | None:
     ).scalar_one_or_none()
 
 
+async def find_open_by_natural_key(
+    db,
+    *,
+    siwe_user_id: str,
+    siwe_address: str,
+    chain_id: int,
+    to_address: str,
+    token_symbol: str,
+    human_amount: str,
+    open_states: tuple[str, ...],
+) -> Row | None:
+    """按「同一笔转账」的业务特征找一条还没结案的任务。
+
+    断线重试会重跑整轮，写路径可能为同一句话再建一张待确认卡。这里不看幂等键，
+    用交易本身的自然键（谁转给谁、转什么、转多少）去重：命中未结案任务就复用它的
+    task_id，不新建。已结案的不拦 —— 用户真的想再转一笔同样的，应该放行。
+
+    Args:
+        db: 调用方提供的异步数据库会话；事务提交由外层负责。
+        siwe_user_id: 任务归属用户的稳定标识。
+        siwe_address: 任务归属钱包的完整地址。
+        chain_id: 写操作所在网络编号。
+        to_address: 收款地址。
+        token_symbol: 转账资产的符号。
+        human_amount: 人类可读的转账数量。
+        open_states: 视为「未结案」的状态集合，命中的任务必须落在其中。
+    """
+    stmt = (
+        select(Row)
+        .where(
+            Row.siwe_user_id == siwe_user_id,
+            Row.siwe_address == siwe_address,
+            Row.chain_id == chain_id,
+            Row.action == "transfer",
+            Row.state.in_(open_states),
+            Row.params["to_address"].astext == to_address,
+            Row.params["token_symbol"].astext == token_symbol,
+            Row.params["human_amount"].astext == human_amount,
+        )
+        .order_by(Row.created_at.asc())
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
 async def transition(
     db,
     task_id: str,

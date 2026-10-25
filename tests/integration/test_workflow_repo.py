@@ -175,3 +175,92 @@ def test_list_pending_includes_expired_unbroadcast_rows() -> None:
     finally:
         _run(cleanup)
     assert rows == [(WorkflowState.INTENT_CONFIRM.value, False)]
+
+
+def _seed_transfer(db, prefix: str, *, state: WorkflowState) -> None:
+    """插入一条按自然键可去重的转账任务。"""
+    now = datetime.now(timezone.utc)
+    db.add(
+        WorkflowTask(
+            task_id=f"{prefix}-{uuid.uuid4().hex[:12]}",
+            siwe_user_id=_USER,
+            siwe_address=_ADDRESS,
+            action="transfer",
+            chain_id=80094,
+            state=state.value,
+            expire_type="NONE",
+            params={
+                "from_address": _ADDRESS,
+                "to_address": "0x" + "2" * 40,
+                "token_symbol": "BERA",
+                "human_amount": "0.1",
+            },
+            tx_intent=None,
+            tx_hash=None,
+            expires_at=now + timedelta(seconds=300),
+        )
+    )
+
+
+def test_find_open_by_natural_key_hits_open_and_skips_terminal() -> None:
+    """同款转账：未结案的能命中（去重），已结案的不拦（允许再转）。"""
+    prefix = f"nk-{uuid.uuid4().hex[:8]}"
+
+    async def flow() -> tuple[str | None, str | None]:
+        async with pg.session_scope() as db:
+            _seed_transfer(db, prefix, state=WorkflowState.INTENT_CONFIRM)
+            _seed_transfer(db, prefix, state=WorkflowState.SETTLED)
+        async with pg.session_scope() as db:
+            hit = await workflow_repo.find_open_by_natural_key(
+                db,
+                siwe_user_id=_USER,
+                siwe_address=_ADDRESS,
+                chain_id=80094,
+                to_address="0x" + "2" * 40,
+                token_symbol="BERA",
+                human_amount="0.1",
+                open_states=(WorkflowState.INTENT_CONFIRM.value, WorkflowState.PREVIEW.value),
+            )
+        return hit.task_id if hit else None, None
+
+    async def cleanup() -> None:
+        async with pg.session_scope() as db:
+            await db.execute(delete(WorkflowTask).where(WorkflowTask.task_id.like(f"{prefix}-%")))
+
+    try:
+        task_id, _ = _run(flow)
+    finally:
+        _run(cleanup)
+    assert task_id is not None
+    assert task_id.startswith(prefix)
+
+
+def test_find_open_by_natural_key_ignores_different_amount() -> None:
+    """金额不同是两笔不同的转账，不能去重。"""
+    prefix = f"nk-{uuid.uuid4().hex[:8]}"
+
+    async def flow() -> str | None:
+        async with pg.session_scope() as db:
+            _seed_transfer(db, prefix, state=WorkflowState.INTENT_CONFIRM)
+        async with pg.session_scope() as db:
+            hit = await workflow_repo.find_open_by_natural_key(
+                db,
+                siwe_user_id=_USER,
+                siwe_address=_ADDRESS,
+                chain_id=80094,
+                to_address="0x" + "2" * 40,
+                token_symbol="BERA",
+                human_amount="9.9",  # 与已存的 0.1 不同
+                open_states=(WorkflowState.INTENT_CONFIRM.value,),
+            )
+        return hit.task_id if hit else None
+
+    async def cleanup() -> None:
+        async with pg.session_scope() as db:
+            await db.execute(delete(WorkflowTask).where(WorkflowTask.task_id.like(f"{prefix}-%")))
+
+    try:
+        task_id = _run(flow)
+    finally:
+        _run(cleanup)
+    assert task_id is None
