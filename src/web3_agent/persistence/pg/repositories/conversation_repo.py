@@ -274,6 +274,8 @@ async def append_message(
     content: str,
     tool_calls: list | None = None,
     turn_id: str | None = None,
+    task_id: str | None = None,
+    intent_preview: dict | None = None,
 ) -> int:
     """追加用户或助手消息并 flush，返回数据库分配的消息 ID。
 
@@ -284,6 +286,8 @@ async def append_message(
         content: 消息正文、文档正文或待写入文本。
         tool_calls: 随助手消息保存的工具轨迹 JSON；没有调用时为空。
         turn_id: 同一轮用户问题与助手回答共用的标识。
+        task_id: 本轮创建的写操作任务标识；普通问答为空。
+        intent_preview: 写操作待确认的参数快照，用于刷新后重建卡片。
     """
     row = ConversationMessage(
         siwe_user_id=siwe_user_id,
@@ -291,6 +295,8 @@ async def append_message(
         content=content,
         tool_calls=tool_calls,
         turn_id=turn_id,
+        task_id=task_id,
+        intent_preview=intent_preview,
     )
     db.add(row)
     await db.flush()

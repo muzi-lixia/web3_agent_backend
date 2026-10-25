@@ -18,7 +18,7 @@ class Intent(str, Enum):
     QUERY_STAKE = "query_stake"
     # QUERY_KNOWLEDGE：查询已审核的静态 Web3 文档知识。
     QUERY_KNOWLEDGE = "query_knowledge"
-    # TRANSFER：转账写意图，当前主链路仅识别并提示未接入。
+    # TRANSFER：转账写意图，返回待确认参数后等前端确认。
     TRANSFER = "transfer"
     # APPROVE：代币授权写意图，当前主链路不执行。
     APPROVE = "approve"
@@ -36,12 +36,44 @@ class Intent(str, Enum):
 class Route(str, Enum):
     # READ：进入只读查询或闲聊处理路径。
     READ = "read"
-    # WRITE：进入写操作分支，当前版本只返回未接入提示。
+    # WRITE：进入写操作分支，参数齐全时回显待确认视图。
     WRITE = "write"
     # CLARIFY：信息不足或置信度偏低，要求用户补充说明。
     CLARIFY = "clarify"
     # REJECT：意图超出范围，返回固定拒答。
     REJECT = "reject"
+
+
+# 数据职责：写操作 workflow 的生命周期状态。
+class WorkflowState(str, Enum):
+    # INTENT_CONFIRM：已构造待签名交易，等 intent/confirm 接口给出确认或拒绝。
+    INTENT_CONFIRM = "INTENT_CONFIRM"
+    # PREVIEW：用户已确认，待签名的交易意图可读，等待钱包签名广播。
+    PREVIEW = "PREVIEW"
+    # SUBMITTED：已收到交易哈希但回执尚未确认。
+    SUBMITTED = "SUBMITTED"
+    # SETTLED：workflow 内全部交易已完成。
+    SETTLED = "SETTLED"
+    # FAILED：回执 status=0，交易被链上回滚。
+    FAILED = "FAILED"
+    # ABORTED：用户在确认环节拒绝。
+    ABORTED = "ABORTED"
+    # EXPIRED_UNSIGNED：TTL 到期且从未广播，可安全重新发起。
+    EXPIRED_UNSIGNED = "EXPIRED_UNSIGNED"
+    # EXPIRED_UNVERIFIED：TTL 到期但已有广播，链上状态未知，不能直接重发。
+    EXPIRED_UNVERIFIED = "EXPIRED_UNVERIFIED"
+
+
+# TERMINAL_STATES：到达即不再推进、前端停止轮询的状态集合。
+TERMINAL_STATES: frozenset[WorkflowState] = frozenset(
+    {
+        WorkflowState.SETTLED,
+        WorkflowState.FAILED,
+        WorkflowState.ABORTED,
+        WorkflowState.EXPIRED_UNSIGNED,
+        WorkflowState.EXPIRED_UNVERIFIED,
+    }
+)
 
 
 # 数据职责：工具对不同执行器的可见性分组。
@@ -86,6 +118,8 @@ TOOL_GET_ASSET_BALANCE = "get_asset_balance"
 TOOL_GET_TRANSACTION_RECORDS = "get_transaction_records"
 # TOOL_GET_STAKE_INFO：工具在注册表和调用轨迹中使用的稳定名称。
 TOOL_GET_STAKE_INFO = "get_stake_info"
+# TOOL_POST_TRANSFER：工具在注册表和调用轨迹中使用的稳定名称。
+TOOL_POST_TRANSFER = "post_transfer"
 
 
 class QuotaMetric(str, Enum):
@@ -110,6 +144,16 @@ MSG_JSON_DEGRADED = "我暂时没法稳定理解这句话，换个说法再试�
 MSG_SECRET_REFUSED = "检测到可能泄露的私钥或助记词，已拒绝本次请求。请勿在对话中粘贴私钥或助记词。"
 # MSG_WRITE_NOT_ENABLED：当前场景使用的固定用户提示，不交给模型生成或改写。
 MSG_WRITE_NOT_ENABLED = "写操作链路（转账 / 授权 / 质押）尚未接入，当前只能查询。"
+# MSG_TRANSFER_CONFIRM：待确认回显的固定文案，参数由参数快照填入。
+MSG_TRANSFER_CONFIRM = "请确认转账：{amount} {symbol} 转给 {target}。"
+# MSG_WALLET_REQUIRED：没有钱包身份时无法构造交易。
+MSG_WALLET_REQUIRED = "还没有连接钱包，连接后我才能构造这笔交易。"
+# MSG_CHAIN_REQUIRED：没有网络信息时无法确定交易发往哪条链。
+MSG_CHAIN_REQUIRED = "还没有确定要使用的网络，选择网络后再试一次。"
+# MSG_WRITE_TASK_FAILED：参数可用但任务没建成，此时不能给确认卡——没有可确认的对象。
+MSG_WRITE_TASK_FAILED = "写操作任务创建失败，请稍后重试。"
+# MSG_AMOUNT_MISSING：模型给出的金额不在用户原话里，必须先问清再出确认卡。
+MSG_AMOUNT_MISSING = "请给出具体的转账金额，比如 10 或 0.5。"
 # MSG_CLARIFY：当前场景使用的固定用户提示，不交给模型生成或改写。
 MSG_CLARIFY = "我需要再确认一点信息才能继续，能补充一下吗？"
 # MSG_OUT_OF_SCOPE：当前场景使用的固定用户提示，不交给模型生成或改写。

@@ -18,7 +18,13 @@ from web3_agent.agent.json_guard import JsonGuard
 from web3_agent.agent.llm_adapter import LlmAdapter
 from web3_agent.agent.tool_registry import ToolRegistry
 from web3_agent.agent.tool_runner import ToolRunner
-from web3_agent.api.v1 import auth_router, chat_router, health_router, rag_router
+from web3_agent.api.v1 import (
+    auth_router,
+    chat_router,
+    health_router,
+    rag_router,
+    workflow_router,
+)
 from web3_agent.common.exceptions import ModelUnavailable
 from web3_agent.common.logging_setup import setup_logging
 from web3_agent.config.constants import ToolGroup
@@ -26,6 +32,7 @@ from web3_agent.config.settings import Settings, get_settings
 from web3_agent.domain.memory.extractor import MemoryExtractor
 from web3_agent.domain.memory.summarizer import Summarizer
 from web3_agent.domain.quotas import QuotaController
+from web3_agent.domain.workflow import sweeper as workflow_sweeper
 from web3_agent.middlewares.error_handler_middleware import register_exception_handlers
 from web3_agent.middlewares.trace_middleware import TraceMiddleware
 from web3_agent.persistence.pg.base import create_all, dispose_engine, init_engine, session_scope
@@ -43,6 +50,7 @@ from web3_agent.web3.chain_adapter import ChainAdapter
 from web3_agent.web3.tools.read.get_asset_balance import build_get_asset_balance
 from web3_agent.web3.tools.read.get_stake_info import build_get_stake_info
 from web3_agent.web3.tools.read.get_transaction_records import build_get_transaction_records
+from web3_agent.web3.tools.write.transfer import build_post_transfer
 
 setup_logging(get_settings().log_level)
 logger = logging.getLogger(__name__)
@@ -108,6 +116,11 @@ def build_container(settings: Settings) -> Container:
         build_get_stake_info(adapter, settings.stake_contracts),
         ToolGroup.LLM_VISIBLE,
         mutating=False,
+    )
+    registry.register(
+        build_post_transfer(adapter),
+        ToolGroup.STATEMACHINE_ONLY,
+        mutating=True,
     )
 
     embedder = Embedder(settings)
@@ -183,6 +196,13 @@ async def lifespan(app: FastAPI):
         background.append(asyncio.create_task(_heartbeat_loop()))
     background.append(asyncio.create_task(_nonce_cleanup_loop()))
     background.append(asyncio.create_task(_quota_cleanup_loop()))
+    if settings.workflow_sweep_seconds > 0:
+        background.append(
+            asyncio.create_task(
+                _workflow_sweep_loop(settings, container.adapter),
+                name="workflow-sweep",
+            )
+        )
     if settings.rag_upload_enabled:
         background.append(asyncio.create_task(container.rag_worker.run(), name="rag-ingestion"))
 
@@ -243,6 +263,28 @@ async def _quota_cleanup_loop() -> None:
         await asyncio.sleep(_QUOTA_CLEANUP_INTERVAL_SECONDS)
 
 
+async def _workflow_sweep_loop(settings: Settings, adapter: ChainAdapter) -> None:
+    """按配置间隔兜底推进写操作任务，让关掉页面的任务也能走到终态。
+
+    Args:
+        settings: 运行配置对象，提供扫描间隔与单批上限。
+        adapter: 按网络管理 RPC 客户端与只读缓存的链适配器。
+    """
+    while True:
+        await asyncio.sleep(settings.workflow_sweep_seconds)
+        try:
+            moved = await workflow_sweeper.sweep_once(
+                adapter,
+                batch=settings.workflow_sweep_batch,
+                stale_seconds=settings.workflow_sweep_seconds,
+            )
+        except Exception:  # noqa: BLE001 扫描失败不能带崩进程
+            logger.exception("workflow sweep failed")
+            continue
+        if moved:
+            logger.info("workflow sweep: advanced %d tasks", moved)
+
+
 def create_app() -> FastAPI:
     """创建 FastAPI 应用，注册中间件、错误处理及全部路由。"""
     app = FastAPI(title="Web3 链上智能 Agent 助手", version="0.8", lifespan=lifespan)
@@ -251,6 +293,7 @@ def create_app() -> FastAPI:
     app.include_router(health_router.router)
     app.include_router(auth_router.router, prefix="/api/v1")
     app.include_router(chat_router.router, prefix="/api/v1")
+    app.include_router(workflow_router.router, prefix="/api/v1")
     app.include_router(rag_router.router, prefix="/api/v1")
     app.include_router(rag_router.public_router, prefix="/api/v1")
     return app

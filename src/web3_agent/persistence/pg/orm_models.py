@@ -57,6 +57,10 @@ class ConversationMessage(Base):
     content: Mapped[str] = mapped_column(Text)
     # tool_calls：本轮工具调用轨迹，包含名称、参数及执行结果；未调用时可为空。
     tool_calls: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    # task_id：本轮创建的写操作任务标识；普通问答为空。
+    task_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # intent_preview：写操作待确认的参数快照，用于刷新后重建确认卡片。
+    intent_preview: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     # 一轮对话的标识。同一轮先写 user、后写 assistant，中间隔着模型调用，
     # 两台设备并发时 id 顺序会变成 u1,u2,a1,a2 —— 靠 id 拼历史等于把 a1 读成回答 u2。
     # 加载时按 turn_id 分组、组内 user 在前，重建出 u1,a1,u2,a2。
@@ -476,5 +480,47 @@ class ChatIdempotency(Base):
     # created_at：记录创建时间；数据库时间字段使用带时区时间。
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
+class WorkflowTask(Base):
+    """写操作任务：意图确认、待签名交易、广播后回执核对的唯一载体。
+
+    运行态与归档同表。siwe_address 存完整值供归属校验，对外只输出脱敏摘要。
+    """
+
+    __tablename__ = "workflow_task"
+
+    # task_id：对外暴露的任务标识，也是本表的唯一键。
+    task_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    # siwe_user_id：任务归属的 SIWE 用户标识，用于越权判断。
+    siwe_user_id: Mapped[str] = mapped_column(String(64), index=True)
+    # siwe_address：任务归属钱包的完整地址，仅内部校验使用，不对外输出。
+    siwe_address: Mapped[str] = mapped_column(String(42))
+    # action：业务动作名，取自写意图，例如 transfer。
+    action: Mapped[str] = mapped_column(String(16))
+    # chain_id：本次写操作所在网络编号。
+    chain_id: Mapped[int] = mapped_column(Integer)
+    # state：生命周期状态，取值见 WorkflowState。
+    state: Mapped[str] = mapped_column(String(24), index=True)
+    # expire_type：过期原因：NONE 或两个 EXPIRED_* 之一。
+    expire_type: Mapped[str] = mapped_column(String(24), default="NONE")
+    # params：构造交易用的原始业务参数，确认后不再改写。
+    params: Mapped[dict] = mapped_column(JSONB)
+    # tx_intent：待签名交易参数（to/value/data），确认前不对外输出。
+    tx_intent: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # tx_hash：前端上报的广播哈希；只记录第一笔，用于回执核对。
+    tx_hash: Mapped[str | None] = mapped_column(String(66), nullable=True)
+    # error_code：失败或过期时对外返回的稳定错误码。
+    error_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # error_message：失败原因的用户可读文案，不使用底层异常原文。
+    error_message: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # expires_at：任务过期时间，到期后按 expire_type 给出终态。
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    # created_at：记录创建时间；数据库时间字段使用带时区时间。
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # updated_at：最近更新时间，用于追踪状态推进。
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 

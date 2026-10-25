@@ -17,6 +17,7 @@ from web3_agent.api.schemas.chat_schema import (
     ClearResp,
     HistoryItem,
     HistoryResp,
+    IntentPreview,
     PurgeResp,
 )
 from web3_agent.common.exceptions import (
@@ -42,7 +43,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["chat"], dependencies=[Depends(chat_rate_limit)])
 
 # _KIND_TO_TYPE：内部回答种类到 HTTP 响应种类的转换映射。
-_KIND_TO_TYPE = {"answer": "answer", "ask": "ask", "reject": "answer"}
+_KIND_TO_TYPE = {
+    "answer": "answer",
+    "ask": "ask",
+    "reject": "answer",
+    "intent_confirm": "intent_confirm",
+}
 
 # 幂等占位的存活上限 = 整轮硬超时 + 这段余量。余量留给超时判定后的事务收尾，
 # 余量之后仍在 running 的行，只可能是进程在写回前就不在了。
@@ -316,6 +322,12 @@ async def chat(
     response = ChatResponse(
         type=_KIND_TO_TYPE.get(outcome.kind, "answer"),
         content=outcome.content,
+        task_id=outcome.task_id,
+        intent_preview=(
+            IntentPreview.model_validate(outcome.intent_preview)
+            if outcome.intent_preview
+            else None
+        ),
         data={
             "steps": outcome.steps,
             "toolCalls": [call.model_dump() for call in outcome.tool_calls],
@@ -367,6 +379,12 @@ async def history(
                 role=row.role,
                 content=row.content,
                 tool_calls=tool_calls,
+                task_id=row.task_id,
+                intent_preview=(
+                    IntentPreview.model_validate(row.intent_preview)
+                    if row.intent_preview
+                    else None
+                ),
                 citations=citations,
                 created_at=row.created_at,
             )

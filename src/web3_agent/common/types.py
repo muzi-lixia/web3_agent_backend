@@ -48,10 +48,14 @@ class ToolCallRecord(BaseModel):
 
 # 数据职责：Agent 内部的一轮处理结果，由 HTTP 层转换为对外响应。
 class ChatOutcome(BaseModel):
-    # kind：内部回答类型：answer 普通回答、ask 追问、reject 拒答。
-    kind: str  # answer | ask | reject
+    # kind：内部回答类型：answer 普通回答、ask 追问、reject 拒答、intent_confirm 待确认。
+    kind: str  # answer | ask | reject | intent_confirm
     # content：本轮最终回复正文；失效轮次会被清空。
     content: str
+    # intent_preview：写操作待确认的参数快照，非写意图为空。
+    intent_preview: dict[str, Any] | None = None
+    # task_id：写操作建出的 workflow 任务标识，供确认与状态轮询使用。
+    task_id: str | None = None
     # tool_calls：本轮工具调用轨迹，包含名称、参数及执行结果；未调用时可为空。
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
     # steps：只读图模型调用步数；意图模型等额外调用由独立账本计量。

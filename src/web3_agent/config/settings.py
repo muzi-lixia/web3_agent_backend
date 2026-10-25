@@ -178,6 +178,13 @@ class Settings(BaseSettings):
     # --- 写链路风控（PRD 12 章：单笔等值金额上限）---
     # write_max_amount_usd：写操作预留的单笔美元等值限额，当前只读链路不据此执行交易。
     write_max_amount_usd: float = DEFAULT_MAX_AMOUNT_USD
+    # workflow_ttl_seconds：一笔写操作从回显到确认、广播、回执核对的总有效秒数。
+    # 到期前会强制核对一次回执，因此不能短于「用户看一眼再签个名」的实际耗时。
+    workflow_ttl_seconds: int = Field(default=180, ge=60, le=86400)
+    # workflow_sweep_seconds：兜底扫描间隔秒数；设为 0 表示不启动后台推进。
+    workflow_sweep_seconds: int = Field(default=60, ge=0, le=3600)
+    # workflow_sweep_batch：单次扫描最多处理的任务数。
+    workflow_sweep_batch: int = Field(default=50, ge=1, le=500)
 
     # --- 本地 Ollama ---
     ollama_base_url: str = "http://127.0.0.1:11434"

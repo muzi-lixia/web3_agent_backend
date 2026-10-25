@@ -1,12 +1,16 @@
 """Agent 主循环：Perception → Thought → IntentRouter → Action → 终止。
 
-写路径在这条链路上只走到 IntentRouter：route=write 就停，交给后续状态机（M2）。
-V1a 不生成任何 TxIntent。
+写路径走到 IntentRouter 后单独出口：转账构造待签名交易并建一个待确认任务，
+其余写意图仍提示未接入。本模块不签名、不广播。
 """
 
 from __future__ import annotations
 
+import json
+import logging
+import re
 import uuid
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -30,18 +34,26 @@ from web3_agent.common.exceptions import (
 from web3_agent.common.tracing import get_trace_id, set_run_id
 from web3_agent.common.types import ChatOutcome, ToolCallRecord
 from web3_agent.config.constants import (
+    MSG_AMOUNT_MISSING,
+    MSG_CHAIN_REQUIRED,
     MSG_CLARIFY,
     MSG_JSON_DEGRADED,
     MSG_NO_DATA,
     MSG_OUT_OF_SCOPE,
     MSG_SECRET_REFUSED,
     MSG_STEP_LIMIT,
+    MSG_TRANSFER_CONFIRM,
+    MSG_WALLET_REQUIRED,
     MSG_WRITE_NOT_ENABLED,
+    MSG_WRITE_TASK_FAILED,
+    TOOL_POST_TRANSFER,
+    CallSource,
     Intent,
     Route,
 )
 from web3_agent.config.settings import Settings
 from web3_agent.domain.memory import memory, profile, schema
+from web3_agent.domain.workflow import service as workflow_service
 from web3_agent.persistence.pg.base import session_scope
 from web3_agent.persistence.pg.repositories import (
     conversation_repo,
@@ -49,6 +61,8 @@ from web3_agent.persistence.pg.repositories import (
     profile_repo,
 )
 from web3_agent.persistence.pg.repositories.audit_repo import AuditLogger
+
+logger = logging.getLogger(__name__)
 
 
 def _turn_inputs(params: dict[str, Any]) -> dict[str, Any]:
@@ -164,6 +178,8 @@ class AgentLoop:
         self._llm = llm
         self._guard = guard
         self._audit = audit
+        # _runner：写路径与读路径共用同一个执行入口，来源校验只在一个地方。
+        self._runner = runner
         # _graph：初始化时编译的只读 LangGraph，供每轮异步执行。
         self._graph = build_read_graph(
             model_with_tools,
@@ -335,7 +351,16 @@ class AgentLoop:
         if decision.route is Route.REJECT:
             return await finish(ChatOutcome(kind="reject", content=MSG_OUT_OF_SCOPE))
         if decision.route is Route.WRITE:
-            return await finish(ChatOutcome(kind="answer", content=MSG_WRITE_NOT_ENABLED))
+            return await finish(
+                await self._write_outcome(
+                    guarded.output.intent,
+                    guarded.output.slots,
+                    siwe_user_id=siwe_user_id,
+                    wallet_address=wallet_address,
+                    chain_id=chain_id,
+                    user_message=user_message,
+                )
+            )
 
         if guarded.output.intent is Intent.QUERY_KNOWLEDGE and not self._settings.rag_enabled:
             return await finish(ChatOutcome(kind="answer", content=UNAVAILABLE, degraded=True))
@@ -461,6 +486,100 @@ class AgentLoop:
             citations=citations,
         )
         return await finish(outcome)
+
+    async def _write_outcome(
+        self,
+        intent: Intent,
+        slots: dict[str, Any],
+        *,
+        siwe_user_id: str,
+        wallet_address: str | None,
+        chain_id: int | None,
+        user_message: str,
+    ) -> ChatOutcome:
+        """校验写操作参数，通过则建任务并回显待确认视图，不通过则追问补参数。
+
+        Args:
+            intent: 已通过必填槽位校验的写意图。
+            slots: 模型抽取到的业务参数。
+            siwe_user_id: 服务端确认的登录用户标识，作为任务归属。
+            wallet_address: 服务端确认的当前钱包地址。
+            chain_id: 交易所在网络编号，由会话注入。
+            user_message: 用户本轮原始输入，用于核对金额是否出自原话。
+        """
+        # 除转账外的写意图还没有构造能力，保持原有的未接入提示。
+        if intent is not Intent.TRANSFER:
+            return ChatOutcome(kind="answer", content=MSG_WRITE_NOT_ENABLED)
+        if not wallet_address:
+            return ChatOutcome(kind="ask", content=MSG_WALLET_REQUIRED)
+        if chain_id is None:
+            return ChatOutcome(kind="ask", content=MSG_CHAIN_REQUIRED)
+        # 模型会把「转点」「一半」这类说法补成一个具体数字，那张卡片上的金额
+        # 用户从没说过。核对不上就追问，不拿推测值去构造交易。
+        if not _amount_quoted(str(slots["humanAmount"]), user_message):
+            return ChatOutcome(kind="ask", content=MSG_AMOUNT_MISSING)
+
+        # 参数校验交给构造工具：地址格式、金额精度、代币归属都在那里判定，
+        # 能拼出待签名交易才允许进入确认，避免回显一张执行不了的卡片。
+        text, record = await self._runner.run(
+            TOOL_POST_TRANSFER,
+            {
+                "from_address": wallet_address,
+                "to_address": str(slots["toAddress"]),
+                "token_symbol": str(slots["tokenSymbol"]),
+                "human_amount": str(slots["humanAmount"]),
+                "chain_id": chain_id,
+            },
+            source=CallSource.STATE_MACHINE,
+        )
+        payload = json.loads(text)
+        if payload.get("status") != "ready":
+            return ChatOutcome(
+                kind="ask",
+                content=str(payload.get("message") or error_message("E304")),
+                tool_calls=[record],
+            )
+
+        asset = payload["asset"]
+        preview = {
+            "action": intent.value,
+            "tokenSymbol": asset["symbol"],
+            "humanAmount": asset["human"],
+            "target": payload["recipient"],
+        }
+        try:
+            task_id = await workflow_service.create_transfer(
+                siwe_user_id=siwe_user_id,
+                siwe_address=wallet_address,
+                chain_id=chain_id,
+                to_address=payload["recipient"],
+                token_symbol=asset["symbol"],
+                human_amount=asset["human"],
+                tx_intent={
+                    "from": payload["from"],
+                    "to": payload["tx"]["to"],
+                    "value": payload["tx"]["value"],
+                    "data": payload["tx"]["data"],
+                    "chainId": payload["chainId"],
+                },
+                ttl_seconds=self._settings.workflow_ttl_seconds,
+            )
+        except Exception:  # noqa: BLE001 建不出任务就不能给卡片：前端没有可确认的对象
+            logger.exception("workflow create failed intent=%s", intent.value)
+            return ChatOutcome(
+                kind="answer", content=MSG_WRITE_TASK_FAILED, tool_calls=[record]
+            )
+        return ChatOutcome(
+            kind="intent_confirm",
+            content=MSG_TRANSFER_CONFIRM.format(
+                amount=preview["humanAmount"],
+                symbol=preview["tokenSymbol"],
+                target=preview["target"],
+            ),
+            intent_preview=preview,
+            task_id=task_id,
+            tool_calls=[record],
+        )
 
     async def _chitchat(
         self,
@@ -623,6 +742,8 @@ class AgentLoop:
                     "discarded": True,
                     "tool_calls": [],
                     "citations": [],
+                    "intent_preview": None,
+                    "task_id": None,
                     "steps": 0,
                     "degraded": False,
                 })
@@ -633,8 +754,32 @@ class AgentLoop:
                 content=outcome.content,
                 tool_calls=calls or None,
                 turn_id=turn_id,
+                # 确认卡片的两个凭据一起落库，刷新后前端才能按 taskId 接着确认。
+                task_id=outcome.task_id,
+                intent_preview=outcome.intent_preview,
             )
         return outcome
+
+
+# _ADDRESS_RE：整段剥掉地址，避免地址里的十六进制数字被当成金额。
+_ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
+# _NUMBER_RE：用户原话里的数字，兼容千分位写法。
+_NUMBER_RE = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?")
+
+
+def _amount_quoted(human_amount: str, message: str) -> bool:
+    """判断待确认的金额是否出自用户原话。
+
+    Args:
+        human_amount: 模型抽取的转账数量。
+        message: 用户本轮原始输入。
+    """
+    try:
+        wanted = Decimal(str(human_amount).strip().replace(",", ""))
+    except (InvalidOperation, AttributeError):
+        return False
+    spoken = _NUMBER_RE.findall(_ADDRESS_RE.sub(" ", message))
+    return any(Decimal(item.replace(",", "")) == wanted for item in spoken)
 
 
 def _record(item: dict) -> ToolCallRecord:

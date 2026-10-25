@@ -2,8 +2,9 @@
 
 对齐文档：`架构 v0.8` / `PRD V1.5` / `Python后端工程目录结构 v2`。
 
-**当前范围：V1a 只读链路 + SIWE 登录 + 限流配额。** 写链路（T4–T7、状态机、workflow 接口）
-尚未实现，`route=write` 一律返回"写操作尚未接入"，不会生成任何 TxIntent。
+**当前范围：V1a 只读链路 + SIWE 登录 + 限流配额 + 转账写链路（仅构造，不签名）。**
+转账意图会构造待签名交易并建 workflow 任务，交给前端确认；授权 / 质押 / 撤销授权
+仍返回"写操作尚未接入"。服务端不持有私钥，任何情况下都不签名、不广播。
 
 ## 已经能跑通的
 
@@ -18,6 +19,10 @@ POST /api/v1/chat  →  限流（1 分钟分桶，落 PG）
 
 POST /api/v1/auth/nonce   →  一次性 nonce（5 分钟，绑定地址与 chainId）+ 完整 SIWE 消息
 POST /api/v1/auth/verify  →  校验 domain/uri/时效 → 验签反推地址 → 核销 nonce → 签 JWT
+
+POST /api/v1/intent/confirm     →  用户接受/拒绝回显 → PREVIEW 或 ABORTED
+GET  /api/v1/workflow/{taskId}  →  拉取状态，已广播时核对一次链上回执
+POST /api/v1/tx/report          →  上报广播哈希（仅审计与记录哈希，不改状态）
 ```
 
 - 闲聊不进工具图；知识问答走独立检索与回答，不注入档案/记忆/摘要；
@@ -33,7 +38,7 @@ POST /api/v1/auth/verify  →  校验 domain/uri/时效 → 验签反推地址 �
 |---|---|
 | 查余额 | `我的 ETH 余额是多少` → 调 `get_asset_balance` → Sepolia 返回真实余额并正确转述 |
 | 私钥粘贴 | 拒答、`steps=0`（未调模型）、PG 里查不到该会话（未落库） |
-| 写意图 | `帮我转 10 USDC 给 0x44…` → 意图识别为 transfer，路由到 write 后被拦为"尚未接入"，不生成 TxIntent |
+| 写意图 | `帮我转 10 USDC 给 0x44…` → 意图识别为 transfer → 构造待签名交易、建任务 → 返回 `intent_confirm` + `taskId`（未签名未广播）；approve/stake 仍回"尚未接入" |
 | 闲聊 / 越界 | 正常回答或说明能力边界，不误触发工具 |
 | 落库 | 一轮 8 条消息、审计 5 条（4 条 intent_routed + 1 条 secret_leak_blocked） |
 | SIWE 登录 | nonce → 钱包签名 → verify 返回 token；同一签名重放被拒（401/E503）；用别的钱包签同一消息被拒 |
@@ -81,10 +86,11 @@ curl -s localhost:8000/api/v1/auth/verify -H 'content-type: application/json' \
 
 | 未做 | 原因 |
 |---|---|
-| 写工具 T4–T7、状态机、workflow / intent / tx 接口 | M2 范围。写工具**不进 `bind_tools`**这条约束已经在 `ToolRegistry` 里用断言锁住 |
+| 授权 / 质押 / 撤销授权的写工具 | 转账已闭环；这三种动作的构造工具与合约适配器还没写，命中时返回"尚未接入" |
 | 质押适配器实现 | `get_stake_info` 只做白名单拦截 + 链高度探活，不编造仓位数字 |
-| Alembic | V1a 用 `create_all` 起步，写链路开工前替换 |
-| 兜底轮询、TTL 双 EXPIRED | 属于 workflow 生命周期，M2 |
+| Alembic | V1a 用 `create_all` 起步，只建缺失的表，不升级既有表结构 |
+| 替换交易（`REPLACED`） | 需要 nonce 落库，再用 `eth_getTransactionCount` 比对原笔是否已上链 |
+| 单笔金额风控 | `write_max_amount_usd` 只有配置没有消费点，美元等值依赖价格源 |
 | token 用量配额 | 配额维度里 `tokens` 只建了表与读取，`LlmAdapter` 尚未回传 usage |
 
 ## 限流与配额的落法

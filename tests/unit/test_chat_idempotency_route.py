@@ -15,6 +15,7 @@ import pytest
 import web3_agent.api.v1.chat_router as chat_router
 from web3_agent.api.schemas.chat_schema import ChatRequest
 from web3_agent.common.exceptions import AppError
+from web3_agent.common.types import ChatOutcome
 
 
 class _Session:
@@ -35,7 +36,7 @@ def _container(handle=None):
         agent=SimpleNamespace(
             handle=handle
             or AsyncMock(
-                return_value=SimpleNamespace(
+                return_value=ChatOutcome(
                     kind="answer", content="你好", steps=1, tool_calls=[], citations=[],
                     discarded=False,
                 )
@@ -123,7 +124,7 @@ def test_discarded_turn_is_not_stored_and_releases_the_key(monkeypatch):
     """失效轮次在幂等语义上等于「没跑成」：存下来会让重试永远拿到空答案。"""
     container = _container(
         handle=AsyncMock(
-            return_value=SimpleNamespace(
+            return_value=ChatOutcome(
                 kind="answer", content="", steps=0, tool_calls=[], citations=[],
                 discarded=True,
             )

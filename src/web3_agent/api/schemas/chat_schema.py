@@ -99,6 +99,10 @@ class HistoryItem(BaseModel):
     content: str
     # tool_calls：本轮工具调用轨迹，包含名称、参数及执行结果；未调用时可为空。
     tool_calls: list[dict[str, Any]] | None = Field(default=None, alias="toolCalls")
+    # task_id：本轮创建的写操作任务标识；普通问答为空。
+    task_id: str | None = Field(default=None, alias="taskId")
+    # intent_preview：该轮的待确认参数快照，刷新后据此重建确认卡片。
+    intent_preview: IntentPreview | None = Field(default=None, alias="intentPreview")
     # citations：当前回答使用的文档证据快照，供引用展示和历史恢复。
     citations: list[dict[str, Any]] = Field(default_factory=list)
     # created_at：记录创建时间；数据库时间字段使用带时区时间。
