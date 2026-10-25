@@ -1,12 +1,13 @@
 """幂等键在路由层的分支：重放、拒绝、失败后放行。
 
 去重的正确性靠真库（tests/integration/test_chat_idempotency.py），
-这里只管路由拿到的结论有没有被正确处理。
+这里只管路由拿到的结论有没有被正确处理。响应是事件流，所以断言都从流里取。
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -46,8 +47,33 @@ def _container(handle=None):
     )
 
 
-def _run(monkeypatch, claim_result, *, container=None, key="key-abcdefgh", swallow=False):
-    """跑一次 /chat。返回 (响应或异常, container, complete 桩, claim 桩, settle 桩)。"""
+def _parse(chunk: str) -> tuple[str, dict]:
+    """取出一帧的事件名与 JSON 负载。"""
+    event, data = "", ""
+    for line in chunk.splitlines():
+        if line.startswith("event: "):
+            event = line[len("event: "):]
+        elif line.startswith("data: "):
+            data = line[len("data: "):]
+    return event, json.loads(data) if data else {}
+
+
+async def _consume(response) -> tuple[dict | None, list[str], list[dict]]:
+    """读完事件流，返回 (结论, 阶段序列, 错误事件)。"""
+    result, stages, errors = None, [], []
+    async for chunk in response.body_iterator:
+        event, data = _parse(chunk)
+        if event == "stage":
+            stages.append(data["stage"])
+        elif event == "result":
+            result = data
+        elif event == "error":
+            errors.append(data)
+    return result, stages, errors
+
+
+def _run(monkeypatch, claim_result, *, container=None, key="key-abcdefgh"):
+    """跑一次 /chat 并读完事件流，返回 (结论, 阶段, 错误, container, complete 桩, claim 桩, settle 桩)。"""
     container = container or _container()
     claim = AsyncMock(return_value=claim_result)
     complete = AsyncMock()
@@ -64,19 +90,20 @@ def _run(monkeypatch, claim_result, *, container=None, key="key-abcdefgh", swall
     )
     identity = SimpleNamespace(user_id="user-1", address="0x" + "1" * 40, chain_id=1)
     payload = ChatRequest(userMessage="你好", idempotencyKey=key)
-    try:
-        outcome = asyncio.run(chat_router.chat(payload, request, identity))
-    except BaseException as exc:  # noqa: BLE001 只有 swallow 时才留在这里
-        if not swallow:
-            raise
-        outcome = exc
-    return outcome, container, complete, claim, settled
+
+    async def go():
+        response = await chat_router.chat(payload, request, identity)
+        return await _consume(response)
+
+    result, stages, errors = asyncio.run(go())
+    return result, stages, errors, container, complete, claim, settled
 
 
 def test_completed_request_replays_without_calling_the_model(monkeypatch):
     cached = {"type": "answer", "content": "上次的答案", "data": {}}
-    response, container, complete, _, _ = _run(monkeypatch, ("done", cached))
-    assert response.content == "上次的答案"
+    result, _, errors, container, complete, _, _ = _run(monkeypatch, ("done", cached))
+    assert result["content"] == "上次的答案"
+    assert errors == []
     container.agent.handle.assert_not_awaited()
     complete.assert_not_awaited()
 
@@ -100,8 +127,9 @@ def test_same_key_with_new_content_is_rejected(monkeypatch):
 
 
 def test_successful_turn_stores_the_response(monkeypatch):
-    response, _, complete, _, settled = _run(monkeypatch, ("new", None))
-    assert response.content == "你好"
+    result, _, errors, _, complete, _, settled = _run(monkeypatch, ("new", None))
+    assert result["content"] == "你好"
+    assert errors == []
     stored = complete.await_args.kwargs
     assert stored["key"] == "key-abcdefgh"
     assert stored["response"]["content"] == "你好"
@@ -112,10 +140,12 @@ def test_successful_turn_stores_the_response(monkeypatch):
 
 def test_failed_turn_releases_the_key_and_stores_nothing(monkeypatch):
     container = _container(handle=AsyncMock(side_effect=RuntimeError("boom")))
-    outcome, _, complete, _, settled = _run(
-        monkeypatch, ("new", None), container=container, swallow=True
+    result, _, errors, _, complete, _, settled = _run(
+        monkeypatch, ("new", None), container=container
     )
-    assert isinstance(outcome, RuntimeError)
+    # 流已经开始，失败只能作为事件告知；客户端按 error 帧展示，而不是连接异常。
+    assert result is None
+    assert errors == [{"code": "E900", "message": "服务内部错误", "retryable": False}]
     complete.assert_not_awaited()
     assert settled.await_args.kwargs["release"] == ("user-1", "key-abcdefgh")
 
@@ -130,8 +160,29 @@ def test_discarded_turn_is_not_stored_and_releases_the_key(monkeypatch):
             )
         )
     )
-    response, _, complete, _, settled = _run(monkeypatch, ("new", None), container=container)
-    assert response.content == ""
-    assert response.data["discarded"] is True
+    result, _, _, _, complete, _, settled = _run(
+        monkeypatch, ("new", None), container=container
+    )
+    assert result["content"] == ""
+    assert result["data"]["discarded"] is True
     complete.assert_not_awaited()
     assert settled.await_args.kwargs["release"] == ("user-1", "key-abcdefgh")
+
+
+def test_stage_events_precede_the_result(monkeypatch):
+    """进度先于结论送达：界面靠它把「十几秒白屏」换成一句当前在做什么。"""
+
+    async def handle(**kwargs):
+        await kwargs["on_stage"]("intent")
+        await kwargs["on_stage"]("query")
+        return ChatOutcome(
+            kind="answer", content="你好", steps=1, tool_calls=[], citations=[],
+            discarded=False,
+        )
+
+    result, stages, errors, _, _, _, _ = _run(
+        monkeypatch, ("new", None), container=_container(handle=handle)
+    )
+    assert stages == ["intent", "query"]
+    assert result["content"] == "你好"
+    assert errors == []

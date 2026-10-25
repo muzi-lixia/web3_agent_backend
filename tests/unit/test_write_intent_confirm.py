@@ -313,11 +313,10 @@ def test_router_renders_confirm_preview_in_camel_case(monkeypatch):
         },
         task_id=_TASK,
     )
-    response, *_ = _run(
+    dumped, *_ = _run(
         monkeypatch, ("new", None), container=_container(handle=AsyncMock(return_value=outcome))
     )
 
-    dumped = response.model_dump(by_alias=True)
     assert dumped["type"] == "intent_confirm"
     assert dumped["intentPreview"] == outcome.intent_preview
     assert dumped["taskId"] == _TASK

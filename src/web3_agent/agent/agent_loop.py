@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -68,6 +69,9 @@ from web3_agent.persistence.pg.repositories import (
 from web3_agent.persistence.pg.repositories.audit_repo import AuditLogger
 
 logger = logging.getLogger(__name__)
+
+# StageFn：阶段上报回调。调用方据此让界面知道这一轮走到哪了，Agent 不关心怎么送达。
+StageFn = Callable[[str], Awaitable[None]]
 
 
 def _turn_inputs(params: dict[str, Any]) -> dict[str, Any]:
@@ -207,6 +211,7 @@ class AgentLoop:
         chain_id: int | None,
         user_message: str,
         knowledge_base_id: str = "default",
+        on_stage: StageFn | None = None,
     ) -> ChatOutcome:
         # 1. 密钥检测必须早于任何模型调用：命中就不外发、不落库。
         """处理单轮输入：先拦截密钥和清洗文本，再建立追踪并执行 Agent 主流程。
@@ -217,6 +222,7 @@ class AgentLoop:
             chain_id: 目标或过滤用的 EVM 网络编号，None 表示未限定。
             user_message: 本轮待处理的用户输入。
             knowledge_base_id: 本轮选定的知识库标识。
+            on_stage: 阶段回调；为空时不产生进度事件。
 
         Returns:
             ChatOutcome: 本轮回答、工具轨迹与降级或失效标志。
@@ -249,6 +255,7 @@ class AgentLoop:
             wallet_address=wallet_address,
             chain_id=chain_id,
             langsmith_extra=extra,
+            on_stage=on_stage,
         )
 
     @traceable(
@@ -265,6 +272,7 @@ class AgentLoop:
         chain_id: int | None,
         user_message: str,
         knowledge_base_id: str = "default",
+        on_stage: StageFn | None = None,
     ) -> ChatOutcome:
         # 2. Perception：短期历史 + 中期摘要 + 长期档案与背景。
         # 这一段全是短查询加一条写入，事务在模型调用之前就关掉 ——
@@ -279,7 +287,22 @@ class AgentLoop:
             chain_id: 目标或过滤用的 EVM 网络编号，None 表示未限定。
             user_message: 本轮待处理的用户输入。
             knowledge_base_id: 本轮选定的知识库标识。
+            on_stage: 阶段回调；为空时不产生进度事件。
         """
+        async def stage(name: str) -> None:
+            """上报当前阶段。送达失败只记日志：进度不是回答的一部分。
+
+            Args:
+                name: 阶段标识，由调用方解释成展示文案。
+            """
+            if on_stage is None:
+                return
+            try:
+                await on_stage(name)
+            except Exception:  # noqa: BLE001
+                logger.warning("stage emit failed stage=%s", name, exc_info=True)
+
+        await stage("intent")
         turn_id = uuid.uuid4().hex
         async with session_scope() as db:
             # 读生命周期版本，并在本事务内锁住它：清空接口要拿排他锁，
@@ -364,6 +387,7 @@ class AgentLoop:
         # 多步计划先于路由分派：这类输入里既有查询又有写操作，模型给的 intent 可能
         # 只落在其中一半上，按单步路由执行会把另一半静默丢掉。
         if multi_hop.needs_plan(guarded.output.hops):
+            await stage("plan")
             return await finish(
                 await self._plan_outcome(
                     guarded.output.hops,
@@ -374,6 +398,7 @@ class AgentLoop:
                 )
             )
         if decision.route is Route.WRITE:
+            await stage("write")
             return await finish(
                 await self._write_outcome(
                     guarded.output.intent,
@@ -410,6 +435,7 @@ class AgentLoop:
         memory_text = self._render_memories(memory_items)
 
         # 5. Action：只读 ReAct
+        await stage("query")
         graph_config = (
             langsmith_tracer.run_config("agent.graph", trace_id=get_trace_id()) or None
         )

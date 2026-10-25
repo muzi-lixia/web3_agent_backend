@@ -6,9 +6,11 @@ import asyncio
 import hashlib
 import json
 import logging
+from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Request
+from fastapi.responses import StreamingResponse
 
 from web3_agent.api.deps import Identity, chat_rate_limit, require_identity
 from web3_agent.api.schemas.chat_schema import (
@@ -59,6 +61,10 @@ _IDEMPOTENCY_STALE_GRACE = 30
 # 重试落在「还在跑」之外又不至于空等；拿不到答案就再来一次，有上限兜底。
 # _IDEMPOTENCY_RETRY_AFTER：幂等请求仍在处理时建议客户端等待的秒数。
 _IDEMPOTENCY_RETRY_AFTER = 3
+
+# _SSE_HEARTBEAT_SECONDS：两次事件之间允许的最长静默。图执行中途没有新进展时发一行注释，
+# 免得中间的代理按「长时间无数据」把连接断掉。
+_SSE_HEARTBEAT_SECONDS = 15
 
 # 后台任务（摘要、长期记忆抽取）。不 await：都慢，不能拖住回复。
 # 集合持有引用，否则任务可能被 GC 掉。
@@ -186,6 +192,46 @@ async def _settle_turn(
         raise
 
 
+def _sse(event: str, data: dict) -> str:
+    """组装一帧事件流。正文压成单行 JSON，客户端按空行切帧即可。
+
+    Args:
+        event: 事件名，客户端据此分派。
+        data: 该事件的负载。
+    """
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+
+
+async def _frames(
+    queue: asyncio.Queue[tuple[str, dict] | None], task: asyncio.Task
+) -> AsyncIterator[str]:
+    """把队列里的事件转发成 SSE 帧，直到收到结束标记。
+
+    客户端断开时生成器被取消，顺带取消还在跑的那一轮：没人在听了，
+    继续跑只会把模型和 RPC 的额度白花掉。
+
+    Args:
+        queue: 本轮产生的事件；None 表示结束。
+        task: 跑这一轮的任务，用于断开时取消。
+    """
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=_SSE_HEARTBEAT_SECONDS)
+            except TimeoutError:
+                # 图执行期间可能长时间没有新阶段，用注释行占住连接。
+                yield ": ping\n\n"
+                continue
+            if item is None:
+                break
+            event, data = item
+            yield _sse(event, data)
+        yield _sse("done", {})
+    finally:
+        if not task.done():
+            task.cancel()
+
+
 def _split_citations(calls: list[dict] | None) -> tuple[list[dict] | None, list[dict]]:
     """引用正文从 tool_calls 里提出来单独给。
 
@@ -227,15 +273,17 @@ def _request_hash(payload: ChatRequest) -> str:
     return hashlib.sha256(material.encode()).hexdigest()
 
 
-@router.post("", response_model=ChatResponse, response_model_by_alias=True)
+@router.post("")
 async def chat(
     payload: ChatRequest,
     request: Request,
     identity: Identity = Depends(require_identity),
-) -> ChatResponse:
-    # 响应 data.steps 为图模型步数，toolCalls 为调用轨迹，citations 在有文档证据时出现。
-    # 会话中途清空时 data.discarded=true，正文及工具证据按失效结果处理。
-    """校验身份与网络、处理幂等、限制整轮时间，调用 Agent 后组装响应并结算。
+) -> StreamingResponse:
+    # 每帧的 data 都是 JSON：stage 报进度，result 是本轮完整结论，error 表示中途失败。
+    """以事件流返回一轮对话：先报阶段，最后下发完整结论。
+
+    身份、网络与幂等占位在开始推流之前完成，那类错误仍用 HTTP 状态码表达；
+    推流之后的工作失败，只能作为 error 事件送出。
 
     Args:
         payload: 经过字段校验的聊天请求。
@@ -247,9 +295,6 @@ async def chat(
     if payload.wallet and payload.wallet.chain_id not in container.settings.allowed_chain_ids:
         raise AppError(*E102_CHAIN_NOT_ALLOWED)
 
-    # 工具在 gather 的子任务里累加计数，必须在这里（父上下文）先开一次。
-    start_metering(downstream=container.settings.turn_max_downstream_calls)
-
     chain_id = payload.wallet.chain_id if payload.wallet else None
     if chain_id is not None and chain_id != identity.chain_id:
         raise AppError(*E509_CHAIN_IDENTITY_MISMATCH)
@@ -259,6 +304,7 @@ async def chat(
     # 幂等键：客户端重试时带同一个值，服务端只跑一轮。占位必须先提交出去，
     # 否则并发的第二个请求看不到第一个已经在跑。
     key = payload.idempotency_key
+    cached: dict | None = None
     if key:
         async with session_scope() as db:
             # 先在短事务中提交幂等占位，再开始慢调用，确保并发重试看得见处理中状态。
@@ -270,86 +316,132 @@ async def chat(
                 # 占位从插入到 complete 最多经历一整轮 + 收尾；超出还没写的行一定是孤儿。
                 stale_after=container.settings.turn_timeout_seconds + _IDEMPOTENCY_STALE_GRACE,
             )
-        if state == "done":
-            return ChatResponse.model_validate(cached)
         if state == "conflict":
             # 换个 key 重新发起就能跑，同一个 key 换内容重试多少次都是这个结果。
             raise AppError(*E512_IDEMPOTENCY_CONFLICT)
-        if state != "new":
+        if state not in ("new", "done"):
             raise AppError(
                 *E511_DUPLICATE_REQUEST,
                 retryable=True,
                 retry_after=_IDEMPOTENCY_RETRY_AFTER,
             )
 
-    accepted = False
-    # 一轮对话要十几秒（意图模型 + 最多 5 步 ReAct），这里不能持连接：
-    # agent 自己按需开短事务，连接只在真正读写的几十毫秒里被占住。
-    # 整轮时间是第四条边界：步数和调用数都有限，链路卡在模型或上游时还得有个上限。
-    deadline = asyncio.timeout(container.settings.turn_timeout_seconds)
-    try:
-        # 整轮超时覆盖模型及工具调用，达到截止线时中止本轮处理。
-        async with deadline:
-            outcome = await container.agent.handle(
-                siwe_user_id=identity.user_id,
-                wallet_address=identity.address,
-                chain_id=effective_chain,
-                user_message=payload.user_message,
-                knowledge_base_id=payload.knowledge_base_id,
-            )
-        accepted = not outcome.discarded
-    except TimeoutError as exc:
-        # 只处理自己这条超时：模型或上游自己抛的 TimeoutError 已经被各自包装过，
-        # 漏到这里的必须原样上抛，不能被误报成整轮超时。
-        if not deadline.expired():
-            raise
-        raise AppError(*E510_TURN_BUDGET) from exc
-    finally:
-        # 这一轮没跑完就把占位撤掉，客户端拿同一个 key 重试才能真的重跑。
-        await _settle_turn(
-            container,
-            quota_key=getattr(request.state, "quota_key", None),
-            release=(identity.user_id, key) if key and not accepted else None,
-        )
+    queue: asyncio.Queue[tuple[str, dict] | None] = asyncio.Queue()
 
-    # 答案已经提交事务，后台辅助任务是纯附加动作：这里任何异常都不该变成
-    # 用户看到的 500 —— 否则库里有一轮完整答案，客户端却以为失败并重试。
-    # 全部挪进后台协程，包括两次 collect 的水位线探测。
-    # 失效轮次没有内容可压缩，跑一遍只是白花模型调用。
-    if not outcome.discarded:
-        _spawn_background(_start_aux_tasks(container, identity))
+    async def emit(stage: str) -> None:
+        """把当前阶段写进事件队列。
 
-    response = ChatResponse(
-        type=_KIND_TO_TYPE.get(outcome.kind, "answer"),
-        content=outcome.content,
-        task_id=outcome.task_id,
-        intent_preview=(
-            IntentPreview.model_validate(outcome.intent_preview)
-            if outcome.intent_preview
-            else None
-        ),
-        data={
-            "steps": outcome.steps,
-            "toolCalls": [call.model_dump() for call in outcome.tool_calls],
-            **({"citations": outcome.citations} if outcome.citations else {}),
-            **({"discarded": True} if outcome.discarded else {}),
-        },
-    )
-    # 失效轮次不进去重表：记下来就成了「这个 key 的答案是空的」，
-    # 客户端重试永远拿到空答案，再也跑不起来。
-    if key and not outcome.discarded:
+        Args:
+            stage: 阶段标识，由客户端解释成展示文案。
+        """
+        await queue.put(("stage", {"stage": stage}))
+
+    async def turn() -> None:
+        """跑完这一轮，把结论或失败放进队列。
+
+        响应头在这之前已经发出去了，所以这里的异常不能再改 HTTP 状态码。
+        """
+        if cached is not None:
+            await queue.put(("result", cached))
+            await queue.put(None)
+            return
+        # 工具在 gather 的子任务里累加计数，必须在这里（父上下文）先开一次。
+        start_metering(downstream=container.settings.turn_max_downstream_calls)
+        outcome = None
+        accepted = False
+        # 一轮对话要十几秒（意图模型 + 最多 5 步 ReAct），这里不能持连接：
+        # agent 自己按需开短事务，连接只在真正读写的几十毫秒里被占住。
+        # 整轮时间是第四条边界：步数和调用数都有限，链路卡在模型或上游时还得有个上限。
+        deadline = asyncio.timeout(container.settings.turn_timeout_seconds)
         try:
-            async with session_scope() as db:
-                # 把已组装的 HTTP 响应保存到去重记录，后续相同请求可直接返回。
-                await idempotency_repo.complete(
-                    db,
-                    siwe_user_id=identity.user_id,
-                    key=key,
-                    response=response.model_dump(by_alias=True),
+            try:
+                # 整轮超时覆盖模型及工具调用，达到截止线时中止本轮处理。
+                async with deadline:
+                    outcome = await container.agent.handle(
+                        siwe_user_id=identity.user_id,
+                        wallet_address=identity.address,
+                        chain_id=effective_chain,
+                        user_message=payload.user_message,
+                        knowledge_base_id=payload.knowledge_base_id,
+                        on_stage=emit,
+                    )
+            except TimeoutError as exc:
+                # 只处理自己这条超时：模型或上游自己抛的 TimeoutError 已经被各自包装过，
+                # 漏到这里的必须原样上抛，不能被误报成整轮超时。
+                if not deadline.expired():
+                    raise
+                raise AppError(*E510_TURN_BUDGET) from exc
+            accepted = not outcome.discarded
+
+            response = ChatResponse(
+                type=_KIND_TO_TYPE.get(outcome.kind, "answer"),
+                content=outcome.content,
+                task_id=outcome.task_id,
+                intent_preview=(
+                    IntentPreview.model_validate(outcome.intent_preview)
+                    if outcome.intent_preview
+                    else None
+                ),
+                data={
+                    "steps": outcome.steps,
+                    "toolCalls": [call.model_dump() for call in outcome.tool_calls],
+                    **({"citations": outcome.citations} if outcome.citations else {}),
+                    **({"discarded": True} if outcome.discarded else {}),
+                },
+            )
+            # 失效轮次不进去重表：记下来就成了「这个 key 的答案是空的」，
+            # 客户端重试永远拿到空答案，再也跑不起来。
+            if key and not outcome.discarded:
+                try:
+                    async with session_scope() as db:
+                        # 把已组装的响应保存到去重记录，后续相同请求可直接返回。
+                        await idempotency_repo.complete(
+                            db,
+                            siwe_user_id=identity.user_id,
+                            key=key,
+                            response=response.model_dump(by_alias=True),
+                        )
+                except Exception:  # noqa: BLE001 答案已经在库里，去重记录不能拖垮这次响应
+                    logger.exception("idempotency complete failed key=%s", key)
+            await queue.put(("result", response.model_dump(by_alias=True)))
+        except AppError as exc:
+            await queue.put(
+                (
+                    "error",
+                    {
+                        "code": exc.code,
+                        "message": exc.message,
+                        "retryable": exc.retryable,
+                        "retryAfter": exc.retry_after,
+                    },
                 )
-        except Exception:  # noqa: BLE001 答案已经在库里，去重记录不能拖垮这次响应
-            logger.exception("idempotency complete failed key=%s", key)
-    return response
+            )
+        except Exception:  # noqa: BLE001 流已开始，只能作为事件告知
+            logger.exception("chat turn failed")
+            await queue.put(
+                ("error", {"code": "E900", "message": "服务内部错误", "retryable": False})
+            )
+        finally:
+            # 这一轮没跑完就把占位撤掉，客户端拿同一个 key 重试才能真的重跑。
+            await _settle_turn(
+                container,
+                quota_key=getattr(request.state, "quota_key", None),
+                release=(identity.user_id, key) if key and not accepted else None,
+            )
+            # 答案已经提交事务，后台辅助任务是纯附加动作：这里任何异常都不该变成
+            # 用户看到的错误 —— 否则库里有一轮完整答案，客户端却以为失败并重试。
+            # 全部挪进后台协程，包括两次 collect 的水位线探测。
+            # 失效轮次没有内容可压缩，跑一遍只是白花模型调用。
+            if outcome is not None and not outcome.discarded:
+                _spawn_background(_start_aux_tasks(container, identity))
+            await queue.put(None)
+
+    task = asyncio.create_task(turn())
+    return StreamingResponse(
+        _frames(queue, task),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/history", response_model=HistoryResp, response_model_by_alias=True)
