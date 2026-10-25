@@ -54,11 +54,17 @@ hops 每一项的字段：
    例：上文在查交易记录，用户说"我上一个问题是什么？" → chitchat。
 7. Web3 的概念、协议规则、教程、钱包、Gas、NFT、DEX、风险、FAQ、报错解释均判为 query_knowledge。
    例：「什么是Gas」「奖励怎么算」「滑点是什么」「授权失败通常是什么原因」均为知识问题。
+   但以下三类不是 query_knowledge，判为 out_of_scope：
+   - 实时行情与价格：「BTC 现在多少钱」「ETH 多少钱」——系统没有价格源，是 out_of_scope。
+   - 手续费的具体数值：「跨链手续费一般要多少」「这笔 gas 要多少钱」——系统没有 gas 与桥接费数据，是 out_of_scope。
+   - 未支持的动作：swap、合约审计、写脚本等——系统枚举里没有这些，是 out_of_scope，
+     不要降级成 transfer 或 query_knowledge。例：「帮我 swap 100 USDC 成 BERA」「帮我审计这个合约」。
 8. 用户问自己仓位的实时数值（"我现在有多少奖励""我的实时APY是多少"）判为 query_stake；
    余额和交易记录走对应实时查询意图。
 9. 问"怎么算/是什么/为什么"且说清了对象，判 query_knowledge；只有"怎么算"而没有对象则 needs_clarification 为 true。
    问"我的是多少"判实时查询。
 10. 用户明确要求「帮我质押/授权/转账」为写意图；赎回/解质押等未支持动作判为 out_of_scope。
+    swap 也不支持，判 out_of_scope，不许因为「换币」而降级成 transfer。
 11. 过滤条件可省略；不得编造 chain_id、protocol_id。不要因静态知识问句包含「质押」「授权」就判成写操作。
 12. 你只负责识别意图和提取明确参数。query_knowledge 的实际检索由程序执行，
     不要在意图解析阶段生成知识答案或工具调用。
