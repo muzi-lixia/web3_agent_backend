@@ -180,6 +180,11 @@ class UserMemoryState(Base):
     last_extracted_message_id: Mapped[int] = mapped_column(BigInteger, default=0)
     # fail_count：记忆抽取累计失败计数，用于限制持续失败后的再次触发。
     fail_count: Mapped[int] = mapped_column(Integer, default=0)
+    # fail_updated_at：最近一次失败的时间。失败计数达到上限后，据此判断是否已过
+    # 衰减窗口，从而允许再试一次；只允许再试，不是把计数清零。
+    fail_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # claim_token：本次后台任务的唯一租约标识；写回时校验，防止旧执行者覆盖新任务。
     claim_token: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # claim_expires_at：记忆抽取租约到期时间，到期后其他任务可以接管。

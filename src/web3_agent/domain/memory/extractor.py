@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from web3_agent.agent import langsmith_tracer
 from web3_agent.agent.llm_adapter import LlmAdapter
@@ -77,16 +78,29 @@ class MemoryExtractor:
         self._audit = audit
         self._quota = quota
 
-    def should_run(self, *, pending: int, fail_count: int) -> bool:
+    def should_run(
+        self, *, pending: int, fail_count: int, last_fail_at: datetime | None = None
+    ) -> bool:
         """按待处理消息数及当前对象的失败限制判断是否应触发后台任务。
+
+        失败计数达到上限后并非永久停摆：距离最近一次失败超过衰减窗口就允许再试
+        一次。失败多为模型临时抖动，不该让用户从此失去长期记忆；衰减只开再试口，
+        不把计数清零，再失败仍会继续累计。
 
         Args:
             pending: 尚未处理的消息条数。
             fail_count: 当前累计的抽取失败次数。
+            last_fail_at: 最近一次失败的时间，达到上限后据此判断是否过了衰减窗口。
         """
         if pending < self._settings.memory_trigger_messages:
             return False
-        return fail_count < self._settings.memory_fail_max
+        if fail_count < self._settings.memory_fail_max:
+            return True
+        # 已到上限：只有过了衰减窗口才允许再试一次（半开）。
+        decay = self._settings.memory_fail_decay_seconds
+        if decay <= 0 or last_fail_at is None:
+            return False
+        return (datetime.now(timezone.utc) - last_fail_at).total_seconds() >= decay
 
     async def run(self, *, siwe_user_id: str, job: _Job | None = None) -> None:
         # 后台处理建立独立账本，避免继承并继续累加触发它的聊天请求用量。
@@ -127,6 +141,7 @@ class MemoryExtractor:
             state = await memory_repo.get_state(db, siwe_user_id)
             since = state.last_extracted_message_id if state else 0
             fail_count = state.fail_count if state else 0
+            last_fail_at = state.fail_updated_at if state else None
 
             pending, rows = await conversation_repo.pending_for_memory(
                 db,
@@ -134,7 +149,9 @@ class MemoryExtractor:
                 since_id=since,
                 cap=self._settings.memory_batch_cap,
             )
-            if not rows or not self.should_run(pending=pending, fail_count=fail_count):
+            if not rows or not self.should_run(
+                pending=pending, fail_count=fail_count, last_fail_at=last_fail_at
+            ):
                 # 没活干必须把租约还回去：留着会让这个用户的抽取等到过期才恢复。
                 await memory_repo.release_claim(db, siwe_user_id, token)
                 return None

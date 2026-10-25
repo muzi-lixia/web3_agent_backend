@@ -279,6 +279,7 @@ async def mark_failed(
         )
         .values(
             fail_count=UserMemoryState.fail_count + 1,
+            fail_updated_at=func.now(),
             claim_token=None,
             claim_expires_at=None,
         )

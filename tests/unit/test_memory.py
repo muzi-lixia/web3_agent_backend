@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
+from web3_agent.config.settings import Settings
 from web3_agent.domain.memory import memory
-from web3_agent.domain.memory.extractor import _dedupe
+from web3_agent.domain.memory.extractor import MemoryExtractor, _dedupe
 
 
 def test_normalize_text_rewrites_first_person_subject() -> None:
@@ -145,3 +148,36 @@ def test_dedupe_drops_text_already_stored() -> None:
         {"text": "用户关心 gas 成本", "type": "profile", "subject": "gas", "confidence": 0.9},
     ]
     assert _dedupe(drafts, existing=["用户关心 gas 成本"]) == []
+
+
+def _extractor() -> MemoryExtractor:
+    return MemoryExtractor(settings=Settings(), llm=None, audit=None, quota=None)  # type: ignore[arg-type]
+
+
+def test_should_run_below_fail_max_with_enough_pending() -> None:
+    ex = _extractor()
+    assert ex.should_run(pending=10, fail_count=2) is True
+
+
+def test_should_run_false_when_pending_below_trigger() -> None:
+    ex = _extractor()
+    assert ex.should_run(pending=1, fail_count=0) is False
+
+
+def test_should_run_blocks_at_fail_max_without_decay() -> None:
+    """达到上限且刚失败过，仍在衰减窗口内，不允许再触发。"""
+    ex = _extractor()
+    assert ex.should_run(pending=10, fail_count=3, last_fail_at=datetime.now(timezone.utc)) is False
+
+
+def test_should_run_allows_retry_after_decay_window() -> None:
+    """超过衰减窗口后允许再试一次，而不是永久停摆。"""
+    ex = _extractor()
+    past = datetime.now(timezone.utc) - timedelta(seconds=ex._settings.memory_fail_decay_seconds + 1)
+    assert ex.should_run(pending=10, fail_count=3, last_fail_at=past) is True
+
+
+def test_should_run_still_blocks_without_last_fail_timestamp() -> None:
+    """没有失败时间就无从判断衰减，保守起见不放行。"""
+    ex = _extractor()
+    assert ex.should_run(pending=10, fail_count=3, last_fail_at=None) is False

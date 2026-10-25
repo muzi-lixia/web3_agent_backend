@@ -108,6 +108,10 @@ class Settings(BaseSettings):
     memory_batch_cap: int = 20
     # memory_fail_max：达到该失败次数后停止再次触发记忆抽取。
     memory_fail_max: int = 3
+    # memory_fail_decay_seconds：失败计数达到上限后，距离最近一次失败超过这个
+    # 秒数就允许再试一次。失败多为模型临时抖动，不该让某个用户永远停摆；
+    # 衰减不是清零，只是开一次「半开」的再试机会，再失败计数继续走。
+    memory_fail_decay_seconds: int = 3600
     # 抽取租约。一次抽取只有一次模型调用，正常几十秒内结束；这个值只决定
     # 进程被杀死之后，该用户的长期记忆要等多久才会重新开始抽取。
     # memory_claim_ttl_seconds：记忆抽取租约有效秒数，过期后允许其他任务接管。
