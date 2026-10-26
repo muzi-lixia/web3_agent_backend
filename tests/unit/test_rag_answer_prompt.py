@@ -16,7 +16,7 @@ def test_material_prompt_contains_question_content_and_stable_ids_only():
     assert '【用户问题】\n什么是Berachain？' in content
     assert '【S1】\nBerachain is an EVM chain.' in content
     assert all(value not in content for value in ['SECRET_TITLE','https://internal','private-version','distance'])
-    assert '根据用户当前输入的语言回答' in messages[0].content
+    assert '语言是硬性要求' in messages[0].content
     assert '不输出来源列表' in messages[0].content
     assert '使用用户当前提问的语言' not in content
     assert '请依据以上相关材料' not in content
