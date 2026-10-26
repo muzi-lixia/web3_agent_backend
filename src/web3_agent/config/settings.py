@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     # --- 链 ---
     # allowed_chain_ids：系统允许访问的 EVM 网络编号列表。
     allowed_chain_ids: list[int] = Field(default_factory=lambda: [1])
+    # chat_allowlist：允许使用对话功能的登录钱包地址白名单。
+    # 只有列表内的登录地址可以发起对话，不在列表内一律拒绝（返回 E513）；
+    # 未配置时列表为空，意味着没有任何地址在白名单内，所有人都会被拒绝。
+    # 环境变量使用 JSON 数组格式，例如 CHAT_ALLOWLIST=["0xAAA...","0xBBB..."]
+    chat_allowlist: list[str] = Field(default_factory=list)
     # rpc_urls：网络编号到 JSON-RPC URL 的映射；未配置 URL 的链不能查询余额。
     rpc_urls: dict[int, str] = Field(default_factory=dict)
     # rpc_timeout_seconds：单次 RPC 或交易浏览器 HTTP 调用的超时秒数。

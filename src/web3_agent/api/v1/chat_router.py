@@ -28,6 +28,7 @@ from web3_agent.common.exceptions import (
     E510_TURN_BUDGET,
     E511_DUPLICATE_REQUEST,
     E512_IDEMPOTENCY_CONFLICT,
+    E513_CHAT_ACCESS_DENIED,
     AppError,
 )
 from web3_agent.config.constants import QuotaMetric
@@ -291,6 +292,11 @@ async def chat(
         identity: 经服务端验证的登录用户与钱包身份。
     """
     container = request.app.state.container
+
+    # 对话白名单：仅白名单内的登录地址可用，不在名单内一律拒绝，不进入后续流程。
+    allowlist = getattr(container.settings, "chat_allowlist", [])
+    if identity.address not in allowlist:
+        raise AppError(*E513_CHAT_ACCESS_DENIED)
 
     if payload.wallet and payload.wallet.chain_id not in container.settings.allowed_chain_ids:
         raise AppError(*E102_CHAIN_NOT_ALLOWED)

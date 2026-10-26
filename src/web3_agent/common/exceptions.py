@@ -115,6 +115,8 @@ ERROR_TABLE: dict[str, tuple[str, int]] = {
     "E511": ("同一请求正在处理中，请稍后重试", 409),
     # 幂等键被复用到另一条内容上。重试永远是同一个结果，只能换 key 重新发起。
     "E512": ("请求内容与上一次不一致，请重新发起", 409),
+    # PRD 表未列：配置了对话白名单且当前登录地址不在名单内。
+    "E513": ("当前账号不在对话功能的使用名单内", 403),
 }
 
 
@@ -162,6 +164,8 @@ E510_TURN_BUDGET = error_tuple("E510")
 E511_DUPLICATE_REQUEST = error_tuple("E511")
 # E512_IDEMPOTENCY_CONFLICT：该业务错误对应的 (错误码, 固定文案, HTTP 状态码) 三元组。
 E512_IDEMPOTENCY_CONFLICT = error_tuple("E512")
+# E513_CHAT_ACCESS_DENIED：该业务错误对应的 (错误码, 固定文案, HTTP 状态码) 三元组。
+E513_CHAT_ACCESS_DENIED = error_tuple("E513")
 # E504_TASK_NOT_FOUND：该业务错误对应的 (错误码, 固定文案, HTTP 状态码) 三元组。
 E504_TASK_NOT_FOUND = error_tuple("E504")
 # E505_TASK_FORBIDDEN：该业务错误对应的 (错误码, 固定文案, HTTP 状态码) 三元组。

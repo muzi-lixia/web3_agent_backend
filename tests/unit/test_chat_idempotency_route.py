@@ -33,6 +33,7 @@ def _container(handle=None):
             allowed_chain_ids={1},
             turn_timeout_seconds=5,
             turn_max_downstream_calls=24,
+            chat_allowlist=["0x" + "1" * 40],
         ),
         agent=SimpleNamespace(
             handle=handle
@@ -186,3 +187,12 @@ def test_stage_events_precede_the_result(monkeypatch):
     assert stages == ["intent", "query"]
     assert result["content"] == "你好"
     assert errors == []
+
+
+def test_address_not_in_allowlist_is_rejected(monkeypatch):
+    """白名单生效：登录地址不在名单内时，入口直接拒绝，不进入后续流程。"""
+    container = _container()
+    container.settings.chat_allowlist = ["0x" + "2" * 40]
+    with pytest.raises(AppError) as exc:
+        _run(monkeypatch, None, container=container)
+    assert exc.value.code == "E513"
