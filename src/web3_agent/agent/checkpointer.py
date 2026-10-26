@@ -42,6 +42,8 @@ async def init_checkpointer(
     try:
         pool = AsyncConnectionPool(
             conninfo=conninfo(settings.database_url),
+            # Keep single-connection deployments valid: psycopg defaults min_size to 4.
+            min_size=0,
             max_size=settings.checkpoint_pool_size,
             open=False,
             kwargs={"autocommit": True, "prepare_threshold": 0},
