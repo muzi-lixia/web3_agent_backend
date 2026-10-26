@@ -1,4 +1,4 @@
-# app + postgres + ollama。没有 redis：存储只有 PostgreSQL 一份。
+# app + postgres（+ 可选的本地 ollama）。没有 redis：存储只有 PostgreSQL 一份。
 services:
   postgres:
     image: postgres:16-alpine
@@ -15,13 +15,15 @@ services:
       interval: 5s
       retries: 10
 
+  # 本地模型可选：默认不启动，需要时加 --profile local-model
   ollama:
+    profiles: ["local-model"]
     image: ollama/ollama:latest
     ports:
       - "11434:11434"
     volumes:
       - ollama:/root/.ollama
-    # 首次启动后需执行：docker compose exec ollama ollama pull qwen2.5:7b
+    # 首次启动后需执行：docker compose --profile local-model exec ollama ollama pull <MODEL_NAME>
 
   app:
     build:
@@ -31,14 +33,15 @@ services:
       - ../../.env
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/web3_agent
-      OLLAMA_BASE_URL: http://ollama:11434
+      # 模型地址只认 .env，不在这里写默认值：env_file 只负责把变量注入容器，
+      # 不参与 Compose 的 ${...} 替换，写 ${MODEL_BASE_URL:-http://ollama:11434}
+      # 会在宿主机没设该变量时把远端地址覆盖成本地 ollama。
+      # 容器内连自带 ollama 时，在 .env 里写 http://ollama:11434。
     ports:
       - "8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
-      ollama:
-        condition: service_started
 
 volumes:
   pgdata:

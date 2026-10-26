@@ -159,11 +159,11 @@ def test_non_hybrid_hits_are_numbered_like_the_hybrid_path():
     assert [hit["id"] for hit in result["hits"]]==["S1","S2"]
 
 
-def test_evidence_selection_skips_oversized_chunks_and_stops_at_limit():
-    chunks=[citation(chunk_id="a",content="x"*50),citation(chunk_id="b",content="yy"),
+def test_evidence_selection_takes_candidates_in_order_and_stops_at_limit():
+    chunks=[citation(chunk_id="a",content="x"*5000),citation(chunk_id="b",content="yy"),
             citation(chunk_id="c",content="zz"),citation(chunk_id="d",content="ww")]
-    selected=_select_evidence(chunks,max_chars=4,limit=2)
-    assert [item["chunk_id"] for item in selected]==["b","c"]
+    selected=_select_evidence(chunks,limit=2)
+    assert [item["chunk_id"] for item in selected]==["a","b"]
     assert [item["id"] for item in selected]==["S1","S2"]
 
 

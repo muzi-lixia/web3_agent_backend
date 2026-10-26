@@ -1,127 +1,78 @@
 # Web3 链上智能 Agent 助手 — 后端
 
-对齐文档：`架构 v0.8` / `PRD V1.5` / `Python后端工程目录结构 v2`。
+FastAPI + LangGraph 的单 Agent 服务：一句话进来，先判意图，再决定调链上只读工具还是查知识库，最后给出带引用的回答。服务端不持私钥，不签名、不广播。
 
-**当前范围：V1a 只读链路 + SIWE 登录 + 限流配额 + 转账写链路（仅构造，不签名）。**
-转账意图会构造待签名交易并建 workflow 任务，交给前端确认；授权 / 质押 / 撤销授权
-仍返回"写操作尚未接入"。服务端不持有私钥，任何情况下都不签名、不广播。
-
-## 已经能跑通的
+## 架构
 
 ```
-POST /api/v1/chat  →  限流（1 分钟分桶，落 PG）
-                   →  意图抽取(Ollama, JSON Schema)
-                   →  JsonGuard 熔断
-                   →  IntentRouter（唯一路由决策点）
-                   →  route=read → LangGraph ReAct 子图（≤5 步）
-                   →  只读工具（余额 / 交易记录 / 质押）+ 知识库检索
-                   →  回答 + 步数/RPC 计数回写配额
-
-POST /api/v1/auth/nonce   →  一次性 nonce（5 分钟，绑定地址与 chainId）+ 完整 SIWE 消息
-POST /api/v1/auth/verify  →  校验 domain/uri/时效 → 验签反推地址 → 核销 nonce → 签 JWT
-
-POST /api/v1/intent/confirm     →  用户接受/拒绝回显 → PREVIEW 或 ABORTED
-GET  /api/v1/workflow/{taskId}  →  拉取状态，已广播时核对一次链上回执
-POST /api/v1/tx/report          →  上报广播哈希（仅审计与记录哈希，不改状态）
+POST /api/v1/chat
+  → 限流配额（1 分钟分桶，落 PG，超限 429/E501）
+  → 意图抽取（模型 + 结构化输出，JsonGuard 兜格式故障）
+  → IntentRouter（唯一路由决策点）
+  → route=read → LangGraph ReAct 子图（≤5 步）
+      ├─ 只读工具：余额 / 交易记录 / 质押信息
+      └─ 知识检索：改写 → 双路召回 → RRF 融合 → 重排 → 证据装配
+  → 回答 + 步数、RPC 次数回写配额
 ```
 
-- 闲聊不进工具图；知识问答走独立检索与回答，不注入档案/记忆/摘要；
-- 对话历史落 PG `conversation_message`，按 `expires_at` 惰性过期；清空与删除靠
-  `conversation_generation` 版本号拦截在途写入，并同步清掉幂等缓存里的答案副本；
-- 审计落 PG `audit_log`，`trace_id` 贯穿整条链路；登录成功与 SIWE 拒绝各留一条；
-- 私钥/助记词命中时**不调用模型、不落库**，直接拒答；
-- LangSmith 上报收敛在 `agent/langsmith_tracer.py` 一处，默认关闭。
+模块职责：
 
-## 已验证（本地实测，非纸面）
-
-| 场景 | 结果 |
+| 目录 | 职责 |
 |---|---|
-| 查余额 | `我的 ETH 余额是多少` → 调 `get_asset_balance` → Sepolia 返回真实余额并正确转述 |
-| 私钥粘贴 | 拒答、`steps=0`（未调模型）、PG 里查不到该会话（未落库） |
-| 写意图 | `帮我转 10 USDC 给 0x44…` → 意图识别为 transfer → 构造待签名交易、建任务 → 返回 `intent_confirm` + `taskId`（未签名未广播）；approve/stake 仍回"尚未接入" |
-| 闲聊 / 越界 | 正常回答或说明能力边界，不误触发工具 |
-| 落库 | 一轮 8 条消息、审计 5 条（4 条 intent_routed + 1 条 secret_leak_blocked） |
-| SIWE 登录 | nonce → 钱包签名 → verify 返回 token；同一签名重放被拒（401/E503）；用别的钱包签同一消息被拒 |
-| 限流 | 当前分钟匿名计数打满后 `/chat` 在进模型之前返回 429/E501，`retryable=true` |
-| 测试 | 416 通过 / 18 跳过（集成用例需本机 PG，连不上自动 skip） |
+| `api/` | HTTP 路由、鉴权依赖、请求响应模型 |
+| `agent/` | 意图抽取、路由、LangGraph 状态机、提示词、回答后置校验 |
+| `llm/` | 模型调用的唯一出口：结构化输出、绑定工具、纯对话 |
+| `rag/` | 知识检索全链路：切块、向量化、召回、融合、重排、证据装配 |
+| `web3/` | 链适配器、只读工具、待签名交易构造 |
+| `domain/` | 对话记忆、摘要、用户画像 |
+| `persistence/` | PG 仓储、迁移、幂等缓存 |
+| `middlewares/` | 请求上下文、trace_id、限流 |
+| `config/` `common/` | 配置、异常体系、资源预算、日志 |
 
-> 地址注入：模型曾把 `address` 填成 `0xYourAddressHere`。现在会话地址写进 system prompt，
-> 且地址参数不是合法 EVM 地址时由后端回填——**不让"模型编地址"变成用户看到的"地址不合法"**。
+两条贯穿全局的约定：
+
+- **模型只有一个出口**（`llm/client.py`）。传输、超时、异常归一、调用配额全在这里定义，业务层不直接碰 SDK。
+- **下游调用先记账再发**。模型、工具、下游请求、探索器四类额度分开计，调用前 `reserve`、结束结算，取消与异常也走收尾。
 
 ## 启动
 
+需要 Python ≥ 3.11、Docker（只跑 PG）、一个可用的模型服务。
+
 ```bash
 cd web3_agent_backend
-python -m venv .venv && .venv/bin/pip install -e ".[dev]"
-cp .env.example .env          # 填 RPC_URLS / DATABASE_URL
 
+# 1. 依赖
+uv sync                                  # 或 python -m venv .venv && .venv/bin/pip install -e ".[dev]"
+
+# 2. 配置
+cp .env.example .env
+# 必填：DATABASE_URL、RPC_URLS
+# 模型二选一：MODEL_PROVIDER=ollama（本地）或 openai_compat（在线，另需 MODEL_BASE_URL / MODEL_API_KEY）
+
+# 3. 数据库（PostgreSQL + pgvector）
 docker compose -f deployment/docker/docker-compose.yml up -d postgres
-.venv/bin/python scripts/migrate_pg.py
-.venv/bin/uvicorn web3_agent.main:app --app-dir src --port 8000
+uv run python scripts/migrate_pg.py
+
+# 4. 起服务
+uv run uvicorn web3_agent.main:app --app-dir src --port 8000
 ```
 
 自检：
 
 ```bash
 curl localhost:8000/health
-curl localhost:8000/health/ready          # 会真的问一次 Ollama
-curl -s localhost:8000/api/v1/chat -H 'content-type: application/json' \
-  -d '{"sessionId":"s1","wallet":{"address":"0x..","chainId":11155111},"userMessage":"我的 ETH 余额是多少"}'
-
-# 登录：拿 nonce 与消息，用钱包对 message 签 personal_sign，再提交 signature
-curl -s localhost:8000/api/v1/auth/nonce -H 'content-type: application/json' \
-  -d '{"address":"0x..","chainId":11155111}'
-curl -s localhost:8000/api/v1/auth/verify -H 'content-type: application/json' \
-  -d '{"message":"<上一步返回的 message>","signature":"0x.."}'
+curl localhost:8000/health/ready      # 会真调用一次所配模型
 ```
 
 测试：
 
 ```bash
-.venv/bin/pytest -q tests/unit          # 不依赖 PG / Ollama
-.venv/bin/pytest -q                     # 集成测试需要本机 PG，不通自动 skip
+uv run pytest -q tests/unit          # 不依赖 PG 与模型服务
+uv run pytest -q                     # 集成用例需要本机 PG，连不上自动 skip
 ```
 
-## 这一版刻意没做的事
+知识库（可选，默认关闭）：`RAG_ENABLED=true` 后，先导入并发布文档再检索。
 
-| 未做 | 原因 |
-|---|---|
-| 授权 / 质押 / 撤销授权的写工具 | 转账已闭环；这三种动作的构造工具与合约适配器还没写，命中时返回"尚未接入" |
-| 质押适配器实现 | `get_stake_info` 只做白名单拦截 + 链高度探活，不编造仓位数字 |
-| Alembic | V1a 用 `create_all` 起步，只建缺失的表，不升级既有表结构 |
-| 替换交易（`REPLACED`） | 需要 nonce 落库，再用 `eth_getTransactionCount` 比对原笔是否已上链 |
-| 单笔金额风控 | `write_max_amount_usd` 只有配置没有消费点，美元等值依赖价格源 |
-| token 用量配额 | 配额维度里 `tokens` 只建了表与读取，`LlmAdapter` 尚未回传 usage |
-
-## 限流与配额的落法
-
-- 1 分钟分桶，`quota_counter` 单语句 upsert 累加（`ON CONFLICT DO UPDATE ... RETURNING`），
-  一次往返拿到最新值，不在热路径上先查后改；
-- 匿名按 IP、登录按 `siwe_user_id`；`/auth/*` 单独一档额度；
-- 单轮资源预算由 `web3/metering.py` 用 ContextVar 记账：模型调用 / 工具调用 / 下游请求 /
-  探索器四类分开限额，调用前预留、结束结算，取消与异常也走收尾。用 ContextVar 而不是逐层传参，
-  是因为 `ChainAdapter` 是进程级单例，按用户归属只能挂在请求上下文上；
-- 凭据无效时按匿名计入 IP 额度，再交给业务依赖返回 401 —— 否则带一个坏 token 就绕过了整个计数器；
-- 超限统一 429/E501。PRD 写的是"超限降级只读"，但降级需要有写链路可降，写链路上线后改判定即可。
-
-## 与文档的差异（都是显式选择，不是遗漏）
-
-1. 新增 `agent/prompts.py`：两段系统提示词集中放，便于评审时逐句核对能力承诺。
-2. `main.py` 里的 `Container` 就是组装点，没有额外引入 DI 容器——当前只有一个进程、一份依赖图。
-3. 只读工具的 `chainId` 不是入参：后端按 `ALLOWED_CHAIN_IDS` 遍历，符合"LLM 不可见 chainId"。
-
-## 已知缺口（会阻断 M2，不阻断 V1a）
-
-- 真实质押合约地址 + ABI（当前 `STAKE_CONTRACTS` 为空）
-- IntentRouter 语义互斥表（`(intent × token × 目标)` 判定矩阵）
-- 前端在同级目录 `web3_agent_frontend`；本仓库只做接口级验收，PRD 16 章的用户故事要前后端一起看
-
-## 通用 Web3 文档 RAG（可选 P0）
-
-新增 `rag_general_knowledge` 只读工具，与现有链上工具并列，查询协议、钱包、Gas、NFT、DEX、质押等静态知识。
-链、协议、分类均可选过滤，通用术语可全局检索。默认 `RAG_ENABLED=false`；启用需准备知识库表并发布已审核文档。
-复用 PG/pgvector 与 bge-m3，知识库与用户记忆独立。部署、元数据、导入脚本、引用与兜底说明见 [通用 RAG 文档](docs/rag.md)。
-
-前端上传、任务轮询、自动解析/切块/向量化/入库、失败重试与检索验证见 [上传接口方案](docs/rag-upload-api.md)。
-
-知识库、文档、切片和任务的四表结构、前端知识库选择与待执行数据库升级见 [知识库分层调整](docs/rag-knowledge-bases.md)。
+```bash
+uv run python scripts/ingest_docs.py
+```

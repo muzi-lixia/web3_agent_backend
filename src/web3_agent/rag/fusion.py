@@ -4,7 +4,7 @@
 # DENSE_WEIGHT：融合时向量路的名次权重。
 DENSE_WEIGHT = 1.0
 # KEYWORD_WEIGHT：融合时关键词路的名次权重。
-KEYWORD_WEIGHT = 0.6
+KEYWORD_WEIGHT = 0.7
 
 
 def fuse(rankings, *, limit=15, k=60, weights=None):

@@ -1,34 +1,73 @@
-"""文本向量化，走本地 Ollama 的 bge-m3。
+"""文本向量化，接入方式按配置选。
 
 `vector(1024)` 是建表时写死的，模型换了维度就对不上 —— 所以这里校验维度，
-不把「写库时才报错」留给调用方。
+不把「写库时才报错」留给调用方。换模型或换供应商之后，已入库的向量必须在
+新模型下重建，否则检索侧的 query 向量和 doc 向量不在同一个空间。
 """
 
 from __future__ import annotations
 
-import httpx
+from langchain_core.embeddings import Embeddings
 from langchain_ollama import OllamaEmbeddings
+from langchain_openai import OpenAIEmbeddings
 
-from web3_agent.common.exceptions import BudgetExhausted, ModelUnavailable
-from web3_agent.config.settings import Settings
+from web3_agent.common.exceptions import (
+    BudgetExhausted,
+    ModelConfigError,
+    ModelUnavailable,
+)
 from web3_agent.common.metering import Resource, reserve
+from web3_agent.config.settings import Settings
+from web3_agent.llm.client import normalize_model_error
+
+# _DEFAULT_OLLAMA_BASE_URL：本地向量服务默认地址，向量留在本地而聊天走远端时使用。
+_DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 
 
-# 数据职责：Ollama 文本向量化适配器，统一计量并检查数据库维度兼容性。
+def _build_embeddings(settings: Settings) -> Embeddings:
+    """按配置创建向量模型客户端。
+
+    Args:
+        settings: 运行配置对象，提供本模块所需开关、阈值和服务地址。
+    """
+    if settings.embed_provider == "ollama":
+        # 聊天在远端、向量在本地时，两条链路地址不同，不能回落到 MODEL_BASE_URL。
+        base_url = settings.embed_base_url or (
+            settings.model_base_url
+            if settings.model_provider == "ollama" else _DEFAULT_OLLAMA_BASE_URL
+        )
+        return OllamaEmbeddings(model=settings.embed_model, base_url=base_url)
+    base_url = settings.embed_base_url or settings.model_base_url
+    api_key = settings.embed_api_key or settings.model_api_key
+    if not api_key:
+        raise ModelConfigError("向量模型缺少 EMBED_API_KEY")
+    return OpenAIEmbeddings(
+        model=settings.embed_model,
+        base_url=base_url,
+        api_key=api_key,
+        dimensions=settings.embed_dim,
+        chunk_size=settings.embed_batch_size,
+        # 同聊天模型：隐形重试会让一次计量对应多次上游请求。
+        max_retries=0,
+        # 不改就是 tiktoken 切 token 再发，非 OpenAI 的兼容端点只收原文。
+        check_embedding_ctx_length=False,
+        # 默认 base64 编码，兼容端点普遍只认 float。
+        model_kwargs={"encoding_format": "float"},
+    )
+
+
+# 数据职责：文本向量化适配器，统一计量并检查数据库维度兼容性。
 class Embedder:
     def __init__(self, settings: Settings) -> None:
-        # _model：Ollama 嵌入模型客户端。
         """初始化 Embedder 所需的依赖和运行状态。
 
         Args:
             settings: 运行配置对象，提供本模块所需开关、阈值和服务地址。
         """
-        self._model = OllamaEmbeddings(
-            model=settings.ollama_embed_model,
-            base_url=settings.ollama_base_url,
-        )
+        # _model：向量模型客户端，供应商由配置决定。
+        self._model = _build_embeddings(settings)
         # _dim：预期向量维度，用于与数据库向量列校验。
-        self._dim = settings.ollama_embed_dim
+        self._dim = settings.embed_dim
 
     @property
     def dim(self) -> int:
@@ -61,8 +100,9 @@ class Embedder:
             raise BudgetExhausted("本轮向量化次数已达上限")
         try:
             vectors = await self._model.aembed_documents(texts)
-        except (httpx.HTTPError, ConnectionError, TimeoutError) as exc:
-            raise ModelUnavailable(f"向量化失败：{exc}") from exc
+        except Exception as exc:
+            # 在线接入抛的是 SDK 自己的连接异常，不是 httpx，逐类捕获会漏。
+            raise normalize_model_error(exc, "向量化") from exc
         for vec in vectors:
             if len(vec) != self._dim:
                 raise ModelUnavailable(

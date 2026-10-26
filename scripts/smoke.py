@@ -26,7 +26,7 @@ from web3_agent.web3.tools.read.get_transaction_records import build_get_transac
 async def main() -> None:
     """构造真实模型和链工具执行人工冒烟流程，可按 --graph 额外运行只读图。"""
     settings = Settings()
-    print("model:", settings.ollama_model)
+    print("model:", settings.model_name)
 
     adapter = ChainAdapter(settings)
     registry = ToolRegistry()
@@ -40,7 +40,7 @@ async def main() -> None:
     print("llm_visible tools:", [t.name for t in registry.llm_tools()])
 
     llm = LlmAdapter(settings)
-    print("ollama:", await llm.check_model())
+    print("model check:", await llm.check_model())
 
     guard = JsonGuard()
     for message in ["我的 ETH 余额是多少", "帮我转 10 USDC 给 0x" + "1" * 40, "今天天气怎么样"]:

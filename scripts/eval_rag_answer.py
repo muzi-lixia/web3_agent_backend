@@ -8,7 +8,7 @@
     .venv/bin/python scripts/eval_rag_answer.py --only rn      # 只跑无答案题
     .venv/bin/python scripts/eval_rag_answer.py --json .tmp/answer.json
 
-只调本地 Ollama（聊天 + 向量化），不产生外部费用。
+只调聊天与向量化两个环节，判分在本进程内完成。
 """
 
 from __future__ import annotations
@@ -162,10 +162,10 @@ async def _run(cases: list[dict], dump_path: str) -> None:
     settings = get_settings()
     init_engine(settings)
     try:
-        retriever = KnowledgeRetriever(
-            settings, Embedder(settings), PgKnowledgeStore(embedding_profile(settings))
-        )
         llm = LlmAdapter(settings)
+        retriever = KnowledgeRetriever(
+            settings, Embedder(settings), PgKnowledgeStore(embedding_profile(settings)), llm.client
+        )
         rows: list[dict] = []
         for idx, case in enumerate(cases, 1):
             started = time.monotonic()

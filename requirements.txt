@@ -15,6 +15,7 @@ eth-account==0.14.0
 # LLM 编排与观测
 langchain-core==1.6.12
 langchain-ollama==1.1.0
+langchain-openai==1.7.2
 langgraph==1.2.16
 langsmith==0.14.11
 

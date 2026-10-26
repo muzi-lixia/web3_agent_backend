@@ -383,7 +383,7 @@ async def main() -> None:
         return
 
     settings = Settings()
-    print(f"模型 {settings.ollama_model} ｜ 用例 {len(cases)} 条 ｜ {cases_path.name}")
+    print(f"模型 {settings.model_name} ｜ 用例 {len(cases)} 条 ｜ {cases_path.name}")
 
     started = time.perf_counter()
     results = await _evaluate(cases, settings)

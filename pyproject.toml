@@ -17,6 +17,7 @@ dependencies = [
     "eth-utils",
     "langchain-core",
     "langchain-ollama",
+    "langchain-openai",
     "langgraph",
     "langsmith",
     "pgvector>=0.5.1",

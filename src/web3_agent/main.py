@@ -129,11 +129,12 @@ def build_container(settings: Settings, checkpointer=None) -> Container:
         mutating=True,
     )
 
+    llm = LlmAdapter(settings)
     embedder = Embedder(settings)
     profile = embedding_profile(settings)
     knowledge_bases = KnowledgeBaseRepository(profile)
     rag_jobs, rag_store = JobRepository(profile), PgKnowledgeStore(profile)
-    rag_retriever = KnowledgeRetriever(settings, embedder, rag_store)
+    rag_retriever = KnowledgeRetriever(settings, embedder, rag_store, llm.client)
     rag_worker = IngestionWorker(settings, embedder, rag_store, rag_jobs)
     if settings.rag_enabled:
         registry.register(
@@ -141,7 +142,6 @@ def build_container(settings: Settings, checkpointer=None) -> Container:
             ToolGroup.LLM_VISIBLE, mutating=False,
         )
 
-    llm = LlmAdapter(settings)
     runner = ToolRunner(registry)
     audit = AuditLogger()
     quota = QuotaController(settings)
@@ -198,9 +198,9 @@ async def lifespan(app: FastAPI):
     if settings.model_check_on_startup:
         try:
             info = await container.llm.check_model()
-            logger.info("ollama ready: %s", info)
+            logger.info("model ready: %s", info)
         except ModelUnavailable as exc:
-            logger.error("ollama not ready: %s", exc)
+            logger.error("model not ready: %s", exc)
 
     background: list[asyncio.Task] = []
     if container.tracing_enabled:

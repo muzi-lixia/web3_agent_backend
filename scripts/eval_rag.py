@@ -5,13 +5,13 @@
     .venv/bin/python scripts/eval_rag.py --profile prod # 只跑生产配置
     .venv/bin/python scripts/eval_rag.py --json .tmp/rag.json
 
-只调向量化（本地 Ollama）与检索，不调生成模型，因此不产生模型费用。
+只调向量化与检索，不调生成模型；问题改写开启时额外调用一次改写模型。
 答案层的正确性（有没有编造数字、有没有答全）不在本脚本范围，靠 cases 里的
 gold / gold_terms / must_not 人工或另一层判分。
 
 两套配置：
     prod —— 完全按 .env，反映线上真实表现
-    wide —— top_k=5、上下文字符预算拉到上限，用来判断「检索不到」还是「装不下」
+    wide —— top_k=5，用来判断「检索不到」还是「装不下」
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from web3_agent.agent.llm_adapter import LlmAdapter
 from web3_agent.config.settings import get_settings
 from web3_agent.persistence.pg.base import dispose_engine, init_engine
 from web3_agent.rag.embedder import Embedder
@@ -38,10 +39,10 @@ from web3_agent.rag.vector_store import PgKnowledgeStore
 # CASES_PATH：检索层评估用例 JSON 的默认路径。
 CASES_PATH = ROOT / "tests" / "golden_suite" / "rag_cases.json"
 
-# PROFILES：两套检索配置。prod 不改任何参数，wide 把条数与字符预算都放到上限。
+# PROFILES：两套检索配置。prod 不改任何参数，wide 把证据条数放到上限。
 PROFILES: dict[str, dict] = {
     "prod": {},
-    "wide": {"rag_top_k": 5, "rag_max_context_chars": 8000},
+    "wide": {"rag_top_k": 5},
 }
 
 # ANSWERABLE：有期望切块、按命中率统计的类型。
@@ -145,8 +146,11 @@ async def _eval_profile(
         settings = settings.model_copy(update=overrides)
     init_engine(settings)
     try:
+        # 改写与其他可选阶段要和生产一样走同一个模型入口，否则评估测的是降级路径。
+        llm = LlmAdapter(settings)
         retriever = KnowledgeRetriever(
-            settings, Embedder(settings), PgKnowledgeStore(embedding_profile(settings))
+            settings, Embedder(settings), PgKnowledgeStore(embedding_profile(settings)),
+            llm.client,
         )
         rows: list[CaseResult] = []
         for case in cases:

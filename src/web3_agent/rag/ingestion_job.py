@@ -22,8 +22,8 @@ def index_signature(checksum, settings):
     """
     return hashlib.sha256("|".join([
         checksum, CHUNKER_VERSION, str(settings.rag_chunk_tokens),
-        str(settings.rag_chunk_overlap), settings.ollama_embed_model,
-        str(settings.ollama_embed_dim), settings.rag_embedding_version,
+        str(settings.rag_chunk_overlap), settings.embed_model,
+        str(settings.embed_dim), settings.rag_embedding_version,
     ]).encode()).hexdigest()
 
 
@@ -36,7 +36,7 @@ def prepare_content(spec, content, settings):
         content: 文档正文字符串或带页码的 ParsedDocument。
         settings: 运行配置对象，提供本模块所需开关、阈值和服务地址。
     """
-    if settings.ollama_embed_dim != EMBEDDING_DIM:
+    if settings.embed_dim != EMBEDDING_DIM:
         raise ValueError("embedding 维度必须与现有 vector(1024) 一致")
     parsed = content if isinstance(content, ParsedDocument) else ParsedDocument(content)
     content = parsed.text
@@ -78,7 +78,7 @@ async def embed_chunks(spec, chunks, settings, embedder, progress=None):
     for start in range(0, len(chunks), 16):
         batch = await embedder.embed_many([f"{spec.title}\n{chunk.section}\n{chunk.content}" for chunk in chunks[start:start+16]])
         if len(batch) != len(chunks[start:start+16]) or any(
-            len(vector) != settings.ollama_embed_dim or not all(math.isfinite(v) for v in vector)
+            len(vector) != settings.embed_dim or not all(math.isfinite(v) for v in vector)
             or not any(v != 0 for v in vector) for vector in batch
         ):
             raise ValueError("embedding 数量、维度或数值不正确")

@@ -26,8 +26,8 @@ def embedding_profile(settings):
     Args:
         settings: 运行配置对象，提供本模块所需开关、阈值和服务地址。
     """
-    return EmbeddingProfile(embedding_model=settings.ollama_embed_model,
-        embedding_dimension=settings.ollama_embed_dim, embedding_version=settings.rag_embedding_version)
+    return EmbeddingProfile(embedding_model=settings.embed_model,
+        embedding_dimension=settings.embed_dim, embedding_version=settings.rag_embedding_version)
 
 
 # 数据职责：经过校验的文档入库描述，供 CLI 和上传 worker 共用。

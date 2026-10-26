@@ -82,44 +82,37 @@ _CACHE_KEY_EXCLUDED = frozenset({
 })
 
 
-def _select_evidence(chunks, *, max_chars, limit):
-    """按字符预算挑证据并连续编号。
+def _select_evidence(chunks, *, limit):
+    """按条数挑证据并连续编号。
 
-    纯向量和混合两条召回路径共用：编号规则、字符预算、超长片段跳过的口径
-    只要有一份，改上下文预算或引用格式时不会只改到其中一条。
+    纯向量和混合两条召回路径共用：编号规则与条数上限只要有一份，
+    改引用格式或条数时不会只改到其中一条。
 
     Args:
         chunks: 本批文档切片，或任务的切片统计数量。
-        max_chars: 本段文本允许的最大字符预算。
         limit: 本次查询或展示返回条数上限。
 
     Returns:
-        未超字符与条数预算、编号为 S1 起的证据字典列表。
+        编号为 S1 起的证据字典列表。
     """
-    remaining, selected = max_chars, []
-    for chunk in chunks:
-        if len(chunk.content) <= remaining:
-            item = chunk.model_dump()
-            item["id"] = f"S{len(selected) + 1}"
-            selected.append(item)
-            remaining -= len(chunk.content)
-        if len(selected) >= limit:
-            break
-    return selected
+    return [{**chunk.model_dump(), "id": f"S{index}"}
+            for index, chunk in enumerate(chunks[:limit], 1)]
 
 
 # 数据职责：知识检索编排器，统一处理预算、缓存、召回、融合与降级。
 class KnowledgeRetriever:
-    def __init__(self, settings, embedder, store):
+    def __init__(self, settings, embedder, store, llm=None):
         # settings：运行配置对象，提供本模块所需开关、阈值和服务地址。
         # embedder：把文本转换为检索向量的服务。
         # store：文档和切片的持久仓储。
+        # llm：模型访问入口；只在启用问题改写时被用到。
         """初始化 KnowledgeRetriever 所需的依赖和运行状态。
 
         Args:
             settings: 运行配置对象，提供本模块所需开关、阈值和服务地址。
             embedder: 把文本转换为检索向量的服务。
             store: 文档和切片的持久仓储。
+            llm: 模型访问入口，None 表示问题改写不可用。
         """
         self.settings, self.embedder, self.store = settings, embedder, store
         # cache：按问题、范围和索引版本保存的检索结果缓存。
@@ -127,8 +120,11 @@ class KnowledgeRetriever:
         # 索引对象只读，共用即可；逐次深拷贝等于每个请求都把整个知识库再铺一遍。
         # index_cache：按范围、版本和有效期边界缓存的只读 BM25 索引。
         self.index_cache = RetrievalCache(max_entries=8, clone=False)
-        # rewriter：可选的问题指代消解与同义改写适配器。
-        self.rewriter = QueryRewriter(settings)
+        # rewriter：可选的问题指代消解与同义改写；没有模型入口时不构造。
+        self.rewriter = (
+            QueryRewriter(llm, settings.rag_rewrite_timeout_seconds)
+            if llm is not None else None
+        )
         # reranker：可选的候选证据重排适配器。
         self.reranker = HttpReranker(settings)
 
@@ -178,9 +174,8 @@ class KnowledgeRetriever:
         except Exception:
             logger.exception("knowledge retrieval failed filters=%s", filters)
             return {"error": "E603", "status": "unavailable", "message": UNAVAILABLE, "hits": []}
-        # 最后统一裁剪证据条数与字符预算，并生成本轮连续引用编号。
-        selected = _select_evidence(
-            hits, max_chars=self.settings.rag_max_context_chars, limit=limit)
+        # 最后统一裁剪证据条数，并生成本轮连续引用编号。
+        selected = _select_evidence(hits, limit=limit)
         if not selected:
             return {"error": "E602", "status": "empty", "message": NO_DOCUMENTS, "hits": []}
         return {"status": "success", "filters": filters, "hits": selected}
@@ -254,8 +249,8 @@ class KnowledgeRetriever:
             info["degraded_stages"].append("keyword")
         config = {key: value for key, value in self.settings.model_dump().items()
                   if key.startswith("rag_") and key not in _CACHE_KEY_EXCLUDED}
-        config["embedding_model"] = self.settings.ollama_embed_model
-        config["rewrite_model"] = self.settings.ollama_model
+        config["embedding_model"] = self.settings.embed_model
+        config["rewrite_model"] = self.settings.model_name
         key = hashlib.sha256(json.dumps([query, conversation_context[-2000:], filters, limit,
                                          revision, boundary, config],
                                        sort_keys=True, default=str).encode()).hexdigest()
@@ -267,12 +262,17 @@ class KnowledgeRetriever:
         # resolved 消解了指代，召回 / 重排 / 回答三个阶段共用它；variants 只用于多路召回。
         resolved, queries = query, [query]
         if self.settings.rag_rewrite_enabled:
-            try:
-                resolved, queries = await asyncio.wait_for(
-                    self.rewriter.rewrite(query, conversation_context[-2000:]), _remaining(recall_deadline))
-            except Exception:
-                logger.warning("RAG rewrite failed; using original query", exc_info=True)
+            if self.rewriter is None:
+                # 开关打开却没接模型入口：这属于装配错误，按降级处理而不是抛错。
+                logger.warning("RAG rewrite enabled without model client; using original query")
                 info["degraded_stages"].append("rewrite")
+            else:
+                try:
+                    resolved, queries = await asyncio.wait_for(
+                        self.rewriter.rewrite(query, conversation_context[-2000:]), _remaining(recall_deadline))
+                except Exception:
+                    logger.warning("RAG rewrite failed; using original query", exc_info=True)
+                    info["degraded_stages"].append("rewrite")
         info["queries"] = queries
         info["resolved_question"] = resolved
         keyword_rankings: list = []
@@ -346,9 +346,8 @@ class KnowledgeRetriever:
             except Exception:
                 logger.warning("RAG rerank failed; retaining RRF ordering", exc_info=True)
                 info["degraded_stages"].append("rerank")
-        # 最后统一裁剪证据条数与字符预算，并生成本轮连续引用编号。
-        selected = _select_evidence(
-            candidates, max_chars=self.settings.rag_max_context_chars, limit=limit)
+        # 最后统一裁剪证据条数，并生成本轮连续引用编号。
+        selected = _select_evidence(candidates, limit=limit)
         info["selected"] = [c["chunk_id"] for c in selected]
         info["elapsed_ms"] = round((monotonic()-start)*1000)
         if not selected:

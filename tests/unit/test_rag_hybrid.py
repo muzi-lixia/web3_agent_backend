@@ -22,7 +22,8 @@ def retriever(chunks, **options):
     store = SimpleNamespace(has_documents=AsyncMock(return_value=True),
         index_state=AsyncMock(return_value=(1, None)),
         keyword_snapshot=AsyncMock(return_value=chunks), search=AsyncMock(return_value=[]))
-    return KnowledgeRetriever(config, SimpleNamespace(embed=AsyncMock(return_value=[1.])), store)
+    client = SimpleNamespace(chat=AsyncMock(return_value='{"query": ""}'))
+    return KnowledgeRetriever(config, SimpleNamespace(embed=AsyncMock(return_value=[1.])), store, client)
 
 
 def test_cache_key_tracks_every_retrieval_setting():
@@ -220,6 +221,45 @@ def test_reranker_http_contract_and_invalid_indices(monkeypatch):
         import pytest
         with pytest.raises(ValueError, match='invalid'):
             await ranker.rerank('question',[chunk('a','first'),chunk('b','second')])
+    asyncio.run(run())
+
+
+def test_reranker_online_contracts(monkeypatch):
+    import httpx
+    from web3_agent.rag.reranker import HttpReranker
+    original = httpx.AsyncClient
+    def patch(handler):
+        monkeypatch.setattr(httpx, 'AsyncClient',
+                            lambda **kw: original(transport=httpx.MockTransport(handler)))
+    async def run():
+        import json
+        seen = {}
+        def cohere(request):
+            seen['body'] = json.loads(request.content)
+            seen['auth'] = request.headers.get('authorization')
+            return httpx.Response(200, json={'results': [
+                {'index': 0, 'relevance_score': .2}, {'index': 1, 'relevance_score': .8}]})
+        patch(cohere)
+        ranker = HttpReranker(Settings(_env_file=None, rag_rerank_url='http://rerank/v1/rerank',
+                                       rag_rerank_provider='cohere', rag_rerank_api_key='k',
+                                       rag_rerank_model='BAAI/bge-reranker-v2-m3'))
+        result = await ranker.rerank('question', [chunk('a', 'first'), chunk('b', 'second')])
+        assert seen['body']['documents'] == ['first', 'second']
+        assert seen['body']['model'] == 'BAAI/bge-reranker-v2-m3'
+        assert seen['auth'] == 'Bearer k'
+        assert [c.chunk_id for c, _ in result] == ['b', 'a']
+        def dashscope(request):
+            seen['body'] = json.loads(request.content)
+            return httpx.Response(200, json={'output': {'results': [
+                {'index': 1, 'relevance_score': .9}, {'index': 0, 'relevance_score': .1}]}})
+        patch(dashscope)
+        ranker = HttpReranker(Settings(_env_file=None, rag_rerank_url='http://dash/rerank',
+                                       rag_rerank_provider='dashscope', rag_rerank_api_key='k',
+                                       rag_rerank_model='gte-rerank-v2'))
+        result = await ranker.rerank('question', [chunk('a', 'first'), chunk('b', 'second')])
+        assert seen['body']['input']['documents'] == ['first', 'second']
+        assert seen['body']['parameters']['top_n'] == 2
+        assert [c.chunk_id for c, _ in result] == ['b', 'a']
     asyncio.run(run())
 
 

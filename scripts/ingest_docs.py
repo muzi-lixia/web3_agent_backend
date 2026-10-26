@@ -1,4 +1,4 @@
-"""管理员 CLI：默认预览；--publish 才使用 Ollama 和 PG。不会自动建表。"""
+"""管理员 CLI：默认预览；--publish 才使用向量化与 PG。不会自动建表。"""
 import argparse
 import asyncio
 import json

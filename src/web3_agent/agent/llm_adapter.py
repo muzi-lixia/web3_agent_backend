@@ -1,149 +1,56 @@
-"""ChatOllama 薄封装。
+"""意图抽取、摘要、记忆抽取与自由回答的业务入口。
 
-所有模型调用都从这里过一遍，目的是：
-- 统一 num_ctx / keep_alive / 超时（不设 num_ctx 会静默截断上下文）；
-- 统一走 LangChain，保证 LangSmith 埋点不断链；
-- 把各家 SDK 的异常翻成项目自己的三类，调用点不再各写一份 except。
+模型访问（接入方式、超时、异常归一化）在 `llm.client`。这里只负责提示词、
+输出契约，以及调用发出前的资源计量，不再自己构造任何请求。
 """
 
 from __future__ import annotations
 
-import logging
-
-import httpx
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import BaseTool
-from langchain_ollama import ChatOllama
 
 from web3_agent.agent.prompts import INTENT_SYSTEM, MEMORY_SYSTEM, SUMMARY_SYSTEM
-from web3_agent.common.exceptions import ModelBadOutput, ModelConfigError, ModelUnavailable
+from web3_agent.common.exceptions import ModelBadOutput
+from web3_agent.common.metering import Resource, reserve
 from web3_agent.common.types import LlmOutput
 from web3_agent.config.settings import Settings
 from web3_agent.domain.memory.memory import MemoryDraftList
 from web3_agent.domain.memory.schema import SummaryFields
-from web3_agent.common.metering import Resource, reserve
-
-logger = logging.getLogger(__name__)
-
-# 传输层故障：连不上、超时、端口不通。等一会再试有意义。
-# ConnectionError / TimeoutError 都是 OSError 子类，写进元组是重复的。
-# _TRANSPORT：模型 SDK 的传输层故障类型集合，归一为模型不可用。
-_TRANSPORT = (httpx.HTTPError, OSError)
-# 拿到了响应但字段不对：只有这一类值得走 JsonGuard 的格式修复。
-# _FORMAT：模型响应结构异常类型集合，可进入结构化重试。
-_FORMAT = (ValueError, KeyError, TypeError, AttributeError)
+from web3_agent.llm.client import ModelClient
 
 
-def _normalize(exc: BaseException, stage: str) -> Exception:
-    """把 SDK 异常翻成三类，本项目其他位置只认这三类。
-
-    Args:
-        exc: 需要转换、记录或判断是否重试的原始异常。
-        stage: 执行阶段名称，用于进度或错误定位。
-    """
-    if isinstance(exc, (ModelUnavailable, ModelBadOutput)):
-        return exc
-    status = getattr(exc, "status_code", None)
-    if type(exc).__name__ == "ResponseError" and status in (400, 404):
-        # 模型名不对或请求被服务端拒绝：重试和降级都救不回来。
-        return ModelConfigError(f"{stage}：模型拒绝请求（{status}）")
-    if isinstance(exc, _TRANSPORT):
-        return ModelUnavailable(f"{stage}：{type(exc).__name__}")
-    if isinstance(exc, _FORMAT):
-        return ModelBadOutput(f"{stage}：响应格式不合法")
-    # 未知异常也不许落成通用 500：对外按模型不可用处理，细节留在日志里。
-    logger.warning("unclassified model error at %s: %r", stage, exc)
-    return ModelUnavailable(f"{stage}：{type(exc).__name__}")
-
-
-class _GuardedModel:
-    """在调用边界归一化异常。图里直接 ainvoke 也不会漏出 SDK 原始异常。"""
-
-    def __init__(self, inner: Runnable, stage: str) -> None:
-        """初始化 _GuardedModel 所需的依赖和运行状态。
-
-        Args:
-            inner: 需要包装异常边界的原始模型 Runnable。
-            stage: 执行阶段名称，用于进度或错误定位。
-        """
-        self._inner = inner
-        self._stage = stage
-
-    def bind_tools(self, tools: list[BaseTool]) -> "_GuardedModel":
-        """给模型绑定允许使用的工具列表并返回可调用对象。
-
-        Args:
-            tools: 允许绑定给模型的工具实例列表。
-        """
-        return _GuardedModel(self._inner.bind_tools(tools), self._stage)
-
-    def invoke(self, messages, config: RunnableConfig | None = None, **kwargs):
-        """同步调用被包装模型，并把底层异常归一化。
-
-        Args:
-            messages: 按角色组织的模型输入消息列表。
-            config: LangChain 调用配置，包含追踪名称、运行 ID 等。
-            **kwargs: 透传给底层调用的其余关键字参数。
-        """
-        try:
-            return self._inner.invoke(messages, config, **kwargs)
-        except Exception as exc:  # noqa: BLE001 所有异常都要归一到三类再往外走
-            raise _normalize(exc, self._stage) from exc
-
-    async def ainvoke(self, messages, config: RunnableConfig | None = None, **kwargs):
-        """异步调用被包装模型，并把底层异常归一化；取消信号继续向上传播。
-
-        Args:
-            messages: 按角色组织的模型输入消息列表。
-            config: LangChain 调用配置，包含追踪名称、运行 ID 等。
-            **kwargs: 透传给底层调用的其余关键字参数。
-        """
-        try:
-            return await self._inner.ainvoke(messages, config, **kwargs)
-        except Exception as exc:  # noqa: BLE001 同上；取消是 BaseException，不受影响
-            raise _normalize(exc, self._stage) from exc
-
-
-# 数据职责：聊天、意图识别、摘要与记忆抽取的统一模型入口。
+# 数据职责：意图识别、摘要、记忆抽取与自由回答的业务入口。
 class LlmAdapter:
-    def __init__(self, settings: Settings) -> None:
-        """统一创建聊天模型，并分别绑定意图、摘要与记忆的结构化输出契约。
+    def __init__(self, settings: Settings, client: ModelClient | None = None) -> None:
+        """绑定意图、摘要与记忆的输出契约。
 
         Args:
             settings: 运行配置对象，提供本模块所需开关、阈值和服务地址。
+            client: 统一的模型访问入口；不传时按配置自建一个，多个业务方共用同一实例即可。
         """
         self._settings = settings
-        # _llm：底层聊天模型或统一模型适配器，由当前类职责决定。
-        self._llm = ChatOllama(
-            model=settings.ollama_model,
-            base_url=settings.ollama_base_url,
-            temperature=settings.ollama_temperature,
-            num_ctx=settings.ollama_num_ctx,
-            keep_alive=settings.ollama_keep_alive,
-            # 不传就是 httpx 默认值：模型排队时请求一直挂着，先把整轮预算吃光。
-            client_kwargs={"timeout": settings.ollama_timeout_seconds},
-        )
+        # _client：唯一的模型访问入口，超时与异常边界都在它内部。
+        self._client = client or ModelClient(settings)
         # _answer_model：用于自由文本回答且统一处理异常的模型包装器。
-        self._answer_model = _GuardedModel(self._llm, "回答")
-        # _intent_llm：按 LlmOutput JSON Schema 输出的意图模型。
-        self._intent_llm = _GuardedModel(
-            self._llm.with_structured_output(LlmOutput, method="json_schema"), "意图抽取"
-        )
-        # _summary_llm：按 SummaryFields JSON Schema 输出的摘要模型。
-        self._summary_llm = _GuardedModel(
-            self._llm.with_structured_output(SummaryFields, method="json_schema"), "摘要"
-        )
-        # _memory_llm：按 MemoryDraftList JSON Schema 输出的记忆模型。
-        self._memory_llm = _GuardedModel(
-            self._llm.with_structured_output(MemoryDraftList, method="json_schema"), "记忆抽取"
-        )
+        self._answer_model = self._client.free_form
+        # _intent_llm：按 LlmOutput 契约输出的意图模型。
+        self._intent_llm = self._client.structured(LlmOutput, "意图抽取")
+        # _summary_llm：按 SummaryFields 契约输出的摘要模型。
+        self._summary_llm = self._client.structured(SummaryFields, "摘要")
+        # _memory_llm：按 MemoryDraftList 契约输出的记忆模型。
+        self._memory_llm = self._client.structured(MemoryDraftList, "记忆抽取")
+
+    @property
+    def client(self) -> ModelClient:
+        """取得模型访问入口，供需要文本调用的其他领域模块直接使用。"""
+        return self._client
 
     @property
     def model_name(self) -> str:
         """读取当前配置的聊天模型名称。"""
-        return self._settings.ollama_model
+        return self._settings.model_name
 
     def bind_tools(self, tools: list[BaseTool]) -> Runnable:
         """给模型绑定允许使用的工具列表并返回可调用对象。
@@ -151,30 +58,11 @@ class LlmAdapter:
         Args:
             tools: 允许绑定给模型的工具实例列表。
         """
-        return self._answer_model.bind_tools(tools)
+        return self._client.bind_tools(tools)
 
     async def check_model(self) -> dict:
-        """确认模型真的加载得起来，而不只是 11434 端口活着。"""
-        url = f"{self._settings.ollama_base_url.rstrip('/')}/api/tags"
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(url)
-                resp.raise_for_status()
-                models = resp.json().get("models", [])
-        except httpx.HTTPError as exc:
-            raise ModelUnavailable(f"Ollama 不可达：{exc}") from exc
-
-        hit = next((m for m in models if m.get("name") == self.model_name), None)
-        if hit is None:
-            raise ModelConfigError(f"模型未拉取：{self.model_name}")
-
-        digest = hit.get("digest", "")
-        expected = self._settings.ollama_model_digest
-        if expected and digest != expected:
-            raise ModelConfigError(
-                f"模型 digest 不一致：期望 {expected[:12]}，实际 {digest[:12]}"
-            )
-        return {"model": self.model_name, "digest": digest}
+        """确认模型可用：ollama 查已拉取列表与指纹，其余查模型列表。"""
+        return await self._client.check_model()
 
     async def extract_intent(
         self,
@@ -302,8 +190,8 @@ class LlmAdapter:
 
     @property
     def chat_model(self) -> BaseChatModel:
-        """取得底层 ChatOllama 模型实例，供需要原始模型的调用方使用。"""
-        return self._llm
+        """取得底层聊天模型实例，供需要原始模型的调用方使用。"""
+        return self._client.chat_model
 
 
 def _as_message(role: str, content: str) -> BaseMessage:

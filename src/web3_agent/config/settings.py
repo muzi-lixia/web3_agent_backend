@@ -71,14 +71,14 @@ class Settings(BaseSettings):
     # conversation_max_messages：注入模型的近期非摘要消息条数上限。
     conversation_max_messages: int = 20
     # 条数管不住体积：一条 50 笔交易的直出文本就有 7000 字符，
-    # 两三轮下来会把 num_ctx 挤满，而 Ollama 超限是静默截断。
+    # 两三轮下来会把上下文窗口挤满，超限的代价在本地是静默截断、在远端是整轮失败。
     # conversation_max_chars：近期历史的字符预算；最新一条消息按加载器规则保留。
     conversation_max_chars: int = 6000
     # --- 上下文总预算（token）---
     # 上面那些 *_chars 只各自约束一段，没有合计上限：历史、摘要、档案、记忆、
-    # 系统提示、工具输出加起来仍可能把 num_ctx 挤爆，而 Ollama 超限是静默截断。
+    # 系统提示、工具输出加起来仍可能把窗口挤爆，而超限的代价在本地是静默截断、在远端是整轮失败。
     # context_budget_tokens：一次模型调用的输入 token 总预算，注入项在此收敛。
-    context_budget_tokens: int = 0  # 0 表示取 ollama_num_ctx 的 80%
+    context_budget_tokens: int = 0  # 0 表示取 model_context_tokens 的 80%
     # intent_history_max_chars：意图抽取只看最近一小段历史，用于消解指代即可；
     # 判断「这句话要干什么」不需要全部对话。0 表示沿用 conversation_max_chars。
     intent_history_max_chars: int = 1600
@@ -157,8 +157,6 @@ class Settings(BaseSettings):
     rag_chunk_tokens: int = Field(default=400, ge=400, le=600)
     # rag_chunk_overlap：同章节相邻切片重叠比例，取值小于 0.5。
     rag_chunk_overlap: float = Field(default=0.1, ge=0, lt=0.5)
-    # rag_max_context_chars：最终检索证据正文的累计字符预算。
-    rag_max_context_chars: int = Field(default=2400, ge=600, le=8000)
     # rag_timeout_seconds：一次知识检索的整体超时秒数。
     rag_timeout_seconds: float = Field(default=20, gt=0, le=120)
 
@@ -173,8 +171,14 @@ class Settings(BaseSettings):
     rag_keyword_max_chunks: int = Field(default=10000, ge=100, le=100000)
     # rag_rerank_enabled：是否启用外部 cross-encoder 重排。
     rag_rerank_enabled: bool = False
-    # rag_rerank_url：重排服务 HTTP 地址，使用兼容 /rerank 的请求契约。
+    # rag_rerank_url：重排服务 HTTP 地址，按 rag_rerank_provider 对应的契约调用。
     rag_rerank_url: str = ""
+    # rag_rerank_provider：重排契约；tei 自建服务，cohere 兼容 Cohere/Jina/硅基流动，dashscope 为百炼。
+    rag_rerank_provider: Literal["tei", "cohere", "dashscope"] = "tei"
+    # rag_rerank_api_key：在线重排服务的凭据；自建 TEI 留空。
+    rag_rerank_api_key: str = ""
+    # rag_rerank_model：在线重排服务的模型名；自建 TEI 不需要。
+    rag_rerank_model: str = ""
     # rag_rerank_model_version：重排模型版本，纳入检索缓存键。
     rag_rerank_model_version: str = "v1"
     # rag_rerank_timeout_seconds：重排 HTTP 请求的超时秒数，还受检索总预算限制。
@@ -206,28 +210,46 @@ class Settings(BaseSettings):
     # workflow_sweep_batch：单次扫描最多处理的任务数。
     workflow_sweep_batch: int = Field(default=50, ge=1, le=500)
 
-    # --- 本地 Ollama ---
-    ollama_base_url: str = "http://127.0.0.1:11434"
-    # ollama_model：意图识别、回答及摘要使用的聊天模型名称。
-    ollama_model: str = "qwen2.5:7b"
-    # ollama_model_digest：期望的聊天模型指纹；为空时不检查指纹一致性。
-    ollama_model_digest: str = ""
-    # ollama_num_ctx：聊天模型上下文窗口容量，单位为 token。
-    ollama_num_ctx: int = 8192
-    # ollama_keep_alive：Ollama 在请求结束后保留模型驻留的时长字符串。
-    ollama_keep_alive: str = "30m"
-    # ollama_temperature：模型采样温度；0 用于提高输出确定性。
-    ollama_temperature: float = 0.0
-    # ollama_timeout_seconds：聊天模型 HTTP 客户端超时秒数。
-    ollama_timeout_seconds: float = 120.0
-    # model_check_on_startup：启动时是否检查所配聊天模型已存在及指纹匹配。
+    # --- 聊天模型：接入方式可换，业务代码只依赖聊天接口与结构化输出契约 ---
+    # model_provider：ollama 走本地 /api/chat；openai_compat 走 /chat/completions。
+    model_provider: Literal["ollama", "openai_compat"] = "ollama"
+    # model_name：模型名，按所选接入方式填写。
+    model_name: str = "qwen2.5:7b"
+    # model_base_url：聊天服务地址；openai_compat 要带兼容路径，以 /v1 结尾。
+    model_base_url: str = "http://127.0.0.1:11434"
+    # model_api_key：openai_compat 的访问凭据；ollama 留空。
+    model_api_key: str = ""
+    # model_temperature：模型采样温度；0 用于提高输出确定性。
+    model_temperature: float = 0.0
+    # model_timeout_seconds：聊天模型 HTTP 客户端超时秒数。
+    model_timeout_seconds: float = 120.0
+    # model_structured_mode：结构化输出的实现方式。留空时 ollama 用 json_schema，
+    # openai_compat 用 function_calling —— strict json_schema 不是通用能力。
+    model_structured_mode: Literal["json_schema", "function_calling", "json_mode"] | None = None
+    # model_extra_body：透传给请求体的额外字段，按供应商需要填。
+    model_extra_body: dict = Field(default_factory=dict)
+    # model_context_tokens：模型上下文窗口容量，单位为 token；ollama 下同时作为 num_ctx。
+    model_context_tokens: int = 8192
+    # model_keep_alive：Ollama 在请求结束后保留模型驻留的时长字符串；其余接入方式不使用。
+    model_keep_alive: str = "30m"
+    # model_digest：期望的聊天模型指纹；为空时不检查指纹一致性，仅 ollama 使用。
+    model_digest: str = ""
+    # model_check_on_startup：启动时是否检查所配聊天模型可用。
     model_check_on_startup: bool = True
 
-    # --- 向量化（bge-m3；维度写死在建表里）---
-    # ollama_embed_model：文档向量化和检索问题向量化所用模型名称。
-    ollama_embed_model: str = "bge-m3"
-    # ollama_embed_dim：向量维度，必须与数据库 vector(1024) 兼容。
-    ollama_embed_dim: int = 1024
+    # --- 向量化（维度写死在建表里）---
+    # embed_provider：向量化接入方式，取值同 model_provider。
+    embed_provider: Literal["ollama", "openai_compat"] = "ollama"
+    # embed_model：文档向量化和检索问题向量化所用模型名称。
+    embed_model: str = "bge-m3"
+    # embed_base_url：向量服务地址；为空时沿用 model_base_url。
+    embed_base_url: str = ""
+    # embed_api_key：向量服务凭据；为空时沿用 model_api_key。
+    embed_api_key: str = ""
+    # embed_dim：向量维度，必须与数据库 vector(1024) 兼容。
+    embed_dim: int = 1024
+    # embed_batch_size：单次向量化请求携带的文本条数，受供应商批量上限约束。
+    embed_batch_size: int = 64
 
     # --- LangSmith（SaaS）---
     # 只认这一个开关：打开就全量上报，关闭时连 run 都不建。
@@ -268,6 +290,13 @@ class Settings(BaseSettings):
     quota_rpc_per_minute: int = 200
     # quota_steps_per_minute：用户每分钟模型调用的配额阈值。
     quota_steps_per_minute: int = 200
+
+    @property
+    def structured_mode(self) -> str:
+        """返回结构化输出方式；未显式配置时按接入方式取默认值。"""
+        if self.model_structured_mode:
+            return self.model_structured_mode
+        return "json_schema" if self.model_provider == "ollama" else "function_calling"
 
 
 @lru_cache

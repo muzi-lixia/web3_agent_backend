@@ -182,7 +182,7 @@
 
 ## 怎么用这份基线
 
-改检索相关参数（`rag_max_distance`、`rag_top_k`、融合权重、`rag_max_context_chars`）、换 embedding 模型或换生成模型之后，两层都重跑一次：
+改检索相关参数（`rag_max_distance`、`rag_top_k`、融合权重）、换 embedding 模型或换生成模型之后，两层都重跑一次：
 
 ```bash
 .venv/bin/python scripts/eval_rag.py --json .tmp/rag_after.json
