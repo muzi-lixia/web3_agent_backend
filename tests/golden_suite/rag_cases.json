@@ -1,0 +1,577 @@
+{
+  "version": "v1",
+  "kb_id": "default",
+  "created_at": "2026-10-26",
+  "corpus": {
+    "documents": [
+      {"title": "Frequently Asked Questions", "doc_category": "faq", "chunks": 21},
+      {"title": "overview", "doc_category": "term", "chunks": 22}
+    ],
+    "total_chunks": 43,
+    "embedding": "bge-m3 / 1024"
+  },
+  "match_mode": {
+    "any": "期望 chunk 至少命中一个即算检出",
+    "all": "期望 chunk 全部命中才算检出（跨块题）"
+  },
+  "types": {
+    "fact": "单块可答，答案是一个明确事实或数字",
+    "paraphrase": "问法不含原文关键词，只能靠语义匹配",
+    "zh": "中文提问检索英文文档",
+    "multi": "答案跨两个及以上切块",
+    "unanswerable": "库内没有答案，正确行为是不编造",
+    "confusable": "相近概念，考验区分度而非召回"
+  },
+  "cases": [
+    {
+      "id": "rf-01",
+      "type": "fact",
+      "lang": "en",
+      "query": "What is Berachain's block time?",
+      "expect_chunks": ["9bfdd7931fb181ffb4b4b9779e56811afe76f70229f1a5874b4d6be391dfa3ce"],
+      "match": "any",
+      "gold": "约 2 秒",
+      "gold_terms": ["2 second", "2s", "two second"],
+      "note": "最基础的数字型事实，作为检索链路的冒烟用例"
+    },
+    {
+      "id": "rf-02",
+      "type": "fact",
+      "lang": "en",
+      "query": "Does BERA have a maximum supply?",
+      "expect_chunks": ["e62ac717557ffad77fa8bace1ab27ba4edf8bccd4edb3f5a007c8ad58ee9d9ab"],
+      "match": "any",
+      "gold": "没有硬顶；创世总量 5 亿；约 5% 年通胀",
+      "gold_terms": ["no hard supply cap", "500,000,000", "5%"],
+      "note": "否定型答案，模型容易反着答成「有上限」"
+    },
+    {
+      "id": "rf-03",
+      "type": "fact",
+      "lang": "en",
+      "query": "What is the minimum and maximum BERA stake for a validator?",
+      "expect_chunks": ["f7836414b8427d3ef86e28aaaa07a8605abe8e5f87c0da5cd56f794e554553b5"],
+      "match": "any",
+      "gold": "下限 250,000 BERA，上限 10,000,000 BERA",
+      "gold_terms": ["250,000", "10,000,000"],
+      "note": "两个数字在同一块里，检索对了也要看答案有没有丢一个"
+    },
+    {
+      "id": "rf-04",
+      "type": "fact",
+      "lang": "en",
+      "query": "How long is the unbonding period for sWBERA?",
+      "expect_chunks": ["1c497f7e5243d35c0292371ea19a580e609d66eed92f35174ce9e6581695e33d"],
+      "match": "any",
+      "gold": "7 天",
+      "gold_terms": ["7-day", "7 day"],
+      "note": "同一块里还有 129,600 块（质押池），是两个不同的时间，容易拿错"
+    },
+    {
+      "id": "rf-05",
+      "type": "fact",
+      "lang": "en",
+      "query": "What was BUSD previously called?",
+      "expect_chunks": ["3abc78fccb3d6c42360525bc2c543a8a848e0c1a930a9e4536822571606a6ec0"],
+      "match": "any",
+      "gold": "BUSD = Bera USD，原名 HONEY",
+      "gold_terms": ["HONEY"],
+      "note": "专有名词更换，测同义与别名"
+    },
+    {
+      "id": "rf-06",
+      "type": "fact",
+      "lang": "en",
+      "query": "When was the HONEY token renamed to BUSD?",
+      "expect_chunks": ["3abc78fccb3d6c42360525bc2c543a8a848e0c1a930a9e4536822571606a6ec0"],
+      "match": "any",
+      "gold": "2026 年 8 月 19 日",
+      "gold_terms": ["August 19, 2026", "2026-08-19"],
+      "note": "与 rf-05 同块不同事实，测同一块的另一种取数"
+    },
+    {
+      "id": "rf-07",
+      "type": "fact",
+      "lang": "en",
+      "query": "Do I need to migrate my HONEY to BUSD?",
+      "expect_chunks": ["ea9f9a8243cbe6e35de90775debb831b0921d513604aa338fd727f9140ab41bf"],
+      "match": "any",
+      "gold": "不需要迁移，合约地址未变，只是改名",
+      "gold_terms": ["no migration", "contract address is unchanged"],
+      "note": "和 rf-05 内容相邻但答案不同，容易串块"
+    },
+    {
+      "id": "rf-08",
+      "type": "fact",
+      "lang": "en",
+      "query": "How much WBERA per block goes to the validator operator?",
+      "expect_chunks": [
+        "2d1a56cac4618bac327d14ab95f42fdde2348575762be2832b64bca34834a405",
+        "c39f763cc0e98955127fc482483fc02f41f914a87e8145fc6a3fe1f3e6d4d392"
+      ],
+      "match": "any",
+      "gold": "baseRate 0.4 WBERA 给 operator，rewardRate 1.305 WBERA 给 Reward Vault",
+      "gold_terms": ["0.4", "1.305"],
+      "note": "两块都写了同一组数字，命中任一可答；常被误答成 1.305 是给 operator 的"
+    },
+    {
+      "id": "rf-09",
+      "type": "fact",
+      "lang": "en",
+      "query": "How many validators are in the active set?",
+      "expect_chunks": ["c39f763cc0e98955127fc482483fc02f41f914a87e8145fc6a3fe1f3e6d4d392"],
+      "match": "any",
+      "gold": "按质押量排名前 69",
+      "gold_terms": ["69"],
+      "note": "单个数字，且只出现在一块里，误答即说明没命中"
+    },
+    {
+      "id": "rf-10",
+      "type": "fact",
+      "lang": "en",
+      "query": "What are the common swap fee tiers on BEX?",
+      "expect_chunks": ["0bcc18a99c73e8b75aa5b87c26bbbef6f5aaa0718ad0fad1fceb53ef9ba687aa"],
+      "match": "any",
+      "gold": "0.05%、0.1%、0.3%、1%",
+      "gold_terms": ["0.05%", "0.1%", "0.3%", "1%"],
+      "note": "四个并列数字，用来观察答案是否只抄了前两个"
+    },
+    {
+      "id": "rf-11",
+      "type": "fact",
+      "lang": "en",
+      "query": "When was the BGT token deprecated?",
+      "expect_chunks": [
+        "fe3a044a4b2c6b9675511d708e4608be17d0e5566cf49ccb23795aff2ad335ed",
+        "31b92543817f44019525ef505ff2316e1b4c2cb4e7bedc6aef09313c4810c370"
+      ],
+      "match": "any",
+      "gold": "2026 年 7 月 8 日",
+      "gold_terms": ["July 8, 2026", "2026-07-08"],
+      "note": "FAQ 那块只说了 BGT 是什么、让用户去换，没给日期；日期在 overview 里。命中 FAQ 块会答不完整"
+    },
+    {
+      "id": "rf-12",
+      "type": "fact",
+      "lang": "en",
+      "query": "What percentage of the total supply is allocated to the community?",
+      "expect_chunks": ["8deb81632187890aed30211fa66f937a9638ce2b0a8617ec5b70a550edbab779"],
+      "match": "any",
+      "gold": "48.9%",
+      "gold_terms": ["48.9%"],
+      "note": "同一块里还有 15.8% 和 13.1%，容易拿错数字"
+    },
+
+    {
+      "id": "rp-01",
+      "type": "paraphrase",
+      "lang": "en",
+      "query": "How quickly does a block get produced?",
+      "expect_chunks": ["9bfdd7931fb181ffb4b4b9779e56811afe76f70229f1a5874b4d6be391dfa3ce"],
+      "match": "any",
+      "gold": "约 2 秒",
+      "gold_terms": ["2 second", "2s"],
+      "note": "「block time」换成「produced」，无字面重合"
+    },
+    {
+      "id": "rp-02",
+      "type": "paraphrase",
+      "lang": "en",
+      "query": "Who decides what changes get made to the protocol?",
+      "expect_chunks": ["1fe225d7f61ae034d32c0ffdbe282a7840854d75ae8edbc34077bb4dd3ac0c31"],
+      "match": "any",
+      "gold": "社区通过治理决定，包括节点升级和参数设置",
+      "gold_terms": ["governance", "community decides"],
+      "note": "问句里没有 governance 这个词"
+    },
+    {
+      "id": "rp-03",
+      "type": "paraphrase",
+      "lang": "en",
+      "query": "If I deposit BERA into the staking vault, what token do I get back?",
+      "expect_chunks": [
+        "e31c30629fd8fbc57fcd5e758337c5f04716d6e95d4ea4e86129b78dbe40c3ec",
+        "02960595c187f1738cbe6c5d669a1c076da2c84fd6cdf2b6f6078fbc80a4880b"
+      ],
+      "match": "any",
+      "gold": "拿到 sWBERA",
+      "gold_terms": ["sWBERA"],
+      "note": "「staking vault」这个说法只在两块里出现，测专有名词定位"
+    },
+    {
+      "id": "rp-04",
+      "type": "paraphrase",
+      "lang": "en",
+      "query": "How do I turn my LP token into yield?",
+      "expect_chunks": ["435fd2cb988416403a030a960f1bc1b908e8fc2e883323e70c7edccebf7b8235"],
+      "match": "any",
+      "gold": "把 LP token 质押进对应的 Reward Vault，积累可领取的 WBERA",
+      "gold_terms": ["Reward Vault", "LP token"],
+      "note": "收益路径题，涉及 LP token → Reward Vault 两步，检索对了答案也可能只说一半"
+    },
+    {
+      "id": "rp-05",
+      "type": "paraphrase",
+      "lang": "en",
+      "query": "What is the difference between a liquidity pool and the person who funds it?",
+      "expect_chunks": [
+        "528a76a49c67b7d067c8f0b019ad64396431f4d0575693606b61bdc6e9af0c6e",
+        "bc62c9716b74fd64f62f4edb35d880d6b4a4bd8fb5db3d50c7e553537a785ff4"
+      ],
+      "match": "all",
+      "gold": "池是代币对的容器；提供者往里存币并分手续费",
+      "gold_terms": ["pool", "provider"],
+      "note": "两块各自只答一半，必须都召回。这是 top_k=3 的真实压力测试"
+    },
+    {
+      "id": "rp-06",
+      "type": "paraphrase",
+      "lang": "en",
+      "query": "What makes a token easy to trade on-chain?",
+      "expect_chunks": ["1bfc711c501e568b057753b195eac80ec12e71a4c89e5f3a94a7d06d511d178c"],
+      "match": "any",
+      "gold": "流动性越高越容易换",
+      "gold_terms": ["liquidity"],
+      "note": "描述性问法，答案是一个概念而不是数字"
+    },
+    {
+      "id": "rp-07",
+      "type": "paraphrase",
+      "lang": "en",
+      "query": "Why would someone stake for sWBERA instead of just holding BERA?",
+      "expect_chunks": ["19c235c6040b2cfc10973b0875a14c512904cd6208d37fc869c20b6d50bd3660"],
+      "match": "any",
+      "gold": "sWBERA 能分到 Incentive Auction 的收益，不用自己管仓位和验证人选择",
+      "gold_terms": ["Incentive Auction", "yield"],
+      "note": "动机型问题，比较容易命中「What is the actual staking token」那块，但那里没有「为什么」"
+    },
+    {
+      "id": "rp-08",
+      "type": "paraphrase",
+      "lang": "en",
+      "query": "Where does the yield in a BEX pool come from?",
+      "expect_chunks": ["0cb370a888e192ea9ad2e618fd07fcaaaa8fff1d1adb4bada055f950e486275a"],
+      "match": "any",
+      "gold": "来自该池每笔 swap 收取的手续费",
+      "gold_terms": ["fees collected on every swap"],
+      "note": "收益来源题，与 rp-07 的 sWBERA 收益不是同一回事，测区分"
+    },
+
+    {
+      "id": "rzh-01",
+      "type": "zh",
+      "lang": "zh",
+      "query": "BERA 有总量上限吗？",
+      "expect_chunks": ["e62ac717557ffad77fa8bace1ab27ba4edf8bccd4edb3f5a007c8ad58ee9d9ab"],
+      "match": "any",
+      "gold": "没有，创世 5 亿，约 5% 年通胀",
+      "gold_terms": ["no hard supply cap", "500,000,000"],
+      "note": "中文问英文库。bge-m3 多语是强项，但 rag_max_distance=0.42 的阈值可能把它挡掉"
+    },
+    {
+      "id": "rzh-02",
+      "type": "zh",
+      "lang": "zh",
+      "query": "解除质押需要等多久？",
+      "expect_chunks": ["1c497f7e5243d35c0292371ea19a580e609d66eed92f35174ce9e6581695e33d"],
+      "match": "any",
+      "gold": "sWBERA 7 天；质押池 129,600 块（约 3 天）",
+      "gold_terms": ["7-day", "129,600"],
+      "note": "两种质押路径时间不同，中文提问下模型更容易只答一个"
+    },
+    {
+      "id": "rzh-03",
+      "type": "zh",
+      "lang": "zh",
+      "query": "什么是流动性池？",
+      "expect_chunks": ["528a76a49c67b7d067c8f0b019ad64396431f4d0575693606b61bdc6e9af0c6e"],
+      "match": "any",
+      "gold": "两种以上代币的配对，供 DEX 用户互换",
+      "gold_terms": ["pairings of 2 or more tokens"],
+      "answer_terms": ["代币", "DEX"],
+      "note": "概念定义，与「liquidity」「LP」相邻，测不串块"
+    },
+    {
+      "id": "rzh-04",
+      "type": "zh",
+      "lang": "zh",
+      "query": "BUSD 以前叫什么名字？",
+      "expect_chunks": ["3abc78fccb3d6c42360525bc2c543a8a848e0c1a930a9e4536822571606a6ec0"],
+      "match": "any",
+      "gold": "HONEY",
+      "gold_terms": ["HONEY"],
+      "note": "中文问 + 专有名词，考察跨语言下的实体对齐"
+    },
+    {
+      "id": "rzh-05",
+      "type": "zh",
+      "lang": "zh",
+      "query": "验证人最少要质押多少 BERA？",
+      "expect_chunks": ["f7836414b8427d3ef86e28aaaa07a8605abe8e5f87c0da5cd56f794e554553b5"],
+      "match": "any",
+      "gold": "25 万 BERA，上限 1000 万",
+      "gold_terms": ["250,000", "10,000,000"],
+      "note": "只问「最少」，但答全上下限才是完整答案"
+    },
+    {
+      "id": "rzh-06",
+      "type": "zh",
+      "lang": "zh",
+      "query": "出块时间是多少？",
+      "expect_chunks": ["9bfdd7931fb181ffb4b4b9779e56811afe76f70229f1a5874b4d6be391dfa3ce"],
+      "match": "any",
+      "gold": "约 2 秒",
+      "gold_terms": ["2 second"],
+      "note": "极短中文问句，几乎没有上下文可依，纯语义匹配下限测试"
+    },
+    {
+      "id": "rzh-07",
+      "type": "zh",
+      "lang": "zh",
+      "query": "swap 一般收多少手续费？",
+      "expect_chunks": ["0bcc18a99c73e8b75aa5b87c26bbbef6f5aaa0718ad0fad1fceb53ef9ba687aa"],
+      "match": "any",
+      "gold": "常见 0.05%、0.1%、0.3%、1%，以池子创建时设定为准",
+      "gold_terms": ["0.05%", "0.3%"],
+      "note": "中英混写，真实用户常见写法"
+    },
+    {
+      "id": "rzh-08",
+      "type": "zh",
+      "lang": "zh",
+      "query": "Berachain 用的是什么共识机制？",
+      "expect_chunks": ["b0e213ba746e1c6095d662312a6e6c4bdcf5c8d52b04cafff7e5ba3c6e1dc390"],
+      "match": "any",
+      "gold": "Proof-of-Liquidity，底层共识由 BeaconKit 提供",
+      "gold_terms": ["Proof-of-Liquidity", "BeaconKit"],
+      "note": "答案要靠 EVM-identical L1 + PoL + BeaconKit 三个词拼出来，单看一块能答但容易漏 BeaconKit"
+    },
+
+    {
+      "id": "rm-01",
+      "type": "multi",
+      "lang": "zh",
+      "query": "sWBERA 的收益从哪来，赎回要多久？",
+      "expect_chunks": [
+        "19c235c6040b2cfc10973b0875a14c512904cd6208d37fc869c20b6d50bd3660",
+        "1c497f7e5243d35c0292371ea19a580e609d66eed92f35174ce9e6581695e33d"
+      ],
+      "match": "all",
+      "gold": "收益来自 Incentive Auction 的 WBERA；赎回有 7 天等待期",
+      "gold_terms": ["Incentive Auction", "7-day"],
+      "note": "两个问题合一，跨块。只命中一块时会答成半个答案而不自知"
+    },
+    {
+      "id": "rm-02",
+      "type": "multi",
+      "lang": "zh",
+      "query": "验证人质押的上下限是多少，奖励用什么代币发放？",
+      "expect_chunks": [
+        "f7836414b8427d3ef86e28aaaa07a8605abe8e5f87c0da5cd56f794e554553b5",
+        "c39f763cc0e98955127fc482483fc02f41f914a87e8145fc6a3fe1f3e6d4d392"
+      ],
+      "match": "any",
+      "gold": "250,000 ~ 10,000,000 BERA；奖励以 WBERA 发放",
+      "gold_terms": ["250,000", "WBERA"],
+      "note": "上下限和奖励代币挤在同一块的末句，单块即可答；考察的是别只抄前半句"
+    },
+    {
+      "id": "rm-03",
+      "type": "multi",
+      "lang": "en",
+      "query": "What was the old name of BUSD and do I need to do a migration?",
+      "expect_chunks": [
+        "3abc78fccb3d6c42360525bc2c543a8a848e0c1a930a9e4536822571606a6ec0",
+        "ea9f9a8243cbe6e35de90775debb831b0921d513604aa338fd727f9140ab41bf"
+      ],
+      "match": "all",
+      "gold": "原名 HONEY；不需要迁移",
+      "gold_terms": ["HONEY", "no migration"],
+      "note": "相邻两块，语义高度相似，融合后容易只留一块"
+    },
+    {
+      "id": "rm-04",
+      "type": "multi",
+      "lang": "en",
+      "query": "How is the per-block WBERA emission split between the operator and the reward vaults?",
+      "expect_chunks": [
+        "2d1a56cac4618bac327d14ab95f42fdde2348575762be2832b64bca34834a405",
+        "c39f763cc0e98955127fc482483fc02f41f914a87e8145fc6a3fe1f3e6d4d392"
+      ],
+      "match": "any",
+      "gold": "baseRate 0.4 给 operator，rewardRate 1.305 给 Reward Vaults",
+      "gold_terms": ["0.4", "1.305", "baseRate", "rewardRate"],
+      "note": "拆分关系在两块里都有完整表述，命中任一即可答；两块都召回是加分项不是及格线"
+    },
+    {
+      "id": "rm-05",
+      "type": "multi",
+      "lang": "zh",
+      "query": "普通用户有哪几种方式可以从 PoL 里拿到收益？",
+      "expect_chunks": [
+        "02960595c187f1738cbe6c5d669a1c076da2c84fd6cdf2b6f6078fbc80a4880b",
+        "a6319d781f6d8de396acadbb8b1f3264e29eb81c5204922a036afd2d1595b6e1"
+      ],
+      "match": "any",
+      "gold": "质押 BERA/sWBERA、往 Reward Vault 存资产、或质押 LST",
+      "gold_terms": ["Reward Vault", "sWBERA", "LST"],
+      "note": "角色表那块列了全部路径，收益计算那块解释了口径。命中任一块都能答，但完整度不同"
+    },
+
+    {
+      "id": "rn-01",
+      "type": "unanswerable",
+      "lang": "zh",
+      "query": "BERA 现在价格多少？",
+      "expect_chunks": [],
+      "match": "any",
+      "gold": "库内没有价格数据，应拒绝或引导到别的入口",
+      "must_not": ["给出任何具体价格数字"],
+      "note": "实时行情。意图层应判 out_of_scope，但若被放进 RAG，检索必须返回空"
+    },
+    {
+      "id": "rn-02",
+      "type": "unanswerable",
+      "lang": "zh",
+      "query": "Berachain 现在的 TVL 是多少？",
+      "expect_chunks": [],
+      "match": "any",
+      "gold": "库内没有 TVL 数据",
+      "must_not": ["给出任何具体 TVL 数字"],
+      "note": "与 rn-01 同类，但「TVL」这个词在文档里完全不出现，理论上更安全，用来对照"
+    },
+    {
+      "id": "rn-03",
+      "type": "unanswerable",
+      "lang": "zh",
+      "query": "BEX 上 BERA/USDC 池子当前的 APY 是多少？",
+      "expect_chunks": [],
+      "match": "any",
+      "gold": "库内有 APY 的定义和计算公式，但没有该池的实时数值",
+      "must_not": ["给出任何具体 APY 百分比"],
+      "note": "最危险的一条：一定会召回「What is APY?」或 APR 公式块，检索看起来成功了，但答案里没有数值。判分要看答案层有没有编"
+    },
+    {
+      "id": "rn-04",
+      "type": "unanswerable",
+      "lang": "en",
+      "query": "What is the contract address of sWBERA?",
+      "expect_chunks": [],
+      "match": "any",
+      "gold": "文档只给了链接，没有地址",
+      "must_not": ["编造 0x 开头的地址"],
+      "note": "地址类幻觉，与项目「无据不给哈希/地址」的既有设计同源"
+    },
+    {
+      "id": "rn-05",
+      "type": "unanswerable",
+      "lang": "en",
+      "query": "What is the deployed address of Uniswap V4 on Berachain?",
+      "expect_chunks": [],
+      "match": "any",
+      "gold": "库内没有该协议的信息",
+      "must_not": ["编造合约地址或部署状态"],
+      "note": "库里只有 Berachain 自有协议（BEX），外部协议应明确说没有"
+    },
+    {
+      "id": "rn-06",
+      "type": "unanswerable",
+      "lang": "zh",
+      "query": "BERA 空投什么时候发？",
+      "expect_chunks": [],
+      "match": "any",
+      "gold": "文档只有分配比例（15.8%），没有发放时间",
+      "must_not": ["给出任何具体日期"],
+      "note": "部分可答的边界：召回空投分配块后，模型可能顺手补一个时间"
+    },
+    {
+      "id": "rn-07",
+      "type": "unanswerable",
+      "lang": "zh",
+      "query": "我钱包里的 BERA 余额是多少？",
+      "expect_chunks": [],
+      "match": "any",
+      "gold": "这是链上查询，不是知识库问题",
+      "must_not": ["给出任何余额数字"],
+      "note": "边界题：同一句在意图层应判 query_asset，不该进 RAG。进来说明路由有问题"
+    },
+    {
+      "id": "rn-08",
+      "type": "unanswerable",
+      "lang": "zh",
+      "query": "怎么申请 Berachain 的 RPC API key？",
+      "expect_chunks": [],
+      "match": "any",
+      "gold": "库内没有该流程",
+      "must_not": ["编造申请步骤或链接"],
+      "note": "运维类问题，与用户侧知识库无关"
+    },
+    {
+      "id": "rn-09",
+      "type": "unanswerable",
+      "lang": "zh",
+      "query": "跑一个 Berachain 节点需要什么硬件配置？",
+      "expect_chunks": [],
+      "match": "any",
+      "gold": "overview 里只提到 Nodes overview 这个入口，没有配置内容",
+      "must_not": ["给出 CPU/内存/磁盘的具体数字"],
+      "note": "「提到了但没有内容」是最容易被模型补齐的一类，权重等同于 rn-03"
+    },
+
+    {
+      "id": "rc-01",
+      "type": "confusable",
+      "lang": "en",
+      "query": "What does the term validator refer to?",
+      "expect_chunks": ["ffac4e63a2d94cac5552a396f69dc4792c17b4bcbb636844f8931922f89f6bfc"],
+      "match": "any",
+      "gold": "三种含义：节点、运营实体、承担 PoL 与治理投票的一方",
+      "gold_terms": ["three things", "node", "entity"],
+      "note": "同一块里显式列了三义，答不全就说明只是抽了第一句"
+    },
+    {
+      "id": "rc-02",
+      "type": "confusable",
+      "lang": "zh",
+      "query": "WBERA、sWBERA 和 BERA 有什么区别？",
+      "expect_chunks": [
+        "e31c30629fd8fbc57fcd5e758337c5f04716d6e95d4ea4e86129b78dbe40c3ec",
+        "02960595c187f1738cbe6c5d669a1c076da2c84fd6cdf2b6f6078fbc80a4880b",
+        "4b7ad73c8b3226252ab3bc8e4ffad2352f576677be6974ceafbc4dc08eff3ecf"
+      ],
+      "match": "any",
+      "gold": "BERA 是主代币，WBERA 是 1:1 包装（也是 PoL 排放代币），sWBERA 是质押凭证",
+      "gold_terms": ["WBERA", "sWBERA"],
+      "note": "四个代币名字互相包含，向量上极易混。任一命中可答，但答全需要至少两块"
+    },
+    {
+      "id": "rc-03",
+      "type": "confusable",
+      "lang": "zh",
+      "query": "APY 和 APR 有什么区别？",
+      "expect_chunks": [
+        "0cb370a888e192ea9ad2e618fd07fcaaaa8fff1d1adb4bada055f950e486275a",
+        "1e7abf3f1cc42721025650aa9efd88c143c28a8b13878a7630209aa5123ad6c9",
+        "f334e9afd0e5ede176a42a92d5f3fe1edebfaeef2ddfa59e6559091500d17bee"
+      ],
+      "match": "any",
+      "gold": "库内只有 APY 的定义和 APR 的计算公式，没有显式的对比说明",
+      "gold_terms": ["annual percentage yield", "APR"],
+      "note": "半可答：能答 APY 是什么、APR 怎么算，但不能答「两者区别」。这类要允许模型说「文档没有直接对比」"
+    },
+    {
+      "id": "rc-04",
+      "type": "confusable",
+      "lang": "en",
+      "query": "Is liquidity the same thing as a liquidity pool?",
+      "expect_chunks": [
+        "1bfc711c501e568b057753b195eac80ec12e71a4c89e5f3a94a7d06d511d178c",
+        "528a76a49c67b7d067c8f0b019ad64396431f4d0575693606b61bdc6e9af0c6e"
+      ],
+      "match": "all",
+      "gold": "不是：流动性是「可换的量」，池是承载它的容器",
+      "gold_terms": ["amount of a token available", "pairings of 2 or more tokens"],
+      "note": "两块答案各一半，必须同时召回才能做区分"
+    }
+  ]
+}
