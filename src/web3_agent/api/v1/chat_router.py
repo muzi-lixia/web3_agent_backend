@@ -294,8 +294,12 @@ async def chat(
     container = request.app.state.container
 
     # 对话白名单：仅白名单内的登录地址可用，不在名单内一律拒绝，不进入后续流程。
-    allowlist = getattr(container.settings, "chat_allowlist", [])
-    if identity.address not in allowlist:
+    # 钱包展示常用 EIP-55 混合大小写，登录身份为小写；比较时统一形式。
+    allowlist = {
+        address.strip().lower()
+        for address in getattr(container.settings, "chat_allowlist", [])
+    }
+    if identity.address.lower() not in allowlist:
         raise AppError(*E513_CHAT_ACCESS_DENIED)
 
     if payload.wallet and payload.wallet.chain_id not in container.settings.allowed_chain_ids:

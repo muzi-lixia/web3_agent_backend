@@ -73,7 +73,7 @@ async def _consume(response) -> tuple[dict | None, list[str], list[dict]]:
     return result, stages, errors
 
 
-def _run(monkeypatch, claim_result, *, container=None, key="key-abcdefgh"):
+def _run(monkeypatch, claim_result, *, container=None, key="key-abcdefgh", address="0x" + "1" * 40):
     """跑一次 /chat 并读完事件流，返回 (结论, 阶段, 错误, container, complete 桩, claim 桩, settle 桩)。"""
     container = container or _container()
     claim = AsyncMock(return_value=claim_result)
@@ -89,7 +89,7 @@ def _run(monkeypatch, claim_result, *, container=None, key="key-abcdefgh"):
         app=SimpleNamespace(state=SimpleNamespace(container=container)),
         state=SimpleNamespace(quota_key=None),
     )
-    identity = SimpleNamespace(user_id="user-1", address="0x" + "1" * 40, chain_id=1)
+    identity = SimpleNamespace(user_id="user-1", address=address, chain_id=1)
     payload = ChatRequest(userMessage="你好", idempotencyKey=key)
 
     async def go():
@@ -196,3 +196,32 @@ def test_address_not_in_allowlist_is_rejected(monkeypatch):
     with pytest.raises(AppError) as exc:
         _run(monkeypatch, None, container=container)
     assert exc.value.code == "E513"
+
+
+@pytest.mark.parametrize("style", ["checksum", "uppercase", "padded"])
+def test_allowlist_matches_wallet_address_regardless_of_display_case(monkeypatch, style):
+    from web3_agent.common.evm_address import to_checksum_address
+
+    address = "0x" + "ab" * 20
+    configured = {
+        "checksum": to_checksum_address(address),
+        "uppercase": address.upper(),
+        "padded": "  " + to_checksum_address(address) + "  ",
+    }[style]
+    container = _container()
+    container.settings.chat_allowlist = [configured]
+    result, _, errors, _, _, _, _ = _run(
+        monkeypatch, ("new", None), container=container, address=address
+    )
+    assert result["content"] == "你好"
+    assert errors == []
+    container.agent.handle.assert_awaited_once()
+
+
+def test_empty_allowlist_still_rejects_all_wallets(monkeypatch):
+    container = _container()
+    container.settings.chat_allowlist = []
+    with pytest.raises(AppError) as exc:
+        _run(monkeypatch, None, container=container)
+    assert exc.value.code == "E513"
+    container.agent.handle.assert_not_awaited()
