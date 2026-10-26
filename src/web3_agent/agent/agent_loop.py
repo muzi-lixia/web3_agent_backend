@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -133,6 +134,30 @@ def _failure_notice(records: list[ToolCallRecord]) -> str:
         except KeyError:
             return MSG_NO_DATA
     return MSG_NO_DATA
+
+
+# 回答里的数值和地址，必须能在这轮证据里找到出处。
+# 只比对两位数以上的数字、小数和十六进制地址：单个数字在行文中太常见，
+# 拿它判定编造，误伤的都是一句正常话。千分位在比对两侧一起抹掉。
+# _TRACEABLE_FACT：需要溯源的数值或地址片段。
+_TRACEABLE_FACT = re.compile(r"0x[0-9a-fA-F]{6,}|\d{2,}(?:[.,]\d+)*|\d+\.\d+")
+
+
+def _untraceable(answer: str, citations: list[dict]) -> bool:
+    """回答里的数值与地址是否一条都对不上本轮证据。
+
+    一条都对不上，说明这段内容不是从证据里读出来的 —— 模型面前摆着一份「讲这个
+    概念」的文档，被问一个具体数字，最典型的走法就是自己补一个看起来合理的。
+
+    Args:
+        answer: 模型本轮给出的回答正文。
+        citations: 本轮检索到的证据，含正文 content。
+    """
+    facts = {value.replace(",", "") for value in _TRACEABLE_FACT.findall(answer)}
+    if not facts:
+        return False
+    evidence = "".join(str(item.get("content", "")) for item in citations).replace(",", "")
+    return not any(fact.lower() in evidence.lower() for fact in facts)
 
 
 # 重跑图时替换掉模型那句空转回答：它没有数据，留着只会被抄一遍。
@@ -527,6 +552,17 @@ class AgentLoop:
                     answer = UNAVAILABLE
                 no_data = True
                 citations = []
+            elif _untraceable(str(answer), citations):
+                # 检索命中了、但答的不是证据里有的东西：宁可说没查到，也不给一个查无实据的数。
+                answer = NO_DOCUMENTS
+                no_data = True
+                citations = []
+                await self._audit.log(
+                    "answer_untraceable",
+                    siwe_user_id=siwe_user_id,
+                    intent=guarded.output.intent.value,
+                    steps=steps,
+                )
             else:
                 answer = str(answer).strip()
         if no_data:
