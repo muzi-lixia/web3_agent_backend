@@ -1,5 +1,7 @@
 # Web3 链上智能 Agent 助手 — 后端
 
+容器化发布与持续部署：[GitHub Actions → GHCR → 服务器](deployment/production/README.md)。
+
 FastAPI + LangGraph 的单 Agent 服务：一句话进来，先判意图，再决定调链上只读工具还是查知识库，最后给出带引用的回答。服务端不持私钥，不签名、不广播。
 
 ## 架构

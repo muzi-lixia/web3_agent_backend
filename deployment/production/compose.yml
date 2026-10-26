@@ -1,0 +1,79 @@
+name: web3-agent
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: web3_agent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in production.env}
+      POSTGRES_DB: web3_agent
+    command: ["postgres", "-c", "shared_buffers=64MB", "-c", "work_mem=2MB", "-c", "maintenance_work_mem=64MB", "-c", "max_connections=30"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    mem_limit: 320m
+    cpus: 0.50
+    shm_size: 64m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U web3_agent -d web3_agent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging: *logging
+
+  backend:
+    image: ${BACKEND_IMAGE:?Set BACKEND_IMAGE to a GHCR digest or commit tag}
+    restart: unless-stopped
+    env_file:
+      - path: ./app.env
+        format: raw
+    environment:
+      DATABASE_URL: postgresql+asyncpg://web3_agent:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/web3_agent
+      DB_POOL_SIZE: "2"
+      CHECKPOINT_POOL_SIZE: "1"
+      TRUSTED_PROXY_HOPS: "2"
+    mem_limit: 512m
+    cpus: 1.25
+    init: true
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=5)); assert d.get('status')=='ok' and d.get('db') is True"
+      interval: 15s
+      timeout: 8s
+      start_period: 60s
+      retries: 5
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *logging
+
+  frontend:
+    image: ${FRONTEND_IMAGE:?Set FRONTEND_IMAGE to a GHCR digest or commit tag}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8081}:80"
+    mem_limit: 64m
+    cpus: 0.25
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/_frontend_health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *logging
+
+volumes:
+  pgdata:
