@@ -12,7 +12,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy import select
 from web3_agent.agent.graph.read_graph import build_read_graph, initial_state
 from web3_agent.agent.intent_router import route_intent
-from web3_agent.agent.agent_loop import _lacks_evidence
+from web3_agent.agent.agent_loop import _lacks_evidence, _untraceable
 from web3_agent.common.types import LlmOutput, ToolCallRecord
 from web3_agent.config.constants import Intent, Route, CallSource
 from web3_agent.config.settings import Settings
@@ -146,8 +146,8 @@ def test_retrieval_enforces_scope_limit_distance_and_returns_sources():
     result=asyncio.run(KnowledgeRetriever(settings(),embedder,store).search("多久解锁",chain_id=1,protocol_id="dex_x",doc_category="swap",top_k=999))
     assert result["hits"][0]["source_url"]=="https://example.com/rules"
     kwargs=store.search.call_args.kwargs
-    assert kwargs["chain_id"]==1 and kwargs["protocol_id"]=="dex_x" and kwargs["doc_category"]=="swap" and kwargs["limit"]==3
-    assert kwargs["max_distance"]==.42
+    assert kwargs["chain_id"]==1 and kwargs["protocol_id"]=="dex_x" and kwargs["doc_category"]=="swap" and kwargs["limit"]==settings().rag_top_k
+    assert kwargs["max_distance"]==settings().rag_max_distance
 
 
 def test_non_hybrid_hits_are_numbered_like_the_hybrid_path():
@@ -165,6 +165,14 @@ def test_evidence_selection_skips_oversized_chunks_and_stops_at_limit():
     selected=_select_evidence(chunks,max_chars=4,limit=2)
     assert [item["chunk_id"] for item in selected]==["b","c"]
     assert [item["id"] for item in selected]==["S1","S2"]
+
+
+def test_answer_figures_must_be_found_in_the_retrieved_evidence():
+    evidence=[dict(content="验证人下限 250,000 BERA，上限 10,000,000 BERA。")]
+    assert not _untraceable("下限 250,000 BERA，上限 10,000,000 BERA。",evidence)
+    assert _untraceable("当前 APY 约 7.5%。",[dict(content="What is APY?")])
+    # 没有数值和地址的回答不在这道校验范围内。
+    assert not _untraceable("流动性是能换的量，池是装它的容器。",evidence)
 
 
 def test_store_failure_degrades_without_rules_or_sensitive_exception():

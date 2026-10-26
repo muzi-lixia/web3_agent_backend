@@ -147,9 +147,12 @@ class Settings(BaseSettings):
     # rag_job_max_attempts：单个入库任务允许被领取执行的最大次数。
     rag_job_max_attempts: int = Field(default=3, ge=1, le=10)
     # rag_top_k：最终最多返回给回答模型的检索证据条数。
-    rag_top_k: int = Field(default=3, ge=1, le=5)
+    # 4 条是跨块题的分界：3 条时「同一件事分散在两块」的问句只拿得到一半。
+    rag_top_k: int = Field(default=4, ge=1, le=5)
     # rag_max_distance：向量召回接受的最大余弦距离，越小越严格。
-    rag_max_distance: float = Field(default=0.42, ge=0, le=2)
+    # 0.46 覆盖跨语言问句的距离段（中文问英文文档集中在 0.39~0.45）：
+    # 0.42 时中文题卡在阈值边缘，再放宽到 0.52 就会把「概念相近但没答案」的块也放进来。
+    rag_max_distance: float = Field(default=0.46, ge=0, le=2)
     # rag_chunk_tokens：每个文档切片的目标近似 token 数。
     rag_chunk_tokens: int = Field(default=400, ge=400, le=600)
     # rag_chunk_overlap：同章节相邻切片重叠比例，取值小于 0.5。

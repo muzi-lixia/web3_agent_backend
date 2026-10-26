@@ -7,7 +7,7 @@ from time import monotonic
 from langsmith import traceable
 from web3_agent.rag.cache import RetrievalCache
 from web3_agent.rag.keyword_index import BM25Index
-from web3_agent.rag.fusion import fuse
+from web3_agent.rag.fusion import DENSE_WEIGHT, KEYWORD_WEIGHT, fuse
 from web3_agent.rag.query_rewriter import QueryRewriter
 from web3_agent.rag.reranker import HttpReranker
 from web3_agent.rag.config import normalize_filters
@@ -329,7 +329,10 @@ class KnowledgeRetriever:
         rankings = [[c for c in ranking if live is None or c.chunk_id in live]
                     for ranking in dense_rankings+keyword_rankings]
         # 用各路排序名次执行 RRF 融合，避免直接比较不同算法的原始分数。
-        candidates, scores = fuse(rankings, limit=self.settings.rag_fusion_k)
+        candidates, scores = fuse(
+            rankings, limit=self.settings.rag_fusion_k,
+            weights=[DENSE_WEIGHT] * len(dense_rankings)
+            + [KEYWORD_WEIGHT] * len(keyword_rankings))
         info["dense_candidates"] = [[c.chunk_id for c in r] for r in dense_rankings]
         info["keyword_candidates"] = [[c.chunk_id for c in r] for r in keyword_rankings]
         info["fusion_scores"] = scores

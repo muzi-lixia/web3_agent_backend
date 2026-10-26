@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 from web3_agent.config.settings import Settings
 from web3_agent.rag.models import Citation
 from web3_agent.rag.keyword_index import BM25Index
-from web3_agent.rag.fusion import fuse
+from web3_agent.rag.fusion import DENSE_WEIGHT, KEYWORD_WEIGHT, fuse
 from web3_agent.rag.retriever import KnowledgeRetriever
 from web3_agent.rag.cache import RetrievalCache
 
@@ -49,6 +49,20 @@ def test_rrf_deduplicates_and_promotes_agreement():
     a, b, c = [chunk(k, k) for k in 'abc']
     result, _ = fuse([[a,b,b], [c,b]])
     assert [v.chunk_id for v in result] == ['b','a','c']
+
+
+def test_keyword_route_weight_lowers_its_first_place_only():
+    """关键词路第一名不该和向量路第一名同分：词面重合的块会把语义命中顶下去。"""
+    a, d = chunk('a', 'a'), chunk('d', 'd')
+    _, equal = fuse([[a], [d]])
+    _, weighted = fuse([[a], [d]], weights=[DENSE_WEIGHT, KEYWORD_WEIGHT])
+    assert equal['a'] == equal['d']
+    assert weighted['a'] == equal['a'] > weighted['d']
+
+
+def test_fusion_rejects_misaligned_weights():
+    with pytest.raises(ValueError):
+        fuse([[chunk('a', 'a')]], weights=[DENSE_WEIGHT, KEYWORD_WEIGHT])
 
 
 def test_bm25_rescues_vector_miss_and_cache_respects_scope_revision():
