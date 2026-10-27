@@ -19,6 +19,17 @@ _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 _UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
 
 
+class HealthAccessFilter(logging.Filter):
+    """省略成功的存活探针访问记录，保留失败请求和就绪检查。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name == "uvicorn.access" and isinstance(record.args, tuple) and len(record.args) == 5:
+            _, method, path, _, status = record.args
+            if method in {"GET", "HEAD"} and str(path).partition("?")[0] == "/health":
+                return not (isinstance(status, int) and 200 <= status < 300)
+        return True
+
+
 class TraceIdFilter(logging.Filter):
     """给没有 trace_id 的记录补 "-"，否则 formatter 会抛 KeyError 把日志本身弄坏。"""
 
@@ -41,6 +52,7 @@ def setup_logging(level: str) -> None:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter(_FORMAT, datefmt=_DATE_FORMAT))
     handler.addFilter(TraceIdFilter())
+    handler.addFilter(HealthAccessFilter())
 
     root = logging.getLogger()
     root.handlers.clear()
